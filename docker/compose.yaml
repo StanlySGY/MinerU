@@ -7,7 +7,7 @@ services:
     ports:
       - 30000:30000
     environment:
-      MINERU_MODEL_SOURCE: local
+      MINERU_MODEL_SOURCE: ${MINERU_MODEL_SOURCE:-local}
     entrypoint: mineru-openai-server
     command:
       --host 0.0.0.0
@@ -35,7 +35,7 @@ services:
     ports:
       - 8000:8000
     environment:
-      MINERU_MODEL_SOURCE: local
+      MINERU_MODEL_SOURCE: ${MINERU_MODEL_SOURCE:-local}
     entrypoint: mineru-api
     command:
       --host 0.0.0.0
@@ -64,7 +64,7 @@ services:
     ports:
       - 8002:8002
     environment:
-      MINERU_MODEL_SOURCE: local
+      MINERU_MODEL_SOURCE: ${MINERU_MODEL_SOURCE:-local}
     entrypoint: mineru-router
     command:
       --host 0.0.0.0
@@ -98,7 +98,7 @@ services:
     ports:
       - 7860:7860
     environment:
-      MINERU_MODEL_SOURCE: local
+      MINERU_MODEL_SOURCE: ${MINERU_MODEL_SOURCE:-local}
     entrypoint: mineru-gradio
     command:
       --server-name 0.0.0.0

@@ -11,8 +11,8 @@ cd MinerU
 # 海外网络或可直连 docker.io / HuggingFace 时使用
 docker build -t mineru-server:v1.0 -f docker/global/Dockerfile.fork .
 
-# 中国大陆服务器或 docker.io / HuggingFace 访问不稳定时，优先使用
-# DaoCloud 基础镜像 + 阿里云 PyPI 镜像 + ModelScope 模型源
+# 中国大陆服务器或 docker.io / HuggingFace 访问不稳定时，优先使用轻量测试镜像
+# DaoCloud 基础镜像 + 阿里云 PyPI 镜像，运行时走 ModelScope 按需下载模型
 docker build -t mineru-server:v1.0 -f docker/china/Dockerfile.fork .
 ```
 
@@ -107,6 +107,7 @@ cd docker
 ```bash
 git pull
 # 中国大陆服务器建议优先用 docker/china/Dockerfile.fork
-docker build -t mineru-server:v1.0 -f docker/china/Dockerfile.fork .
-docker compose -f docker/compose.yaml --profile gradio up -d --force-recreate
+# 首次运行前显式指定 ModelScope，容器会在运行时按需下载模型
+MINERU_MODEL_SOURCE=modelscope docker build -t mineru-server:v1.0 -f docker/china/Dockerfile.fork .
+MINERU_MODEL_SOURCE=modelscope docker compose -f docker/compose.yaml --profile gradio up -d --force-recreate
 ```
