@@ -33,7 +33,7 @@ services:
     restart: always
     profiles: ["api"]
     ports:
-      - 8000:8000
+      - ${MINERU_API_PORT:-18000}:8000
     environment:
       MINERU_MODEL_SOURCE: ${MINERU_MODEL_SOURCE:-local}
     entrypoint: mineru-api

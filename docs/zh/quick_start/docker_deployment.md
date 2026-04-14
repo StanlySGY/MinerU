@@ -73,9 +73,12 @@ cd docker
 ### 启动 Web API 服务
   ```bash
   docker compose -f compose.yaml --profile api up -d
+  # 如需自定义宿主机端口，例如 18000
+  # MINERU_API_PORT=18000 docker compose -f compose.yaml --profile api up -d
   ```
   >[!TIP]
-  >在浏览器中访问 `http://<server_ip>:8000/docs` 查看API文档。
+  >通过 compose 启动时，默认访问 `http://<server_ip>:18000/docs` 查看API文档。
+  >如设置了 `MINERU_API_PORT`，则将 `18000` 替换为对应端口。
 
 ---
 
@@ -110,4 +113,7 @@ git pull
 # 首次运行前显式指定 ModelScope，容器会在运行时按需下载模型
 MINERU_MODEL_SOURCE=modelscope docker build -t mineru-server:v1.0 -f docker/china/Dockerfile.fork .
 MINERU_MODEL_SOURCE=modelscope docker compose -f docker/compose.yaml --profile gradio up -d --force-recreate
+
+# 如果要启动 API 并避免 8000 端口冲突，可改用 18000
+MINERU_MODEL_SOURCE=modelscope MINERU_API_PORT=18000 docker compose -f docker/compose.yaml --profile api up -d --force-recreate
 ```
