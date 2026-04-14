@@ -3,7 +3,14 @@
 # support x86_64 architecture and ARM(AArch64) architecture
 FROM docker.m.daocloud.io/vllm/vllm-openai:v0.11.2
 
-RUN apt-get update && \
+RUN rm -f /etc/apt/sources.list.d/*.list && \
+    if [ -f /etc/apt/sources.list ]; then \
+        sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirrors.aliyun.com/ubuntu|g; s|http://security.ubuntu.com/ubuntu|https://mirrors.aliyun.com/ubuntu|g' /etc/apt/sources.list; \
+    fi && \
+    if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then \
+        sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirrors.aliyun.com/ubuntu|g; s|http://security.ubuntu.com/ubuntu|https://mirrors.aliyun.com/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources; \
+    fi && \
+    apt-get update && \
     apt-get install -y \
         fonts-noto-core \
         fonts-noto-cjk \
