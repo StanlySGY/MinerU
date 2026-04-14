@@ -5,8 +5,9 @@ MinerU提供了便捷的docker部署方式，这有助于快速搭建环境并�
 ## 使用 Dockerfile 构建镜像
 
 ```bash
-wget https://gcore.jsdelivr.net/gh/opendatalab/MinerU@master/docker/china/Dockerfile
-docker build -t mineru:latest -f Dockerfile .
+git clone <your-fork-repo-url>
+cd MinerU
+docker build -t mineru-server:v1.0 -f docker/global/Dockerfile.fork .
 ```
 
 ## Docker说明
@@ -27,7 +28,7 @@ docker run --gpus all \
   --shm-size 32g \
   -p 30000:30000 -p 7860:7860 -p 8000:8000 -p 8002:8002 \
   --ipc=host \
-  -it mineru:latest \
+  -it mineru-server:v1.0 \
   /bin/bash
 ```
 
@@ -39,8 +40,8 @@ docker run --gpus all \
 我们提供了[compose.yml](https://github.com/opendatalab/MinerU/blob/master/docker/compose.yaml)文件，您可以通过它来快速启动MinerU服务。
 
 ```bash
-# 下载 compose.yaml 文件
-wget https://gcore.jsdelivr.net/gh/opendatalab/MinerU@master/docker/compose.yaml
+# 使用仓库内自带 compose 文件
+cd docker
 ```
 >[!NOTE]
 >  
@@ -90,3 +91,15 @@ wget https://gcore.jsdelivr.net/gh/opendatalab/MinerU@master/docker/compose.yaml
   >[!TIP]
   > 
   >- 在浏览器中访问 `http://<server_ip>:7860` 使用 Gradio WebUI。
+
+---
+
+## 推荐的更新发布流程
+
+当您的 fork 有新提交时，可在服务器执行以下命令完成更新：
+
+```bash
+git pull
+docker build -t mineru-server:v1.0 -f docker/global/Dockerfile.fork .
+docker compose -f docker/compose.yaml --profile gradio up -d --force-recreate
+```
