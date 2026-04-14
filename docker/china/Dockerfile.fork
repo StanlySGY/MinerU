@@ -4,6 +4,7 @@
 FROM docker.m.daocloud.io/vllm/vllm-openai:v0.11.2
 
 RUN rm -f /etc/apt/sources.list.d/*.list && \
+    rm -rf /var/cache/apt/archives/* /var/cache/apt/archives/partial/* /var/lib/apt/lists/* && \
     if [ -f /etc/apt/sources.list ]; then \
         sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirrors.aliyun.com/ubuntu|g; s|http://security.ubuntu.com/ubuntu|https://mirrors.aliyun.com/ubuntu|g' /etc/apt/sources.list; \
     fi && \
@@ -13,14 +14,13 @@ RUN rm -f /etc/apt/sources.list.d/*.list && \
     apt-get -o Acquire::AllowInsecureRepositories=true \
             -o Acquire::AllowDowngradeToInsecureRepositories=true \
             update && \
-    apt-get install -y --allow-unauthenticated \
-        fonts-noto-core \
+    apt-get install -y --no-install-recommends --allow-unauthenticated \
         fonts-noto-cjk \
         fontconfig \
         libgl1 && \
     fc-cache -fv && \
     apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/cache/apt/archives/* /var/cache/apt/archives/partial/* /var/lib/apt/lists/*
 
 WORKDIR /opt/MinerU
 COPY . /opt/MinerU
