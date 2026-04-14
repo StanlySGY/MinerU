@@ -7,7 +7,13 @@ MinerU提供了便捷的docker部署方式，这有助于快速搭建环境并�
 ```bash
 git clone <your-fork-repo-url>
 cd MinerU
+
+# 海外网络或可直连 docker.io / HuggingFace 时使用
 docker build -t mineru-server:v1.0 -f docker/global/Dockerfile.fork .
+
+# 中国大陆服务器或 docker.io / HuggingFace 访问不稳定时，优先使用
+# DaoCloud 基础镜像 + 阿里云 PyPI 镜像 + ModelScope 模型源
+docker build -t mineru-server:v1.0 -f docker/china/Dockerfile.fork .
 ```
 
 ## Docker说明
@@ -100,6 +106,7 @@ cd docker
 
 ```bash
 git pull
-docker build -t mineru-server:v1.0 -f docker/global/Dockerfile.fork .
+# 中国大陆服务器建议优先用 docker/china/Dockerfile.fork
+docker build -t mineru-server:v1.0 -f docker/china/Dockerfile.fork .
 docker compose -f docker/compose.yaml --profile gradio up -d --force-recreate
 ```
