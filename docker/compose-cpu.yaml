@@ -1,0 +1,23 @@
+services:
+  mineru-api:
+    build:
+      context: .
+      dockerfile: china/Dockerfile.cpu-arm
+    image: mineru-cpu:v1.0
+    container_name: mineru-api
+    restart: always
+    profiles: ["api"]
+    ports:
+      - ${MINERU_API_PORT:-18000}:8000
+    environment:
+      MINERU_VLM_SERVER_URL: ${MINERU_VLM_SERVER_URL:-http://10.8.132.224:6002/v1}
+    entrypoint: mineru-api
+    command:
+      --host 0.0.0.0
+      --port 8000
+      --allow-public-http-client
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

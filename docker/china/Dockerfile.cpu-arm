@@ -1,0 +1,17 @@
+FROM python:3.11-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        fonts-noto-core \
+        fonts-noto-cjk \
+        fontconfig \
+        libgl1 \
+        libglib2.0-0 \
+        curl && \
+    fc-cache -fv && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir 'mineru>=3.0.0' -i https://mirrors.aliyun.com/pypi/simple
+
+ENTRYPOINT ["/bin/bash", "-c", "exec \"$@\"", "--"]
