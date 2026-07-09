@@ -24,6 +24,11 @@ def auto_download_and_get_model_root_path(relative_path: str, repo_mode='pipelin
         return root_path
 
     # 建立仓库模式到路径的映射
+    # 优先使用环境变量 MINERU_VLM_MODEL 覆盖默认模型路径
+    vlm_model_override = os.getenv('MINERU_VLM_MODEL')
+    vlm_hf = vlm_model_override or ModelPath.vlm_root_hf
+    vlm_ms = vlm_model_override or ModelPath.vlm_root_modelscope
+
     repo_mapping = {
         'pipeline': {
             'huggingface': ModelPath.pipeline_root_hf,
@@ -31,9 +36,9 @@ def auto_download_and_get_model_root_path(relative_path: str, repo_mode='pipelin
             'default': ModelPath.pipeline_root_hf
         },
         'vlm': {
-            'huggingface': ModelPath.vlm_root_hf,
-            'modelscope': ModelPath.vlm_root_modelscope,
-            'default': ModelPath.vlm_root_hf
+            'huggingface': vlm_hf,
+            'modelscope': vlm_ms,
+            'default': vlm_hf
         }
     }
 
