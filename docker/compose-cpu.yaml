@@ -10,7 +10,8 @@ services:
     ports:
       - ${MINERU_API_PORT:-18000}:8000
     environment:
-      MINERU_VLM_SERVER_URL: ${MINERU_VLM_SERVER_URL:-http://10.8.132.224:6002/v1}
+      MINERU_VL_SERVER: ${MINERU_VL_SERVER:-http://10.8.132.224:6002/v1}
+      MINERU_VLM_SERVER_URL: ${MINERU_VL_SERVER:-http://10.8.132.224:6002/v1}
       MINERU_PROCESSING_WINDOW_SIZE: ${MINERU_PROCESSING_WINDOW_SIZE:-64}
     entrypoint: mineru-api
     command:
