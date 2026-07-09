@@ -8,44 +8,44 @@ services:
     restart: always
     profiles: ["openai-server"]
     ports:
-      # VLM inference server port (default: 30000)
+      # VLM 推理服务端口（默认：30000）
       - ${MINERU_VLM_PORT:-30000}:30000
     environment:
-      # ========== Model Configuration ==========
-      # Model source: local / modelscope / huggingface (default: local)
+      # ========== 模型配置 ==========
+      # 模型来源：local / modelscope / huggingface（默认：local）
       MINERU_MODEL_SOURCE: ${MINERU_MODEL_SOURCE:-local}
 
-      # VLM model path (default: OpenDataLab/MinerU2.5-2509-1.2B)
-      # Override for custom model: OpenDataLab/MinerU2.5-Pro-2604-1.2B
+      # VLM 模型路径（默认：OpenDataLab/MinerU2.5-2509-1.2B）
+      # 自定义模型：OpenDataLab/MinerU2.5-Pro-2604-1.2B
       MINERU_VLM_MODEL: ${MINERU_VLM_MODEL:-OpenDataLab/MinerU2.5-2509-1.2B}
 
-      # ========== Performance Configuration ==========
-      # GPU/NPU memory utilization ratio (default: 0.9)
-      # Higher = more memory for KV cache = better concurrency
+      # ========== 性能配置 ==========
+      # GPU/NPU 显存利用率（默认：0.9）
+      # 越大 = KV 缓存越大 = 并发能力越强
       VLLM_GPU_MEMORY_UTILIZATION: ${VLLM_GPU_MEMORY_UTILIZATION:-0.9}
 
-      # Max sequence length (default: model dependent)
+      # 最大序列长度（默认：跟随模型配置）
       # VLLM_MAX_MODEL_LEN: ${VLLM_MAX_MODEL_LEN:-8192}
 
-      # Tensor parallel size for multi-NPU (default: 1)
+      # 多 NPU 张量并行数（默认：1）
       # VLLM_TENSOR_PARALLEL_SIZE: ${VLLM_TENSOR_PARALLEL_SIZE:-1}
 
-      # ========== Logging ==========
-      # Log level: DEBUG, INFO, WARNING, ERROR (default: INFO)
+      # ========== 日志配置 ==========
+      # 日志级别：DEBUG、INFO、WARNING、ERROR（默认：INFO）
       MINERU_LOG_LEVEL: ${MINERU_LOG_LEVEL:-INFO}
 
-      # ========== Ascend NPU Specific ==========
-      # Disable torch NPU async (if needed)
+      # ========== 昇腾 NPU 专属配置 ==========
+      # 禁用 torch NPU 异步（调试时使用）
       # ASCEND_LAUNCH_BLOCKING: 1
 
-      # OMP threads (default: 1 for vllm)
+      # OMP 线程数（默认：1，vllm 推荐）
       OMP_NUM_THREADS: ${OMP_NUM_THREADS:-1}
     entrypoint: mineru-openai-server
     command:
       --host 0.0.0.0
       --port 30000
-      # --gpu-memory-utilization 0.9  # Override if needed
-      # --model /path/to/custom/model  # Override for custom model path
+      # --gpu-memory-utilization 0.9  # 按需覆盖显存利用率
+      # --model /path/to/custom/model  # 按需覆盖自定义模型路径
     ulimits:
       memlock: -1
       stack: 67108864
