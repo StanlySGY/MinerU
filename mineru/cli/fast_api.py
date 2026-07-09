@@ -800,7 +800,7 @@ async def parse_request_form(
         Form(
             description="(Adapted only for <vlm/hybrid>-http-client backend)openai compatible server url, e.g., http://127.0.0.1:30000",
         ),
-    ] = None,
+    ] = os.getenv("MINERU_VLM_SERVER_URL"),
     return_md: Annotated[
         bool,
         Form(description="Return markdown content in response"),
