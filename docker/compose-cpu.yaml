@@ -8,11 +8,51 @@ services:
     restart: always
     profiles: ["api"]
     ports:
+      # API service port (default: 18000)
       - ${MINERU_API_PORT:-18000}:8000
     environment:
+      # ========== VLM Server Configuration ==========
+      # Remote VLM model server URL (required for vlm-http-client backend)
       MINERU_VL_SERVER: ${MINERU_VL_SERVER:-http://10.8.132.224:6002/v1}
       MINERU_VLM_SERVER_URL: ${MINERU_VL_SERVER:-http://10.8.132.224:6002/v1}
+
+      # ========== Performance Configuration ==========
+      # Pages processed per window (default: 64, lower = less memory per request)
       MINERU_PROCESSING_WINDOW_SIZE: ${MINERU_PROCESSING_WINDOW_SIZE:-64}
+
+      # Max concurrent requests (default: 3, higher = more parallel processing)
+      MINERU_API_MAX_CONCURRENT_REQUESTS: ${MINERU_API_MAX_CONCURRENT_REQUESTS:-3}
+
+      # ========== Feature Configuration ==========
+      # Enable formula parsing (default: true)
+      MINERU_FORMULA_ENABLE: ${MINERU_FORMULA_ENABLE:-true}
+
+      # Enable table parsing (default: true)
+      MINERU_TABLE_ENABLE: ${MINERU_TABLE_ENABLE:-true}
+
+      # ========== Task Management ==========
+      # Task retention time in seconds (default: 86400 = 24 hours)
+      MINERU_API_TASK_RETENTION_SECONDS: ${MINERU_API_TASK_RETENTION_SECONDS:-86400}
+
+      # Task cleanup interval in seconds (default: 3600 = 1 hour)
+      MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS: ${MINERU_API_TASK_CLEANUP_INTERVAL_SECONDS:-3600}
+
+      # ========== Logging ==========
+      # Log level: DEBUG, INFO, WARNING, ERROR (default: INFO)
+      MINERU_LOG_LEVEL: ${MINERU_LOG_LEVEL:-INFO}
+
+      # ========== Advanced Options ==========
+      # Output root directory (default: ./output)
+      # MINERU_API_OUTPUT_ROOT: /data/output
+
+      # Enable VLM model preload on startup (default: false)
+      # MINERU_API_ENABLE_VLM_PRELOAD: false
+
+      # Disable access log (default: false)
+      # MINERU_API_DISABLE_ACCESS_LOG: false
+
+      # Shutdown on stdin EOF (default: false)
+      # MINERU_API_SHUTDOWN_ON_STDIN_EOF: false
     entrypoint: mineru-api
     command:
       --host 0.0.0.0
