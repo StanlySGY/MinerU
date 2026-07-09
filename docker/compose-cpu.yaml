@@ -15,6 +15,7 @@ services:
       # 远程 VLM 模型服务地址（使用 vlm-http-client 后端时必填）
       MINERU_VL_SERVER: ${MINERU_VL_SERVER:-http://10.8.132.224:6002/v1}
       MINERU_VLM_SERVER_URL: ${MINERU_VL_SERVER:-http://10.8.132.224:6002/v1}
+      MINERU_VLM_MODEL: ${MINERU_VLM_MODEL:-OpenDataLab/MinerU2.5-Pro-2604-1.2B}
 
       # ========== 性能配置 ==========
       # 每个窗口处理的页数（默认：64，越小单次内存占用越低）

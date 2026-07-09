@@ -15,9 +15,8 @@ services:
       # 模型来源：local / modelscope / huggingface（默认：local）
       MINERU_MODEL_SOURCE: ${MINERU_MODEL_SOURCE:-local}
 
-      # VLM 模型路径（默认：OpenDataLab/MinerU2.5-2509-1.2B）
-      # 自定义模型：OpenDataLab/MinerU2.5-Pro-2604-1.2B
-      MINERU_VLM_MODEL: ${MINERU_VLM_MODEL:-OpenDataLab/MinerU2.5-2509-1.2B}
+      # VLM 模型路径（默认：OpenDataLab/MinerU2.5-Pro-2604-1.2B）
+      MINERU_VLM_MODEL: ${MINERU_VLM_MODEL:-OpenDataLab/MinerU2.5-Pro-2604-1.2B}
 
       # ========== 性能配置 ==========
       # GPU/NPU 显存利用率（默认：0.9）
