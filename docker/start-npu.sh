@@ -19,7 +19,7 @@ fi
 case "${1:-start}" in
     build)
         echo "Building MinerU NPU image..."
-        DOCKER_BUILDKIT=0 $COMPOSE_CMD -f $COMPOSE_FILE --env-file $ENV_FILE --profile openai-server build
+        DOCKER_BUILDKIT=0 $COMPOSE_CMD -f $COMPOSE_FILE --env-file $ENV_FILE --profile openai-server build --no-cache
         echo "Build complete."
         ;;
     start)

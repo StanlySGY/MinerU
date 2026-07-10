@@ -19,7 +19,7 @@ fi
 case "${1:-start}" in
     build)
         echo "Building MinerU CPU image..."
-        DOCKER_BUILDKIT=0 $COMPOSE_CMD -f $COMPOSE_FILE --env-file $ENV_FILE --profile api build
+        DOCKER_BUILDKIT=0 $COMPOSE_CMD -f $COMPOSE_FILE --env-file $ENV_FILE --profile api build --no-cache
         echo "Build complete."
         ;;
     start)
