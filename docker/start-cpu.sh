@@ -9,27 +9,34 @@ ENV_FILE="compose-cpu.env"
 
 cd "$(dirname "$0")"
 
+# 兼容 docker compose v1 和 v2
+if docker compose version &>/dev/null 2>&1; then
+    COMPOSE_CMD="docker compose"
+else
+    COMPOSE_CMD="docker-compose"
+fi
+
 case "${1:-start}" in
     build)
         echo "Building MinerU CPU image..."
-        DOCKER_BUILDKIT=0 docker compose -f $COMPOSE_FILE --env-file $ENV_FILE --profile api build
+        DOCKER_BUILDKIT=0 $COMPOSE_CMD -f $COMPOSE_FILE --env-file $ENV_FILE --profile api build
         echo "Build complete."
         ;;
     start)
         echo "Starting MinerU API service..."
-        docker compose -f $COMPOSE_FILE --env-file $ENV_FILE --profile api up -d
+        $COMPOSE_CMD -f $COMPOSE_FILE --env-file $ENV_FILE --profile api up -d
         echo "Service started. API: http://$(hostname -I | awk '{print $1}'):18000/docs"
         ;;
     stop)
         echo "Stopping MinerU API service..."
-        docker compose -f $COMPOSE_FILE --env-file $ENV_FILE --profile api down
+        $COMPOSE_CMD -f $COMPOSE_FILE --env-file $ENV_FILE --profile api down
         ;;
     restart)
         echo "Restarting MinerU API service..."
-        docker compose -f $COMPOSE_FILE --env-file $ENV_FILE --profile api up -d --force-recreate
+        $COMPOSE_CMD -f $COMPOSE_FILE --env-file $ENV_FILE --profile api up -d --force-recreate
         ;;
     logs)
-        docker compose -f $COMPOSE_FILE --env-file $ENV_FILE --profile api logs -f
+        $COMPOSE_CMD -f $COMPOSE_FILE --env-file $ENV_FILE --profile api logs -f
         ;;
     *)
         echo "Usage: $0 {build|start|stop|restart|logs}"
