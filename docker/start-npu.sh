@@ -9,27 +9,34 @@ ENV_FILE="compose-npu.env"
 
 cd "$(dirname "$0")"
 
+# 兼容 docker compose v1 和 v2
+if docker compose version &>/dev/null 2>&1; then
+    COMPOSE_CMD="docker compose"
+else
+    COMPOSE_CMD="docker-compose"
+fi
+
 case "${1:-start}" in
     build)
         echo "Building MinerU NPU image..."
-        DOCKER_BUILDKIT=0 docker compose -f $COMPOSE_FILE --env-file $ENV_FILE --profile openai-server build
+        DOCKER_BUILDKIT=0 $COMPOSE_CMD -f $COMPOSE_FILE --env-file $ENV_FILE --profile openai-server build
         echo "Build complete."
         ;;
     start)
         echo "Starting MinerU OpenAI Server..."
-        docker compose -f $COMPOSE_FILE --env-file $ENV_FILE --profile openai-server up -d
+        $COMPOSE_CMD -f $COMPOSE_FILE --env-file $ENV_FILE --profile openai-server up -d
         echo "Service started. API: http://$(hostname -I | awk '{print $1}'):30000/v1/models"
         ;;
     stop)
         echo "Stopping MinerU OpenAI Server..."
-        docker compose -f $COMPOSE_FILE --env-file $ENV_FILE --profile openai-server down
+        $COMPOSE_CMD -f $COMPOSE_FILE --env-file $ENV_FILE --profile openai-server down
         ;;
     restart)
         echo "Restarting MinerU OpenAI Server..."
-        docker compose -f $COMPOSE_FILE --env-file $ENV_FILE --profile openai-server up -d --force-recreate
+        $COMPOSE_CMD -f $COMPOSE_FILE --env-file $ENV_FILE --profile openai-server up -d --force-recreate
         ;;
     logs)
-        docker compose -f $COMPOSE_FILE --env-file $ENV_FILE --profile openai-server logs -f
+        $COMPOSE_CMD -f $COMPOSE_FILE --env-file $ENV_FILE --profile openai-server logs -f
         ;;
     *)
         echo "Usage: $0 {build|start|stop|restart|logs}"
