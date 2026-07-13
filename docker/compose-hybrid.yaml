@@ -1,0 +1,142 @@
+# =============================================================================
+# MinerU Hybrid 模式部署
+# =============================================================================
+# hybrid-http-client: 本地 Pipeline 小模型 + 远程 VLM
+#
+# 需要两台机器：
+#   1. NPU 机器：跑 VLM Server（已有 compose-npu.yaml）
+#   2. CPU/GPU 机器：跑 API + Pipeline 模型 + Router
+#
+# 使用方式：
+#   1. 修改 compose-hybrid.env 中的 IP 地址
+#   2. ./start-hybrid.sh build
+#   3. ./start-hybrid.sh start
+# =============================================================================
+
+services:
+  # =========================================================================
+  # Router - 统一入口
+  # =========================================================================
+  mineru-router:
+    image: mineru-hybrid:v1.0
+    container_name: mineru-router
+    restart: always
+    profiles: ["router"]
+    ports:
+      - ${ROUTER_PORT:-8002}:8002
+    entrypoint: mineru-router
+    command:
+      --host 0.0.0.0
+      --port 8002
+      --local-gpus none
+      # 指向所有 API 实例
+      --upstream-url http://${API_SERVER_IP:-127.0.0.1}:${API_1_PORT:-18000}
+      --upstream-url http://${API_SERVER_IP:-127.0.0.1}:${API_2_PORT:-18001}
+      --upstream-url http://${API_SERVER_IP:-127.0.0.1}:${API_3_PORT:-18002}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8002/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # =========================================================================
+  # API 实例 1 - 本地 Pipeline + 远程 VLM-1
+  # =========================================================================
+  mineru-api-1:
+    image: mineru-hybrid:v1.0
+    container_name: mineru-api-1
+    restart: always
+    profiles: ["api"]
+    ports:
+      - ${API_1_PORT:-18000}:8000
+    environment:
+      # 远程 VLM 服务器地址
+      MINERU_VL_SERVER: http://${VLM_SERVER_IP:-10.8.132.224}:${VLM_1_PORT:-30000}/v1
+      MINERU_VLM_SERVER_URL: http://${VLM_SERVER_IP:-10.8.132.224}:${VLM_1_PORT:-30000}/v1
+      MINERU_VLM_MODEL: ${MINERU_VLM_MODEL:-OpenDataLab/MinerU2.5-Pro-2604-1.2B}
+
+      # 性能配置
+      MINERU_PROCESSING_WINDOW_SIZE: ${MINERU_PROCESSING_WINDOW_SIZE:-32}
+      MINERU_API_MAX_CONCURRENT_REQUESTS: ${MINERU_API_MAX_CONCURRENT_REQUESTS:-3}
+
+      # 功能配置
+      MINERU_FORMULA_ENABLE: ${MINERU_FORMULA_ENABLE:-true}
+      MINERU_TABLE_ENABLE: ${MINERU_TABLE_ENABLE:-true}
+
+      MINERU_LOG_LEVEL: ${MINERU_LOG_LEVEL:-INFO}
+    entrypoint: mineru-api
+    command:
+      --host 0.0.0.0
+      --port 8000
+      --allow-public-http-client
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # =========================================================================
+  # API 实例 2 - 本地 Pipeline + 远程 VLM-2
+  # =========================================================================
+  mineru-api-2:
+    image: mineru-hybrid:v1.0
+    container_name: mineru-api-2
+    restart: always
+    profiles: ["api"]
+    ports:
+      - ${API_2_PORT:-18001}:8000
+    environment:
+      MINERU_VL_SERVER: http://${VLM_SERVER_IP:-10.8.132.224}:${VLM_2_PORT:-30001}/v1
+      MINERU_VLM_SERVER_URL: http://${VLM_SERVER_IP:-10.8.132.224}:${VLM_2_PORT:-30001}/v1
+      MINERU_VLM_MODEL: ${MINERU_VLM_MODEL:-OpenDataLab/MinerU2.5-Pro-2604-1.2B}
+
+      MINERU_PROCESSING_WINDOW_SIZE: ${MINERU_PROCESSING_WINDOW_SIZE:-32}
+      MINERU_API_MAX_CONCURRENT_REQUESTS: ${MINERU_API_MAX_CONCURRENT_REQUESTS:-3}
+
+      MINERU_FORMULA_ENABLE: ${MINERU_FORMULA_ENABLE:-true}
+      MINERU_TABLE_ENABLE: ${MINERU_TABLE_ENABLE:-true}
+
+      MINERU_LOG_LEVEL: ${MINERU_LOG_LEVEL:-INFO}
+    entrypoint: mineru-api
+    command:
+      --host 0.0.0.0
+      --port 8000
+      --allow-public-http-client
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # =========================================================================
+  # API 实例 3 - 本地 Pipeline + 远程 VLM-3
+  # =========================================================================
+  mineru-api-3:
+    image: mineru-hybrid:v1.0
+    container_name: mineru-api-3
+    restart: always
+    profiles: ["api"]
+    ports:
+      - ${API_3_PORT:-18002}:8000
+    environment:
+      MINERU_VL_SERVER: http://${VLM_SERVER_IP:-10.8.132.224}:${VLM_3_PORT:-30002}/v1
+      MINERU_VLM_SERVER_URL: http://${VLM_SERVER_IP:-10.8.132.224}:${VLM_3_PORT:-30002}/v1
+      MINERU_VLM_MODEL: ${MINERU_VLM_MODEL:-OpenDataLab/MinerU2.5-Pro-2604-1.2B}
+
+      MINERU_PROCESSING_WINDOW_SIZE: ${MINERU_PROCESSING_WINDOW_SIZE:-32}
+      MINERU_API_MAX_CONCURRENT_REQUESTS: ${MINERU_API_MAX_CONCURRENT_REQUESTS:-3}
+
+      MINERU_FORMULA_ENABLE: ${MINERU_FORMULA_ENABLE:-true}
+      MINERU_TABLE_ENABLE: ${MINERU_TABLE_ENABLE:-true}
+
+      MINERU_LOG_LEVEL: ${MINERU_LOG_LEVEL:-INFO}
+    entrypoint: mineru-api
+    command:
+      --host 0.0.0.0
+      --port 8000
+      --allow-public-http-client
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

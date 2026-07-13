@@ -1,0 +1,22 @@
+# MinerU Hybrid 模式 Dockerfile
+# 包含 Pipeline 小模型 + VLM HTTP Client 支持
+# 适用于 hybrid-http-client 后端
+
+FROM python:3.11-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        fonts-noto-core \
+        fonts-noto-cjk \
+        fontconfig \
+        libgl1 \
+        libglib2.0-0 \
+        curl && \
+    fc-cache -fv && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# 安装 mineru[pipeline]（包含 torch、paddleocr 等 Pipeline 依赖）
+RUN pip install --no-cache-dir 'mineru[pipeline]>=3.0.0' -i https://mirrors.aliyun.com/pypi/simple
+
+ENTRYPOINT ["/bin/bash", "-c", "exec \"$@\"", "--"]
