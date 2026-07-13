@@ -1,7 +1,5 @@
 FROM python:3.11-slim
 
-ENV NPY_DISABLE_CPU_FEATURES="X86_V2"
-
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         fonts-noto-core \
@@ -14,6 +12,7 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir 'mineru>=3.0.0' -i https://mirrors.aliyun.com/pypi/simple
+RUN pip install --no-cache-dir 'mineru>=3.0.0' -i https://mirrors.aliyun.com/pypi/simple && \
+    pip install --no-cache-dir --force-reinstall 'numpy<2.1' -i https://mirrors.aliyun.com/pypi/simple
 
 ENTRYPOINT ["/bin/bash", "-c", "exec \"$@\"", "--"]
