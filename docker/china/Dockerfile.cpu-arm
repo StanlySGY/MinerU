@@ -12,7 +12,6 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir 'mineru>=3.0.0' -i https://mirrors.aliyun.com/pypi/simple && \
-    pip install --no-cache-dir --force-reinstall numpy==1.21.6 -i https://mirrors.aliyun.com/pypi/simple
+RUN pip install --no-cache-dir 'mineru>=3.0.0' -i https://mirrors.aliyun.com/pypi/simple
 
 ENTRYPOINT ["/bin/bash", "-c", "exec \"$@\"", "--"]
