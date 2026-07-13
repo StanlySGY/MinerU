@@ -1,0 +1,256 @@
+# =============================================================================
+# MinerU 集群部署方案 - 多卡多实例
+# =============================================================================
+# 架构：router (负载均衡) → 多个 mineru-api (CPU薄代理) → 多个 VLM Server (NPU)
+#
+# 使用方式：
+#   1. 修改 compose-cluster.env 中的 IP 地址和实例数量
+#   2. ./start-cluster.sh build
+#   3. ./start-cluster.sh start
+# =============================================================================
+
+services:
+  # =========================================================================
+  # Router - 统一入口 + 负载均衡
+  # =========================================================================
+  mineru-router:
+    image: mineru-server:v1.0
+    container_name: mineru-router
+    restart: always
+    profiles: ["router"]
+    ports:
+      - 8002:8002
+    environment:
+      MINERU_MODEL_SOURCE: ${MINERU_MODEL_SOURCE:-local}
+    entrypoint: mineru-router
+    command:
+      --host 0.0.0.0
+      --port 8002
+      --local-gpus none
+      --upstream-url http://${API_SERVER_1_IP:-127.0.0.1}:${API_1_PORT:-18000}
+      --upstream-url http://${API_SERVER_1_IP:-127.0.0.1}:${API_2_PORT:-18001}
+      --upstream-url http://${API_SERVER_1_IP:-127.0.0.1}:${API_3_PORT:-18002}
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8002/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # =========================================================================
+  # MinerU API 实例 1 - CPU 薄代理，指向 VLM Server 1
+  # =========================================================================
+  mineru-api-1:
+    build:
+      context: .
+      dockerfile: china/Dockerfile.cpu-arm
+    image: mineru-cpu:v1.0
+    container_name: mineru-api-1
+    restart: always
+    profiles: ["api"]
+    ports:
+      - ${API_1_PORT:-18000}:8000
+    environment:
+      # 指向 VLM Server 1（NPU 卡0）
+      MINERU_VL_SERVER: http://${VLM_SERVER_1_IP:-127.0.0.1}:${VLM_1_PORT:-30000}/v1
+      MINERU_VLM_SERVER_URL: http://${VLM_SERVER_1_IP:-127.0.0.1}:${VLM_1_PORT:-30000}/v1
+      MINERU_VLM_MODEL: ${MINERU_VLM_MODEL:-OpenDataLab/MinerU2.5-Pro-2604-1.2B}
+
+      # 性能配置
+      MINERU_PROCESSING_WINDOW_SIZE: ${MINERU_PROCESSING_WINDOW_SIZE:-32}
+      MINERU_API_MAX_CONCURRENT_REQUESTS: ${MINERU_API_MAX_CONCURRENT_REQUESTS:-6}
+
+      # 功能配置
+      MINERU_FORMULA_ENABLE: ${MINERU_FORMULA_ENABLE:-true}
+      MINERU_TABLE_ENABLE: ${MINERU_TABLE_ENABLE:-true}
+
+      MINERU_LOG_LEVEL: ${MINERU_LOG_LEVEL:-INFO}
+    entrypoint: mineru-api
+    command:
+      --host 0.0.0.0
+      --port 8000
+      --allow-public-http-client
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # =========================================================================
+  # MinerU API 实例 2 - CPU 薄代理，指向 VLM Server 2
+  # =========================================================================
+  mineru-api-2:
+    build:
+      context: .
+      dockerfile: china/Dockerfile.cpu-arm
+    image: mineru-cpu:v1.0
+    container_name: mineru-api-2
+    restart: always
+    profiles: ["api"]
+    ports:
+      - ${API_2_PORT:-18001}:8000
+    environment:
+      # 指向 VLM Server 2（NPU 卡1）
+      MINERU_VL_SERVER: http://${VLM_SERVER_2_IP:-127.0.0.1}:${VLM_2_PORT:-30001}/v1
+      MINERU_VLM_SERVER_URL: http://${VLM_SERVER_2_IP:-127.0.0.1}:${VLM_2_PORT:-30001}/v1
+      MINERU_VLM_MODEL: ${MINERU_VLM_MODEL:-OpenDataLab/MinerU2.5-Pro-2604-1.2B}
+
+      MINERU_PROCESSING_WINDOW_SIZE: ${MINERU_PROCESSING_WINDOW_SIZE:-32}
+      MINERU_API_MAX_CONCURRENT_REQUESTS: ${MINERU_API_MAX_CONCURRENT_REQUESTS:-6}
+
+      MINERU_FORMULA_ENABLE: ${MINERU_FORMULA_ENABLE:-true}
+      MINERU_TABLE_ENABLE: ${MINERU_TABLE_ENABLE:-true}
+
+      MINERU_LOG_LEVEL: ${MINERU_LOG_LEVEL:-INFO}
+    entrypoint: mineru-api
+    command:
+      --host 0.0.0.0
+      --port 8000
+      --allow-public-http-client
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # =========================================================================
+  # MinerU API 实例 3 - CPU 薄代理，指向 VLM Server 3
+  # =========================================================================
+  mineru-api-3:
+    build:
+      context: .
+      dockerfile: china/Dockerfile.cpu-arm
+    image: mineru-cpu:v1.0
+    container_name: mineru-api-3
+    restart: always
+    profiles: ["api"]
+    ports:
+      - ${API_3_PORT:-18002}:8000
+    environment:
+      # 指向 VLM Server 3（NPU 卡2）
+      MINERU_VL_SERVER: http://${VLM_SERVER_3_IP:-127.0.0.1}:${VLM_3_PORT:-30002}/v1
+      MINERU_VLM_SERVER_URL: http://${VLM_SERVER_3_IP:-127.0.0.1}:${VLM_3_PORT:-30002}/v1
+      MINERU_VLM_MODEL: ${MINERU_VLM_MODEL:-OpenDataLab/MinerU2.5-Pro-2604-1.2B}
+
+      MINERU_PROCESSING_WINDOW_SIZE: ${MINERU_PROCESSING_WINDOW_SIZE:-32}
+      MINERU_API_MAX_CONCURRENT_REQUESTS: ${MINERU_API_MAX_CONCURRENT_REQUESTS:-6}
+
+      MINERU_FORMULA_ENABLE: ${MINERU_FORMULA_ENABLE:-true}
+      MINERU_TABLE_ENABLE: ${MINERU_TABLE_ENABLE:-true}
+
+      MINERU_LOG_LEVEL: ${MINERU_LOG_LEVEL:-INFO}
+    entrypoint: mineru-api
+    command:
+      --host 0.0.0.0
+      --port 8000
+      --allow-public-http-client
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # =========================================================================
+  # VLM Server 1 - NPU 卡0 推理服务
+  # =========================================================================
+  mineru-vlm-1:
+    build:
+      context: .
+      dockerfile: china/npu.Dockerfile
+    image: mineru-npu:v1.0
+    container_name: mineru-vlm-1
+    restart: always
+    profiles: ["vlm"]
+    ports:
+      - ${VLM_1_PORT:-30000}:30000
+    environment:
+      MINERU_MODEL_SOURCE: ${MINERU_MODEL_SOURCE:-modelscope}
+      MINERU_VLM_MODEL: ${MINERU_VLM_MODEL:-OpenDataLab/MinerU2.5-Pro-2604-1.2B}
+      VLLM_GPU_MEMORY_UTILIZATION: ${VLLM_GPU_MEMORY_UTILIZATION:-0.9}
+      MINERU_LOG_LEVEL: ${MINERU_LOG_LEVEL:-INFO}
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-1}
+    entrypoint: mineru-openai-server
+    command:
+      --host 0.0.0.0
+      --port 30000
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:30000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  # =========================================================================
+  # VLM Server 2 - NPU 卡1 推理服务
+  # =========================================================================
+  mineru-vlm-2:
+    build:
+      context: .
+      dockerfile: china/npu.Dockerfile
+    image: mineru-npu:v1.0
+    container_name: mineru-vlm-2
+    restart: always
+    profiles: ["vlm"]
+    ports:
+      - ${VLM_2_PORT:-30001}:30000
+    environment:
+      MINERU_MODEL_SOURCE: ${MINERU_MODEL_SOURCE:-modelscope}
+      MINERU_VLM_MODEL: ${MINERU_VLM_MODEL:-OpenDataLab/MinerU2.5-Pro-2604-1.2B}
+      VLLM_GPU_MEMORY_UTILIZATION: ${VLLM_GPU_MEMORY_UTILIZATION:-0.9}
+      MINERU_LOG_LEVEL: ${MINERU_LOG_LEVEL:-INFO}
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-1}
+    entrypoint: mineru-openai-server
+    command:
+      --host 0.0.0.0
+      --port 30000
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:30000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  # =========================================================================
+  # VLM Server 3 - NPU 卡2 推理服务
+  # =========================================================================
+  mineru-vlm-3:
+    build:
+      context: .
+      dockerfile: china/npu.Dockerfile
+    image: mineru-npu:v1.0
+    container_name: mineru-vlm-3
+    restart: always
+    profiles: ["vlm"]
+    ports:
+      - ${VLM_3_PORT:-30002}:30000
+    environment:
+      MINERU_MODEL_SOURCE: ${MINERU_MODEL_SOURCE:-modelscope}
+      MINERU_VLM_MODEL: ${MINERU_VLM_MODEL:-OpenDataLab/MinerU2.5-Pro-2604-1.2B}
+      VLLM_GPU_MEMORY_UTILIZATION: ${VLLM_GPU_MEMORY_UTILIZATION:-0.9}
+      MINERU_LOG_LEVEL: ${MINERU_LOG_LEVEL:-INFO}
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-1}
+    entrypoint: mineru-openai-server
+    command:
+      --host 0.0.0.0
+      --port 30000
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:30000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
