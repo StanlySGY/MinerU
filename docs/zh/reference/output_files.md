@@ -8,6 +8,7 @@
 
 - **可视化调试文件**：帮助用户直观了解文档解析过程和结果
 - **结构化数据文件**：包含详细的解析数据，可用于二次开发
+- 多模态 markdown 输出中，`image` / `chart` 默认以截图为主；若块内存在 `content`，会在图片后追加一个默认折叠的 HTML `<details>` 内容块，其中折叠标题优先使用块的 `sub_type`，否则回退为 `image content` 或 `chart content`
 
 下面将详细介绍每个文件的作用和格式。
 
@@ -133,7 +134,7 @@
 ##### 块结构层次
 
 ```
-一级块 (table | image)
+一级块 (table | image | chart)
 └── 二级块
     └── 行 (line)
         └── 片段 (span)
@@ -143,7 +144,7 @@
 
 | 字段名 | 说明 |
 |--------|------|
-| `type` | 块类型：`table` 或 `image` |
+| `type` | 块类型：`table`、`image` 或 `chart` |
 | `bbox` | 块的矩形框坐标 `[x0, y0, x1, y1]` |
 | `blocks` | 包含的二级块列表 |
 
@@ -165,6 +166,9 @@
 | `table_body` | 表格本体 |
 | `table_caption` | 表格描述文本 |
 | `table_footnote` | 表格脚注 |
+| `chart_body` | 图表本体 |
+| `chart_caption` | 图表描述文本 |
+| `chart_footnote` | 图表脚注 |
 | `text` | 文本块 |
 | `title` | 标题块 |
 | `index` | 目录块 |
@@ -179,8 +183,8 @@
 
 **片段 (span) 字段**：
 - `bbox`：片段的矩形框坐标
-- `type`：片段类型（`image`、`table`、`text`、`inline_equation`、`interline_equation`）
-- `content` | `img_path`：文本内容或图片路径
+- `type`：片段类型（`image`、`table`、`chart`、`text`、`inline_equation`、`interline_equation`）
+- `content` | `image_path`：文本内容或图片路径
 
 ##### 示例数据
 
@@ -302,7 +306,6 @@
 | `chart` | 图表 |
 | `text` | 文本/标题 |
 | `equation` | 行间公式 |
-| `seal` | 印章 |
 | `code` | 代码块 / 算法块 |
 | `list` | 列表 / 参考文献列表 |
 | `header` / `footer` / `page_number` / `aside_text` / `page_footnote` | 页面辅助块 |
@@ -322,6 +325,8 @@
 - 所有内容块都包含 `bbox` 字段，表示内容块的边界框坐标 `[x0, y0, x1, y1]` 映射在0-1000范围内的结果。
 - `code` 类型会通过 `sub_type` 区分 `code` 和 `algorithm`，并可包含 `code_body`、`code_caption`、`code_footnote` 等字段。
 - `list` 类型可通过 `sub_type` 区分普通列表和参考文献列表。
+- `image` / `chart` 类型可包含可选 `sub_type` 字段，用于透传视觉子类型。
+- 印章内容通过 `sub_type: "seal"` 的 `image` 类型表示。
 
 ##### 示例数据
 
@@ -409,6 +414,8 @@
 | `bbox` | `list[int]` | 可选，0-1000 范围的边界框 |
 | `anchor` | `string` | 可选，部分 `DOCX` 标题或索引项会携带锚点 |
 
+其中 `image` / `chart` 类型还可能包含可选顶层字段 `sub_type`，用于表示视觉子类型。
+
 ##### 常见类型
 
 | 类型 | 说明 |
@@ -416,11 +423,16 @@
 | `title` | 标题块，包含 `title_content` 与 `level` |
 | `paragraph` | 段落块，包含 `paragraph_content` |
 | `equation_interline` | 行间公式，包含 `math_content`、`math_type` |
-| `image` / `table` / `chart` / `seal` | 视觉类块，包含图片路径、说明文字等结构化字段 |
+| `image` / `table` / `chart` | 视觉类块，包含图片路径、说明文字等结构化字段；印章使用 `sub_type: "seal"` 的 `image` 表示 |
 | `code` | 代码块，包含 `code_content`、`code_caption`、`code_footnote`、`code_language` |
 | `algorithm` | 算法块，包含 `algorithm_content`、`algorithm_caption`、`algorithm_footnote` |
 | `list` / `index` | 列表与索引，包含 `list_items` |
 | `page_header` / `page_footer` / `page_number` / `page_aside_text` / `page_footnote` | 页面辅助块 |
+
+`title_content`、`paragraph_content`、说明文字等行内内容通常由 span 列表组成。
+`hyperlink` span 包含 `content`、`url`，当同一个链接内存在多段不同样式文本时，
+还会包含 `children`；此时 `content` 是 children 文本的拼接，精确样式以
+`children` 中的 `text` span 为准。
 
 ##### 示例数据
 
@@ -757,6 +769,9 @@ vlm 后端的 content_list.json 文件结构与 pipeline 后端类似，伴随�
 - 新增`list`类型，list类型包含两种"sub_type":
     * `text`
     * `ref_text` 
+
+- `image` / `chart` 类型可能带有可选 `sub_type` 字段，用于透传视觉子类型
+- `chart` 类型除 `img_path` 外，还可包含 `content`、`chart_caption`、`chart_footnote`，其中 `content` 保持原始 Markdown 表格文本
 
 - 增加所有所有`discarded_blocks`的输出内容
     * `header`

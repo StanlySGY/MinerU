@@ -1,3 +1,4 @@
+# Copyright (c) Opendatalab. All rights reserved.
 import os
 import threading
 
@@ -9,15 +10,54 @@ from ...model.layout.pp_doclayoutv2 import PPDocLayoutV2LayoutModel
 from ...model.mfr.unimernet.Unimernet import UnimernetModel
 from ...model.mfr.pp_formulanet_plus_m.predict_formula import FormulaRecognizer
 from mineru.model.ocr.pytorch_paddle import PytorchPaddleOCR
-from ...model.ori_cls.paddle_ori_cls import PaddleOrientationClsModel
 from ...model.table.cls.paddle_table_cls import PaddleTableClsModel
+from ...model.table.cls.mineru_table_ori_cls import MineruTableOrientationClsModel
 from ...model.table.rec.slanet_plus.main import PaddleTableModel
 from ...model.table.rec.unet_table.main import UnetTableModel
 from ...utils.config_reader import get_device
 from ...utils.enum_class import ModelPath
 from ...utils.models_download_utils import auto_download_and_get_model_root_path
+from ...utils.ocr_language import normalize_ocr_model_lang
 
 PIPELINE_MODEL_INIT_LOCK = threading.RLock()
+# 这些锁保护 pipeline 与 hybrid 共享的 atom model/native 模型推理调用，避免多线程同时进入同一个模型对象。
+PIPELINE_LAYOUT_INFERENCE_LOCK = threading.RLock()
+PIPELINE_MFR_INFERENCE_LOCK = threading.RLock()
+PIPELINE_OCR_INFERENCE_LOCK = threading.RLock()
+# 临时关闭 pipeline/hybrid 共享推理阶段锁；需要回滚实验时可通过环境变量重新打开。
+PIPELINE_INFERENCE_LOCKS_ENABLED = os.getenv(
+    'MINERU_ENABLE_PIPELINE_INFERENCE_LOCKS', 'False'
+).lower() in ['true', '1', 'yes']
+
+
+def _run_with_inference_lock(inference_lock, inference_callable, *args, **kwargs):
+    """按实验开关决定是否在指定推理锁内执行真实 native 模型调用。"""
+    if not PIPELINE_INFERENCE_LOCKS_ENABLED:
+        return inference_callable(*args, **kwargs)
+
+    with inference_lock:
+        return inference_callable(*args, **kwargs)
+
+
+def run_layout_inference(inference_callable, *args, **kwargs):
+    """按实验开关执行共享 Layout 模型调用。"""
+    return _run_with_inference_lock(
+        PIPELINE_LAYOUT_INFERENCE_LOCK, inference_callable, *args, **kwargs
+    )
+
+
+def run_mfr_inference(inference_callable, *args, **kwargs):
+    """按实验开关执行共享 MFR 模型调用。"""
+    return _run_with_inference_lock(
+        PIPELINE_MFR_INFERENCE_LOCK, inference_callable, *args, **kwargs
+    )
+
+
+def run_ocr_inference(inference_callable, *args, **kwargs):
+    """按实验开关执行共享 OCR native 模型调用。"""
+    return _run_with_inference_lock(
+        PIPELINE_OCR_INFERENCE_LOCK, inference_callable, *args, **kwargs
+    )
 
 MFR_MODEL = os.getenv('MINERU_FORMULA_CH_SUPPORT', 'False')
 if MFR_MODEL.lower() in ['true', '1', 'yes']:
@@ -29,16 +69,16 @@ else:
     MFR_MODEL = "unimernet_small"
 
 
-def img_orientation_cls_model_init():
+def table_orientation_cls_model_init():
     atom_model_manager = AtomModelSingleton()
     ocr_engine = atom_model_manager.get_atom_model(
         atom_model_name=AtomicModel.OCR,
         det_db_box_thresh=0.5,
         det_db_unclip_ratio=1.6,
-        lang="ch_lite",
+        lang="ch",
         enable_merge_det_boxes=False
     )
-    cls_model = PaddleOrientationClsModel(ocr_engine)
+    cls_model = MineruTableOrientationClsModel(ocr_engine)
     return cls_model
 
 
@@ -89,27 +129,20 @@ def pp_doclayout_v2_model_init(weight, device='cpu'):
     model = PPDocLayoutV2LayoutModel(weight, device)
     return model
 
-def ocr_model_init(det_db_box_thresh=0.3,
+
+def ocr_model_init(det_db_box_thresh=0.5,
                    lang=None,
-                   det_db_unclip_ratio=1.8,
+                   det_db_unclip_ratio=1.5,
                    enable_merge_det_boxes=True
                    ):
-    if lang is not None and lang != '':
-        model = PytorchPaddleOCR(
-            det_db_box_thresh=det_db_box_thresh,
-            lang=lang,
-            use_dilation=True,
-            det_db_unclip_ratio=det_db_unclip_ratio,
-            enable_merge_det_boxes=enable_merge_det_boxes,
-        )
-    else:
-        model = PytorchPaddleOCR(
-            det_db_box_thresh=det_db_box_thresh,
-            use_dilation=True,
-            det_db_unclip_ratio=det_db_unclip_ratio,
-            enable_merge_det_boxes=enable_merge_det_boxes,
-        )
-    return model
+    ocr_kwargs = {
+        "lang": normalize_ocr_model_lang(lang),
+        "det_db_box_thresh": det_db_box_thresh,
+        "det_db_unclip_ratio": det_db_unclip_ratio,
+        "enable_merge_det_boxes": enable_merge_det_boxes,
+    }
+
+    return PytorchPaddleOCR(**ocr_kwargs)
 
 
 class AtomModelSingleton:
@@ -126,18 +159,18 @@ class AtomModelSingleton:
     def get_atom_model(self, atom_model_name: str, **kwargs):
 
         lang = kwargs.get('lang', None)
-
+        ocr_singleton_lang = normalize_ocr_model_lang(lang)
         if atom_model_name in [AtomicModel.WiredTable, AtomicModel.WirelessTable]:
             key = (
                 atom_model_name,
-                lang
+                ocr_singleton_lang
             )
         elif atom_model_name in [AtomicModel.OCR]:
             key = (
                 atom_model_name,
-                kwargs.get('det_db_box_thresh', 0.3),
-                lang,
-                kwargs.get('det_db_unclip_ratio', 1.8),
+                kwargs.get('det_db_box_thresh', 0.5),
+                ocr_singleton_lang,
+                kwargs.get('det_db_unclip_ratio', 1.5),
                 kwargs.get('enable_merge_det_boxes', True)
             )
         elif atom_model_name in [AtomicModel.Layout, AtomicModel.MFR]:
@@ -167,9 +200,9 @@ def atom_model_init(model_name: str, **kwargs):
         )
     elif model_name == AtomicModel.OCR:
         atom_model = ocr_model_init(
-            kwargs.get('det_db_box_thresh', 0.3),
+            kwargs.get('det_db_box_thresh', 0.5),
             kwargs.get('lang'),
-            kwargs.get('det_db_unclip_ratio', 1.8),
+            kwargs.get('det_db_unclip_ratio', 1.5),
             kwargs.get('enable_merge_det_boxes', True)
         )
     elif model_name == AtomicModel.WirelessTable:
@@ -182,8 +215,8 @@ def atom_model_init(model_name: str, **kwargs):
         )
     elif model_name == AtomicModel.TableCls:
         atom_model = table_cls_model_init()
-    elif model_name == AtomicModel.ImgOrientationCls:
-        atom_model = img_orientation_cls_model_init()
+    elif model_name == AtomicModel.TableOrientationCls:
+        atom_model = table_orientation_cls_model_init()
     else:
         logger.error('model name not allow')
         exit(1)
@@ -235,7 +268,6 @@ class MineruPipelineModel:
         # 初始化ocr
         self.ocr_model = atom_model_manager.get_atom_model(
             atom_model_name=AtomicModel.OCR,
-            det_db_box_thresh=0.3,
             lang=self.lang
         )
         # init table model
@@ -252,7 +284,7 @@ class MineruPipelineModel:
                 atom_model_name=AtomicModel.TableCls,
             )
             self.img_orientation_cls_model = atom_model_manager.get_atom_model(
-                atom_model_name=AtomicModel.ImgOrientationCls,
+                atom_model_name=AtomicModel.TableOrientationCls,
                 lang=self.lang,
             )
 
@@ -329,23 +361,22 @@ class MineruHybridModel:
         # 初始化OCR模型
         self.ocr_model = self.atom_model_manager.get_atom_model(
             atom_model_name=AtomicModel.OCR,
-            det_db_box_thresh=0.3,
             lang=self.lang
         )
 
-        if formula_enable:
-            # 初始化layout模型，用于提供行内公式检测框
-            self.layout_model = self.atom_model_manager.get_atom_model(
-                atom_model_name=AtomicModel.Layout,
-                pp_doclayout_v2_weights=str(
-                    os.path.join(
-                        auto_download_and_get_model_root_path(ModelPath.pp_doclayout_v2),
-                        ModelPath.pp_doclayout_v2,
-                    )
-                ),
-                device=self.device,
-            )
+        # 初始化layout模型，用于提供行内公式检测框和Hybrid标题拆分
+        self.layout_model = self.atom_model_manager.get_atom_model(
+            atom_model_name=AtomicModel.Layout,
+            pp_doclayout_v2_weights=str(
+                os.path.join(
+                    auto_download_and_get_model_root_path(ModelPath.pp_doclayout_v2),
+                    ModelPath.pp_doclayout_v2,
+                )
+            ),
+            device=self.device,
+        )
 
+        if formula_enable:
             # 初始化公式解析模型
             if MFR_MODEL == "unimernet_small":
                 mfr_model_path = ModelPath.unimernet_small

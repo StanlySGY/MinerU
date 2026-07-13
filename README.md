@@ -20,6 +20,7 @@
 [![Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/gist/myhloli/a3cb16570ab3cfeadf9d8f0ac91b4fca/mineru_demo.ipynb)
 [![arXiv](https://img.shields.io/badge/MinerU-Technical%20Report-b31b1b.svg?logo=arXiv)](https://arxiv.org/abs/2409.18839)
 [![arXiv](https://img.shields.io/badge/MinerU2.5-Technical%20Report-b31b1b.svg?logo=arXiv)](https://arxiv.org/abs/2509.22186)
+[![arXiv](https://img.shields.io/badge/MinerU2.5%20Pro-Technical%20Report-b31b1b.svg?logo=arXiv)](https://arxiv.org/abs/2604.04771)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/opendatalab/MinerU)
 
 
@@ -46,11 +47,12 @@
 
 <details>
 <summary>MinerU — High-accuracy document parsing engine for LLM · RAG · Agent workflows</summary>
-Converts PDF · Word · PPT · Images · Web pages into structured Markdown / JSON · VLM+OCR dual engine · 109 languages <br>
+Converts PDF · DOCX · PPTX · XLSX · Images · Web pages into structured Markdown / JSON · VLM+OCR dual engine · 109 languages <br>
 MCP Server · LangChain / Dify / FastGPT native integration · 10+ domestic AI chip support
 
 **🔍 Core Parsing Capabilities**
 
+- Native support for `DOCX`, `PPTX`, and `XLSX` parsing
 - Formulas → LaTeX · Tables → HTML, accurate layout reconstruction
 - Supports scanned docs, handwriting, multi-column layouts, cross-page table merging
 - Output follows human reading order with automatic header/footer removal
@@ -77,6 +79,57 @@ Domestic AI chips: Ascend · Cambricon · Enflame · MetaX · Moore Threads · K
 </details>
 
 # Changelog
+
+- 2026/06/18 3.4 Released
+
+  This release focuses on **OCR capability upgrades for the pipeline backend**, **OCR processing pipeline optimization**, and **model download experience improvements**. The main updates include:
+
+  - OCR model upgrade and processing acceleration
+    - The OCR model for the `pipeline` backend has been upgraded to `PP-OCRv6`, improving OCR accuracy by about `11%` on OmniDocBench v1.6.
+    - Removed Japanese, Traditional Chinese, English, and Latin options from OCR language selection. These scenarios are now routed to the `ch` OCR model, simplifying model configuration and language selection.
+    - Optimized the OCR inference and processing pipeline, increasing OCR processing speed by about `100%` and significantly improving parsing efficiency for batch documents and OCR-intensive documents.
+
+  - Model download logic optimization
+    - Added automatic model source selection, allowing first-time installations to choose a better model source based on the current network environment.
+    - Before downloading models, MinerU now prioritizes checking locally downloaded model cache files. Cache hits can be reused directly, reducing repeated downloads and unnecessary remote requests.
+    - For more details about model source configuration, automatic source selection, and local model usage, see the [Model Source Documentation](https://opendatalab.github.io/MinerU/usage/model_source/).
+
+  With the 3.4 release, MinerU further improves the parsing accuracy and processing efficiency of the `pipeline` backend in OCR scenarios. It also optimizes model downloads, cache reuse, and local configuration write-back, making first-time installation, model updates, and multi-environment deployment more stable and automated.
+
+- 2026/06/11 3.3 Released
+
+  This release focuses on **Hybrid parsing performance optimization** and **VLM model capability upgrades**. The main updates include:
+
+  - New `effort` parsing-strength parameter for the Hybrid backend
+    - Added two parsing-strength levels, `medium` and `high`, allowing users to balance parsing speed, parsing accuracy, and feature requirements.
+    - On OmniDocBench v1.6, `medium` reduces overall accuracy by only `0.13` points compared with `high`, while delivering `35%` ~ `220%` parsing speed improvements across different devices and scenarios:
+      - Linux: about `80%` faster for text PDF scenarios and about `35%` faster for OCR scenarios
+      - Windows: about `90%` faster for text PDF scenarios and about `45%` faster for OCR scenarios
+      - macOS: about `220%` faster for text PDF scenarios and about `50%` faster for OCR scenarios
+    - The default Hybrid backend now uses `effort=medium`, significantly improving overall parsing efficiency while maintaining high parsing accuracy.
+    - The `medium` level does not support `image analysis`; for maximum parsing accuracy or `image analysis` support, switch to the high-strength parsing mode with `effort=high`, which may have an impact on parsing speed.
+
+  - VLM model upgraded to `MinerU2.5-Pro-2605-1.2B`
+    - Fixed multiple model issues found in the `2604` version, further improving parsing stability on complex documents.
+    - Added native multilingual OCR support, reducing the need for extra language-parameter configuration and improving out-of-the-box usability for multilingual documents.
+
+  With the 3.3 release, MinerU further improves Hybrid backend efficiency across platforms and scenarios while maintaining high-accuracy parsing. The default `medium` effort level is better suited for most day-to-day document processing tasks, while `high` is designed for scenarios that require maximum parsing accuracy or `image analysis` capabilities.
+
+- 2026/04/18 3.1.0 Released
+
+  This release focuses on **licensing openness, parsing accuracy, and full-format native support**. The main updates include:
+
+  - License upgrade
+    - MinerU has officially moved from `AGPLv3` to the [MinerU Open Source License](https://github.com/opendatalab/MinerU/blob/master/LICENSE.md), a custom license based on `Apache 2.0`.
+    - This change significantly reduces adoption friction for both community users and commercial deployments, making MinerU easier to integrate into real-world workflows.
+  - VLM main model upgrade
+    - The primary VLM model has been upgraded to `MinerU2.5-Pro-2604-1.2B`, bringing overall parsing accuracy to a state-of-the-art level.
+    - The new model now supports image and chart parsing, truncated paragraph merging, cross-page table merging, and image recognition inside tables, further strengthening performance on complex document layouts.
+  - Full-format native parsing support
+    - Native parsing support has now been extended to `PPTX` and `XLSX`.
+    - MinerU now fully supports parsing across images, `PDF`, `DOCX`, `PPTX`, and `XLSX`, providing a more complete multi-format document understanding workflow.
+
+  With the 3.1.0 release, MinerU becomes more open, more accurate, and easier to adopt in production. The new license lowers the barrier for both community and commercial use, `MinerU2.5-Pro-2604-1.2B` improves parsing quality on complex content, and native `PPTX` / `XLSX` support completes end-to-end coverage of mainstream document formats.
 
 - 2026/03/29 3.0.0 Released
 
@@ -108,7 +161,7 @@ Domestic AI chips: Ascend · Cambricon · Enflame · MetaX · Moore Threads · K
 
 ## Project Introduction
 
-MinerU is a document parsing tool that converts `PDF`, image, and `DOCX` inputs into machine-readable formats such as Markdown and JSON for downstream retrieval, extraction, and processing.
+MinerU is a document parsing tool that converts `PDF`, image, `DOCX`, `PPTX`, and `XLSX` inputs into machine-readable formats such as Markdown and JSON for downstream retrieval, extraction, and processing.
 MinerU was born during the pre-training process of [InternLM](https://github.com/InternLM/InternLM). We focus on solving symbol conversion issues in scientific literature and hope to contribute to technological development in the era of large models.
 Compared to well-known commercial products, MinerU is still young. If you encounter any issues or if the results are not as expected, please submit an issue on [issue](https://github.com/opendatalab/MinerU/issues) and **attach the relevant document or sample file**.
 
@@ -116,7 +169,7 @@ https://github.com/user-attachments/assets/4bea02c9-6d54-4cd6-97ed-dff14340982c
 
 ## Key Features
 
-- Support `PDF`, image, and `DOCX` inputs.
+- Support `PDF`, image, `DOCX`, `PPTX`, and `XLSX` inputs.
 - Remove headers, footers, footnotes, page numbers, etc., to ensure semantic coherence.
 - Output text in human-readable order, suitable for single-column, multi-column, and complex layouts.
 - Preserve the structure of the original document, including headings, paragraphs, lists, etc.
@@ -128,13 +181,14 @@ https://github.com/user-attachments/assets/4bea02c9-6d54-4cd6-97ed-dff14340982c
 - Supports multiple output formats, such as multimodal and NLP Markdown, JSON sorted by reading order, and rich intermediate formats.
 - Supports various visualization results, including layout visualization and span visualization, for efficient confirmation of output quality.
 - Built-in CLI, FastAPI, Gradio WebUI, for local orchestration and multi-service deployment.
-- Supports running in a pure CPU environment, and also supports GPU(CUDA)/NPU(CANN)/MPS acceleration
+- Supports running in a pure CPU environment, and also supports GPU/MPS acceleration
 - Compatible with Windows, Linux, and Mac platforms.
 
 # Quick Start
 
-If you encounter any installation issues, please first consult the <a href="#faq">FAQ</a>. </br>
-If the parsing results are not as expected, refer to the <a href="#known-issues">Known Issues</a>. </br>
+Document parsing is a difficult and complex task. In scenarios such as complex layouts, scanned pages, and handwritten content, the parsing results may fall short of expectations. We recommend trying the online demo first to evaluate MinerU's parsing quality and suitability before choosing an appropriate deployment method based on your actual needs.
+If you have **document** samples with unsatisfactory parsing results, feel free to share them in an [issue](https://github.com/opendatalab/MinerU/issues). We will continue improving the parsing capabilities.
+If you encounter any installation issues, please first consult the <a href="#faq">FAQ</a>. 
 
 ## Online Experience
 
@@ -166,7 +220,7 @@ A WebUI developed based on Gradio, with a simple interface and only core parsing
     <tr>
       <th rowspan="2">Parsing Backend</th>
       <th rowspan="2">pipeline</th>
-      <th colspan="2">*-auto-engine</th>
+      <th colspan="2">*-engine</th>
       <th colspan="2">*-http-client</th>
     </tr>
     <tr>
@@ -185,8 +239,11 @@ A WebUI developed based on Gradio, with a simple interface and only core parsing
     </tr> 
     <tr>
       <th>Accuracy<sup>1</sup></th>
-      <td style="text-align:center;">86+</td>
-      <td colspan="4" style="text-align:center;">90+</td>
+      <td style="text-align:center;">86.47</td>
+      <td style="text-align:center;">95.39 (high)<br>95.26 (medium)</td>
+      <td style="text-align:center;">95.30</td>
+      <td style="text-align:center;">95.39 (high)<br>95.26 (medium)</td>
+      <td style="text-align:center;">95.30</td>
     </tr>
     <tr>
       <th>Operating System</th>
@@ -206,8 +263,7 @@ A WebUI developed based on Gradio, with a simple interface and only core parsing
     <tr>
       <th>Min VRAM</th>
       <td style="text-align:center;">4GB</td>
-      <td style="text-align:center;">8GB</td>
-      <td style="text-align:center;">8GB</td>
+      <td colspan="2" style="text-align:center;">8GB</td>
       <td style="text-align:center;">2GB</td>
     </tr>
     <tr>
@@ -227,7 +283,7 @@ A WebUI developed based on Gradio, with a simple interface and only core parsing
   </tbody>
 </table>
 
-<sup>1</sup> Accuracy metrics are the End-to-End Evaluation Overall scores from OmniDocBench (v1.5), based on the latest version of `MinerU`.  
+<sup>1</sup> Accuracy metrics are the End-to-End Evaluation Overall scores from OmniDocBench (v1.6), based on the latest version of `MinerU`.  
 <sup>2</sup> Servers compatible with OpenAI API, such as local model servers or remote model services deployed via inference frameworks like `vLLM`/`SGLang`/`LMDeploy`.  
 <sup>3</sup> Linux only supports distributions from 2019 and later.  
 <sup>4</sup> Since the key dependency `ray` does not support Python 3.13 on Windows, only versions 3.10~3.12 are supported.  
@@ -251,13 +307,19 @@ uv pip install -e .[all]
 ```
 
 > [!TIP]
-> `mineru[all]` includes all core features, compatible with Windows / Linux / macOS systems, suitable for most users.
-> If you need to specify the inference framework for the VLM model, or only intend to install a lightweight client on an edge device, please refer to the documentation [Extension Modules Installation Guide](https://opendatalab.github.io/MinerU/quick_start/extension_modules/).
+> - `mineru[all]` includes all core features, compatible with Windows / Linux / macOS systems, suitable for most users.
+> - If CUDA acceleration is unavailable after installing on Windows, see the [Windows CUDA acceleration FAQ](https://opendatalab.github.io/MinerU/faq/#windows-cuda-acceleration).
+> - If you need to specify the inference framework for the VLM model, or only intend to install a lightweight client on an edge device, please refer to the documentation [Extension Modules Installation Guide](https://opendatalab.github.io/MinerU/quick_start/extension_modules/).
 
 ---
  
 #### Deploy MinerU using Docker
 MinerU provides a convenient Docker deployment method, which helps quickly set up the environment and solve some tricky environment compatibility issues.
+
+> [!TIP]
+> - Docker deployment is only supported on Linux and Windows environments with WSL2 support;
+> - macOS users should refer to the two installation methods above for installation instead of using Docker deployment.
+
 You can get the [Docker Deployment Instructions](https://opendatalab.github.io/MinerU/quick_start/docker_deployment/) in the documentation.
 
 ---
@@ -274,31 +336,7 @@ If your device does not meet the GPU acceleration requirements, you can specify 
 mineru -p <input_path> -o <output_path> -b pipeline
 ```
 
-`mineru` currently supports local `PDF`, image, and `DOCX` file or directory inputs, and can be used for document parsing through the CLI, API, WebUI, and `mineru-router`. For detailed instructions, please refer to the [Usage Guide](https://opendatalab.github.io/MinerU/usage/).
-
-# TODO
-
-- [x] Reading order based on the model  
-- [x] Recognition of `index` and `list` in the main text  
-- [x] Table recognition
-- [x] Heading Classification
-- [x] Handwritten Text Recognition  
-- [x] Vertical Text Recognition  
-- [x] Latin Accent Mark Recognition
-- [x] Code block recognition in the main text
-- [x] [Chemical formula recognition](docs/chemical_knowledge_introduction/introduction.pdf)(mineru.net)
-- [ ] Geometric shape recognition
-
-# Known Issues
-
-- Reading order is determined by the model based on the spatial distribution of readable content, and may be out of order in some areas under extremely complex layouts.
-- Limited support for vertical text.
-- Tables of contents and lists are recognized through rules, and some uncommon list formats may not be recognized.
-- Code blocks are not yet supported in the layout model.
-- Comic books, art albums, primary school textbooks, and exercises cannot be parsed well.
-- Table recognition may result in row/column recognition errors in complex tables.
-- OCR recognition may produce inaccurate characters in PDFs of lesser-known languages (e.g., diacritical marks in Latin script, easily confused characters in Arabic script).
-- Some formulas may not render correctly in Markdown.
+`mineru` currently supports local `PDF`, image, `DOCX`, `PPTX`, and `XLSX` file or directory inputs, and can be used for document parsing through the CLI, API, WebUI, and `mineru-router`. For detailed instructions, please refer to the [Usage Guide](https://opendatalab.github.io/MinerU/usage/).
 
 # FAQ
 
@@ -314,9 +352,7 @@ mineru -p <input_path> -o <output_path> -b pipeline
 
 # License Information
 
-[LICENSE.md](LICENSE.md)
-
-The source code in this repository is licensed under AGPLv3.
+This repository is licensed under the [MinerU Open Source License](https://github.com/opendatalab/MinerU/blob/master/LICENSE.md), based on Apache 2.0 with additional conditions.
 
 # Acknowledgments
 
@@ -327,7 +363,6 @@ The source code in this repository is licensed under AGPLv3.
 - [fast-langdetect](https://github.com/LlmKira/fast-langdetect)
 - [pypdfium2](https://github.com/pypdfium2-team/pypdfium2)
 - [pdftext](https://github.com/datalab-to/pdftext)
-- [pdfminer.six](https://github.com/pdfminer/pdfminer.six)
 - [pypdf](https://github.com/py-pdf/pypdf)
 - [magika](https://github.com/google/magika)
 - [vLLM](https://github.com/vllm-project/vllm)

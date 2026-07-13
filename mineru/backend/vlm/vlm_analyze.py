@@ -19,9 +19,12 @@ from .model_output_to_middle_json import (
     finalize_middle_json,
     init_middle_json,
 )
-from mineru.backend.utils import exclude_progress_bar_idle_time
+from mineru.backend.utils.runtime_utils import exclude_progress_bar_idle_time
 from ...data.data_reader_writer import DataWriter
-from mineru.utils.pdf_image_tools import load_images_from_pdf_doc
+from mineru.utils.pdf_image_tools import (
+    aio_load_images_from_pdf_bytes_range,
+    load_images_from_pdf_doc,
+)
 from ...utils.check_sys_env import is_mac_os_version_supported
 from ...utils.config_reader import get_device, get_processing_window_size
 
@@ -106,11 +109,8 @@ class ModelSingleton:
                     mlx_supported = is_mac_os_version_supported()
                     if not mlx_supported:
                         raise EnvironmentError("mlx-engine backend is only supported on macOS 13.5+ with Apple Silicon.")
-                    try:
-                        from mlx_vlm import load as mlx_load
-                    except ImportError:
-                        raise ImportError("Please install mlx-vlm to use the mlx-engine backend.")
-                    model, processor = mlx_load(model_path)
+                    from mineru_vl_utils.mlx_compat import load_mlx_model
+                    model, processor = load_mlx_model(model_path)
                 else:
                     if os.getenv('OMP_NUM_THREADS') is None:
                         os.environ["OMP_NUM_THREADS"] = "1"
@@ -233,6 +233,9 @@ class ModelSingleton:
                     server_headers=server_headers,
                     max_retries=max_retries,
                     retry_backoff_factor=retry_backoff_factor,
+                    enable_table_formula_eq_wrap=True,
+                    image_analysis=True,
+                    enable_cross_page_table_merge=True,
                 )
                 predictor._mineru_runtime_handles = {
                     "backend": backend,
@@ -257,6 +260,21 @@ class ModelSingleton:
             _shutdown_predictor_runtime(predictor)
 
         gc.collect()
+
+
+async def _get_model_async(
+    backend: str,
+    model_path: str | None,
+    server_url: str | None,
+    **kwargs,
+) -> MinerUClient:
+    return await asyncio.to_thread(
+        ModelSingleton().get_model,
+        backend,
+        model_path,
+        server_url,
+        **kwargs,
+    )
 
 
 def _iter_shutdown_candidates(predictor: MinerUClient):
@@ -409,8 +427,12 @@ def doc_analyze(
     backend="transformers",
     model_path: str | None = None,
     server_url: str | None = None,
+    image_analysis: bool = True,
     **kwargs,
 ):
+    client_side_output_generation = bool(
+        kwargs.pop("client_side_output_generation", False)
+    )
     if predictor is None:
         predictor = ModelSingleton().get_model(backend, model_path, server_url, **kwargs)
     predictor = _maybe_enable_serial_execution(predictor, backend)
@@ -454,7 +476,10 @@ def doc_analyze(
                         f'({len(images_pil_list)} pages)'
                     )
                     with predictor_execution_guard(predictor):
-                        window_results = predictor.batch_two_step_extract(images=images_pil_list)
+                        window_results = predictor.batch_two_step_extract(
+                            images=images_pil_list,
+                            image_analysis=image_analysis,
+                        )
                     results.extend(window_results)
                     if progress_bar is None:
                         progress_bar = tqdm(total=page_count, desc="Processing pages")
@@ -485,7 +510,8 @@ def doc_analyze(
                 f"processing-window infer finished, cost: {infer_time}, "
                 f"speed: {round(len(results) / infer_time, 3)} page/s"
             )
-        finalize_middle_json(middle_json["pdf_info"])
+        if not client_side_output_generation:
+            finalize_middle_json(middle_json["pdf_info"])
         close_pdfium_document(pdf_doc)
         doc_closed = True
         return middle_json, results
@@ -501,10 +527,14 @@ async def aio_doc_analyze(
     backend="transformers",
     model_path: str | None = None,
     server_url: str | None = None,
+    image_analysis: bool = True,
     **kwargs,
 ):
+    client_side_output_generation = bool(
+        kwargs.pop("client_side_output_generation", False)
+    )
     if predictor is None:
-        predictor = ModelSingleton().get_model(backend, model_path, server_url, **kwargs)
+        predictor = await _get_model_async(backend, model_path, server_url, **kwargs)
     predictor = _maybe_enable_serial_execution(predictor, backend)
 
     pdf_doc = open_pdfium_document(pdfium.PdfDocument, pdf_bytes)
@@ -531,12 +561,11 @@ async def aio_doc_analyze(
         try:
             for window_index, window_start in enumerate(range(0, page_count, effective_window_size or 1)):
                 window_end = min(page_count - 1, window_start + effective_window_size - 1)
-                images_list = load_images_from_pdf_doc(
-                    pdf_doc,
+                images_list = await aio_load_images_from_pdf_bytes_range(
+                    pdf_bytes,
                     start_page_id=window_start,
                     end_page_id=window_end,
                     image_type=ImageType.PIL,
-                    pdf_bytes=pdf_bytes,
                 )
                 try:
                     images_pil_list = [image_dict["img_pil"] for image_dict in images_list]
@@ -546,7 +575,10 @@ async def aio_doc_analyze(
                         f'({len(images_pil_list)} pages)'
                     )
                     async with aio_predictor_execution_guard(predictor):
-                        window_results = await predictor.aio_batch_two_step_extract(images=images_pil_list)
+                        window_results = await predictor.aio_batch_two_step_extract(
+                            images=images_pil_list,
+                            image_analysis=image_analysis,
+                        )
                     results.extend(window_results)
                     if progress_bar is None:
                         progress_bar = tqdm(total=page_count, desc="Processing pages")
@@ -577,7 +609,8 @@ async def aio_doc_analyze(
                 f"processing-window infer finished, cost: {infer_time}, "
                 f"speed: {round(len(results) / infer_time, 3)} page/s"
             )
-        finalize_middle_json(middle_json["pdf_info"])
+        if not client_side_output_generation:
+            await asyncio.to_thread(finalize_middle_json, middle_json["pdf_info"])
         close_pdfium_document(pdf_doc)
         doc_closed = True
         return middle_json, results

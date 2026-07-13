@@ -1,3 +1,4 @@
+# Copyright (c) Opendatalab. All rights reserved.
 import os
 import math
 from pathlib import Path
@@ -8,6 +9,9 @@ import argparse
 
 root_dir = Path(__file__).resolve().parent.parent.parent
 DEFAULT_CFG_PATH = root_dir / "pytorchocr" / "utils" / "resources" / "arch_config.yaml"
+DEFAULT_REC_CHAR_DICT_PATH = (
+    root_dir / "pytorchocr" / "utils" / "resources" / "dict" / "ppocrv6_dict.txt"
+)
 
 
 def init_args():
@@ -78,7 +82,7 @@ def init_args():
 
     parser.add_argument("--use_space_char", type=str2bool, default=True)
     parser.add_argument("--drop_score", type=float, default=0.5)
-    parser.add_argument("--limited_max_width", type=int, default=1280)
+    parser.add_argument("--limited_max_width", type=int, default=2560)
     parser.add_argument("--limited_min_width", type=int, default=16)
 
     parser.add_argument(
@@ -87,8 +91,7 @@ def init_args():
     parser.add_argument(
         "--rec_char_dict_path",
         type=str,
-        default=os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-                             'pytorchocr/utils/ppocr_keys_v1.txt'))
+        default=str(DEFAULT_REC_CHAR_DICT_PATH))
 
     # params for text classifier
     parser.add_argument("--use_angle_cls", type=str2bool, default=False)
@@ -218,8 +221,9 @@ def base64_to_cv2(b64str):
 
 
 def get_arch_config(model_path):
-    from omegaconf import OmegaConf
-    all_arch_config = OmegaConf.load(DEFAULT_CFG_PATH)
+    import yaml
+    with open(DEFAULT_CFG_PATH, encoding='utf-8') as f:
+        all_arch_config = yaml.safe_load(f)
     path = Path(model_path)
     file_name = path.stem
     if file_name not in all_arch_config:

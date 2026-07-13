@@ -50,13 +50,17 @@ def build_form_data(
     server_url: str | None,
     start_page_id: int,
     end_page_id: int | None,
+    image_analysis: bool = True,
+    effort: str = "medium",
 ) -> dict[str, str | list[str]]:
     return _api_client.build_parse_request_form_data(
         lang_list=[language],
         backend=backend,
+        effort=effort,
         parse_method=parse_method,
         formula_enable=formula_enable,
         table_enable=table_enable,
+        image_analysis=image_analysis,
         server_url=server_url,
         start_page_id=start_page_id,
         end_page_id=end_page_id,
@@ -93,11 +97,13 @@ async def run_demo(
     output_dir: str | Path,
     *,
     api_url: str | None = None,
-    backend: str = "hybrid-auto-engine",
+    backend: str = "hybrid-engine",
     parse_method: str = "auto",
     language: str = "ch",
     formula_enable: bool = True,
     table_enable: bool = True,
+    image_analysis: bool = True,
+    effort: str = "medium",
     server_url: str | None = None,
     start_page_id: int = 0,
     end_page_id: int | None = None,
@@ -117,6 +123,8 @@ async def run_demo(
         parse_method=parse_method,
         formula_enable=formula_enable,
         table_enable=table_enable,
+        image_analysis=image_analysis,
+        effort=effort,
         server_url=server_url,
         start_page_id=start_page_id,
         end_page_id=end_page_id,
@@ -208,23 +216,27 @@ def main() -> None:
     api_url = None
 
     # Available examples:
-    # "hybrid-auto-engine"   -> local hybrid parsing, recommended default
+    # "hybrid-engine"        -> local hybrid parsing, recommended default
     # "pipeline"             -> more general OCR/text pipeline
-    # "vlm-auto-engine"      -> local VLM parsing
+    # "vlm-engine"           -> local VLM parsing
     # "vlm-http-client"      -> remote OpenAI-compatible VLM server
     # "hybrid-http-client"   -> remote OpenAI-compatible hybrid server
-    backend = "hybrid-auto-engine"
+    backend = "hybrid-engine"
+    # Hybrid parsing effort. "medium" is faster; "high" keeps the high-effort hybrid behavior.
+    effort = "medium"
     # Available options:
     # "auto" -> let MinerU choose between text extraction and OCR
     # "txt"  -> force text extraction
     # "ocr"  -> force OCR
     parse_method = "auto"
-    # OCR language hint. This is mainly used by pipeline and hybrid backends.
+    # Pipeline OCR language hint; hybrid and VLM backends ignore this value.
     language = "ch"
     # Enable formula parsing in the output.
     formula_enable = True
     # Enable table parsing in the output.
     table_enable = True
+    # Enable image/chart analysis for VLM and hybrid backends.
+    image_analysis = True
     # Required only for "*-http-client" backends, for example:
     # "http://127.0.0.1:30000"
     server_url = None
@@ -241,10 +253,12 @@ def main() -> None:
             output_dir=output_dir,
             api_url=api_url,
             backend=backend,
+            effort=effort,
             parse_method=parse_method,
             language=language,
             formula_enable=formula_enable,
             table_enable=table_enable,
+            image_analysis=image_analysis,
             server_url=server_url,
             start_page_id=start_page_id,
             end_page_id=end_page_id,

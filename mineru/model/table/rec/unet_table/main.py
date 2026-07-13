@@ -1,3 +1,4 @@
+# Copyright (c) Opendatalab. All rights reserved.
 import html
 import logging
 import os
@@ -26,6 +27,21 @@ from .utils_table_recover import (
     sorted_ocr_boxes,
     gather_ocr_list_by_row,
 )
+
+BLANK_CELL_REC_DROP_TEXTS = {
+    "1",
+    "一",
+    "—",
+    "口",
+    "■",
+    "（204号",
+    "（20",
+    "（2",
+    "（2号",
+    "（20号",
+    "号",
+    "（204",
+}
 
 
 @dataclass
@@ -96,12 +112,13 @@ class WiredTableRecognition:
             # 将每个单元格中的ocr识别结果排序和同行合并，输出的html能完整保留文字的换行格式
             t_rec_ocr_list = self.sort_and_gather_ocr_res(t_rec_ocr_list)
 
-            logi_points = [t_box_ocr["t_logic_box"] for t_box_ocr in t_rec_ocr_list]
             cell_box_det_map = {
-                i: [ocr_box_and_text[1] for ocr_box_and_text in t_box_ocr["t_ocr_res"]]
-                for i, t_box_ocr in enumerate(t_rec_ocr_list)
+                t_box_ocr["cell_idx"]: [
+                    ocr_box_and_text[1] for ocr_box_and_text in t_box_ocr["t_ocr_res"]
+                ]
+                for t_box_ocr in t_rec_ocr_list
             }
-            pred_html = plot_html_table(logi_points, cell_box_det_map)
+            pred_html = plot_html_table(logi_points, cell_box_det_map, polygons)
             polygons = np.array(polygons).reshape(-1, 8)
             logi_points = np.array(logi_points)
             elapse = time.perf_counter() - s
@@ -127,6 +144,8 @@ class WiredTableRecognition:
             xmax = max([ocr_box[0][2][0] for ocr_box in ocr_res_list])
             ymax = max([ocr_box[0][2][1] for ocr_box in ocr_res_list])
             dict_res = {
+                # 物理 cell 的原始下标，用于按完整结构回填空单元格
+                "cell_idx": i,
                 # xmin,xmax,ymin,ymax
                 "t_box": [xmin, ymin, xmax, ymax],
                 # row_start,row_end,col_start,col_end
@@ -151,20 +170,18 @@ class WiredTableRecognition:
             )
         return res
 
-    # def fill_blank_rec(
-    #     self,
-    #     img: np.ndarray,
-    #     sorted_polygons: np.ndarray,
-    #     cell_box_map: Dict[int, List[str]],
-    # ) -> Dict[int, List[Any]]:
-    #     """找到poly对应为空的框，尝试将直接将poly框直接送到识别中"""
-    #     for i in range(sorted_polygons.shape[0]):
-    #         if cell_box_map.get(i):
-    #             continue
-    #         box = sorted_polygons[i]
-    #         cell_box_map[i] = [[box, "", 1]]
-    #         continue
-    #     return cell_box_map
+    @staticmethod
+    def _should_drop_blank_cell_rec_result(text: str, score) -> bool:
+        """判断空单元格二次 OCR-rec 结果是否应作为噪声过滤。"""
+        try:
+            if float(score) < 0.6:
+                return True
+        except (TypeError, ValueError):
+            return True
+
+        normalized_text = "" if text is None else str(text).strip()
+        return not normalized_text or normalized_text in BLANK_CELL_REC_DROP_TEXTS
+
     def fill_blank_rec(
         self,
         img: np.ndarray,
@@ -205,13 +222,6 @@ class WiredTableRecognition:
         if len(img_crop_list) > 0:
             # 进行ocr识别
             ocr_result = self.ocr_engine.ocr(img_crop_list, det=False)
-            # ocr_result = [[]]
-            # for crop_img in img_crop_list:
-            #     tmp_ocr_result = self.ocr_engine.ocr(crop_img)
-            #     if tmp_ocr_result[0] and len(tmp_ocr_result[0]) > 0 and isinstance(tmp_ocr_result[0], list) and len(tmp_ocr_result[0][0]) == 2:
-            #         ocr_result[0].append(tmp_ocr_result[0][0][1])
-            #     else:
-            #         ocr_result[0].append(("", 0.0))
 
             if not ocr_result or not isinstance(ocr_result, list) or len(ocr_result) == 0:
                 logger.warning("OCR engine returned no results or invalid result for image crops.")
@@ -227,7 +237,7 @@ class WiredTableRecognition:
                 # 处理ocr结果
                 ocr_text, ocr_score = ocr_res
                 # logger.debug(f"OCR result for box {i}: {ocr_text} with score {ocr_score}")
-                if ocr_score < 0.6 or ocr_text in ['1','口','■','（204号', '（20', '（2', '（2号', '（20号', '号', '（204']:
+                if self._should_drop_blank_cell_rec_result(ocr_text, ocr_score):
                     # logger.warning(f"Low confidence OCR result for box {i}: {ocr_text} with score {ocr_score}")
                     box = sorted_polygons[i]
                     cell_box_map[i] = [[box, "", 0.1]]

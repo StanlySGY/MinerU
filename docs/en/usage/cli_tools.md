@@ -12,19 +12,27 @@ Options:
   -o, --output PATH               Output directory (required)
   --api-url TEXT                  MinerU FastAPI base URL; if omitted, `mineru` starts a temporary local `mineru-api`
   -m, --method [auto|txt|ocr]     Parsing method: auto (default), txt, ocr (pipeline and hybrid* backend only)
-  -b, --backend [pipeline|hybrid-auto-engine|hybrid-http-client|vlm-auto-engine|vlm-http-client]
-                                  Parsing backend (default: hybrid-auto-engine)
-  -l, --lang [ch|ch_server|ch_lite|en|korean|japan|chinese_cht|ta|te|ka|th|el|latin|arabic|east_slavic|cyrillic|devanagari]
-                                  Specify document language (improves OCR accuracy, pipeline and hybrid* backend only)
+  -b, --backend [pipeline|vlm-engine|hybrid-engine|vlm-http-client|hybrid-http-client]
+                                  Parsing backend (default: hybrid-engine)
+  --effort [medium|high]          Hybrid parsing effort (default: medium)
+  -l, --lang [ch|ch_server|korean|ta|te|ka|th|el|arabic|east_slavic|cyrillic|devanagari]
+                                  Specify document language (improves OCR accuracy, pipeline backend only)
   -u, --url TEXT                  OpenAI-compatible backend URL passed through to the server when using http-client
   -s, --start INTEGER             Starting page number for parsing (0-based)
   -e, --end INTEGER               Ending page number for parsing (0-based)
   -f, --formula BOOLEAN           Enable formula parsing (default: enabled)
   -t, --table BOOLEAN             Enable table parsing (default: enabled)
+  --image-analysis BOOLEAN        Enable image/chart analysis for VLM and hybrid
+                                  backends. Hybrid medium effort automatically
+                                  disables image/chart analysis (default: enabled)
+  --client-side-output-generation BOOLEAN
+                                  Generate Markdown and content lists locally
+                                  from server-returned middle JSON, images, and
+                                  original files (default: disabled)
   --help                          Show help information
 ```
 > [!TIP]
-> `mineru` currently supports local `PDF`, image, and `DOCX` file or directory inputs.
+> `mineru` currently supports local `PDF`, image, `DOCX`, `PPTX`, and `XLSX` file or directory inputs.
 
 ```bash
 mineru-api --help
@@ -45,7 +53,7 @@ Usage: mineru-gradio [OPTIONS]
 Options:
   --enable-example BOOLEAN        Enable example files for input. The example
                                   files to be input need to be placed in the
-                                  `example` folder within the directory where
+                                  `examples` folder within the directory where
                                   the command is currently executed.
   --enable-http-client BOOLEAN    Enable http-client backend to link openai-
                                   compatible servers.
@@ -59,6 +67,9 @@ Options:
                                   starts a reusable local mineru-api service.
   --enable-vlm-preload BOOLEAN    Preload the local VLM model when gradio
                                   starts a local mineru-api service.
+  --client-side-output-generation BOOLEAN
+                                  Generate Markdown and content lists locally
+                                  from server-returned middle JSON.
   --latex-delimiters-type [a|b|all]
                                   Set the type of LaTeX delimiters to use in
                                   Markdown rendering: 'a' for type '$', 'b' for
@@ -119,12 +130,12 @@ Here are the environment variables and their descriptions:
 - `MINERU_PDF_RENDER_TIMEOUT`:
     * Used to set the timeout (in seconds) for rendering PDFs to images.
     * Default is `300` seconds; you can set a different value via an environment variable to adjust the rendering timeout.
-    * Only effective on Linux and macOS systems.
+    * Effective on Linux, macOS, and Windows.
 
 - `MINERU_PDF_RENDER_THREADS`:
-    * Used to set the number of threads used when rendering PDFs to images.
-    * Default is `4`; you can set a different value via an environment variable to adjust the number of threads for image rendering.
-    * Only effective on Linux and macOS systems.
+    * Used to set the render worker concurrency used when rendering PDFs to images.
+    * Default is `4`; you can set a different value via an environment variable to adjust render worker concurrency.
+    * Effective on Linux, macOS, and Windows.
 
 - `MINERU_PROCESSING_WINDOW_SIZE`:
     * Used to control the processing window size, which affects memory use and throughput on large-document workloads.
@@ -146,6 +157,16 @@ Here are the environment variables and their descriptions:
     * Used to control how long CLI tools wait for a locally started `mineru-api` to become healthy.
     * Default is `300` seconds.
     * Applies to temporary local API startup in `mineru`, preload startup in `mineru-gradio`, and router-managed local workers.
+
+- `MINERU_TASK_RESULT_TIMEOUT_SECONDS`:
+    * Used to control how long clients wait for a task to complete and reach a terminal state.
+    * Default is `3600` seconds, and the value must be greater than or equal to `1`.
+    * Applies to task-status polling in `mineru`, `mineru-gradio`, `mineru-router`, and other API-client scenarios.
+
+- `MINERU_TASK_RESULT_DOWNLOAD_TIMEOUT_SECONDS`:
+    * Used to control the read timeout when retrieving completed task results, including waiting for server-side ZIP generation and downloading the result ZIP.
+    * Default is `600` seconds, and the value must be greater than or equal to `1`.
+    * This is not a hard limit for total download duration; if the server keeps returning data, the total download time may exceed this value.
 
 - `MINERU_API_TASK_RETENTION_SECONDS`:
     * Used to set how long completed or failed tasks are retained, in seconds.
@@ -172,10 +193,6 @@ Here are the environment variables and their descriptions:
       <= 4   GB               | 4
       <= 3   GB               | 2
       <= 2   GB               | 1
-
-- `MINERU_HYBRID_FORCE_PIPELINE_ENABLE`:
-    * Used to force the text extraction part in `hybrid-*` backends to be processed using small models.
-    * Defaults to `false`. Can be set to `true` via environment variable to enable this feature, thereby reducing hallucinations in certain extreme cases.
 
 - `MINERU_VL_MODEL_NAME`:
     * Used to specify the model name for the vlm/hybrid backend, allowing you to designate the model required for MinerU to run when multiple models exist on a remote openai-server.

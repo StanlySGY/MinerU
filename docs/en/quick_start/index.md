@@ -1,5 +1,7 @@
 # Quick Start
 
+Document parsing is a difficult and complex task. In scenarios such as complex layouts, scanned pages, and handwritten content, the parsing results may fall short of expectations. We recommend trying the online demo first to evaluate MinerU's parsing quality and suitability before choosing an appropriate deployment method based on your actual needs.
+If you have **document** samples with unsatisfactory parsing results, feel free to share them in an [issue](https://github.com/opendatalab/MinerU/issues). We will continue improving the parsing capabilities.
 If you encounter any installation issues, please check the [FAQ](../faq/index.md) first.
 
 ## Online Experience
@@ -31,7 +33,7 @@ A WebUI developed based on Gradio, with a simple interface and only core parsing
     <tr>
       <th rowspan="2" style="text-align:center; vertical-align:middle;">Parsing Backend</th>
       <th rowspan="2" style="text-align:center; vertical-align:middle;">pipeline</th>
-      <th colspan="2" style="text-align:center;">*-auto-engine</th>
+      <th colspan="2" style="text-align:center;">*-engine</th>
       <th colspan="2" style="text-align:center;">*-http-client</th>
     </tr>
     <tr>
@@ -50,8 +52,11 @@ A WebUI developed based on Gradio, with a simple interface and only core parsing
     </tr> 
     <tr>
       <th>Accuracy<sup>1</sup></th>
-      <td style="text-align:center;">86+</td>
-      <td colspan="4" style="text-align:center;">90+</td>
+      <td style="text-align:center;">86.47</td>
+      <td style="text-align:center;">95.39 (high)<br>95.26 (medium)</td>
+      <td style="text-align:center;">95.30</td>
+      <td style="text-align:center;">95.39 (high)<br>95.26 (medium)</td>
+      <td style="text-align:center;">95.30</td>
     </tr>
     <tr>
       <th>Operating System</th>
@@ -71,8 +76,7 @@ A WebUI developed based on Gradio, with a simple interface and only core parsing
     <tr>
       <th>Min VRAM</th>
       <td style="text-align:center;">4GB</td>
-      <td style="text-align:center;">8GB</td>
-      <td style="text-align:center;">8GB</td>
+      <td colspan="2" style="text-align:center;">8GB</td>
       <td style="text-align:center;">2GB</td>
     </tr>
     <tr>
@@ -92,7 +96,7 @@ A WebUI developed based on Gradio, with a simple interface and only core parsing
   </tbody>
 </table>
 
-<sup>1</sup> Accuracy metrics are the End-to-End Evaluation Overall scores from OmniDocBench (v1.5), based on the latest version of `MinerU`.  
+<sup>1</sup> Accuracy metrics are the End-to-End Evaluation Overall scores from OmniDocBench (v1.6), based on the latest version of `MinerU`.  
 <sup>2</sup> Servers compatible with OpenAI API, such as local model servers or remote model services deployed via inference frameworks like `vLLM`/`SGLang`/`LMDeploy`.  
 <sup>3</sup> Linux only supports distributions from 2019 and later.  
 <sup>4</sup> Since the key dependency `ray` does not support Python 3.13 on Windows, only versions 3.10~3.12 are supported.  
@@ -116,13 +120,19 @@ uv pip install -e .[all]
 ```
 
 > [!TIP]
-> `mineru[all]` includes all core features, compatible with Windows / Linux / macOS systems, suitable for most users.
-> If you need to specify the inference framework for the VLM model, or only intend to install a lightweight client on an edge device, please refer to the documentation [Extension Modules Installation Guide](https://opendatalab.github.io/MinerU/quick_start/extension_modules/).
+> - `mineru[all]` includes all core features, compatible with Windows / Linux / macOS systems, suitable for most users.
+> - If CUDA acceleration is unavailable after installing on Windows, see the [Windows CUDA acceleration FAQ](../faq/index.md#windows-cuda-acceleration).
+> - If you need to specify the inference framework for the VLM model, or only intend to install a lightweight client on an edge device, please refer to the documentation [Extension Modules Installation Guide](https://opendatalab.github.io/MinerU/quick_start/extension_modules/).
 
 ---
  
 #### Deploy MinerU using Docker
 MinerU provides a convenient Docker deployment method, which helps quickly set up the environment and solve some tricky environment compatibility issues.
+
+> [!TIP]
+> - Docker deployment is only supported on Linux and Windows environments with WSL2 support;
+> - macOS users should refer to the two installation methods above for installation instead of using Docker deployment.
+
 You can get the [Docker Deployment Instructions](./docker_deployment.md) in the documentation.
 
 ---
@@ -138,6 +148,6 @@ If your device does not meet the GPU acceleration requirements, you can specify 
 mineru -p <input_path> -o <output_path> -b pipeline
 ```
 
-`mineru` currently supports local `PDF`, image, and `DOCX` file or directory inputs.
+`mineru` currently supports local `PDF`, image, `DOCX`, `PPTX`, and `XLSX` file or directory inputs.
 
 You can use MinerU for document parsing through the CLI, API, WebUI. For detailed instructions, please refer to the [Usage Guide](../usage/index.md).

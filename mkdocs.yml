@@ -47,7 +47,6 @@ theme:
     - navigation.tracking
     - search.suggest
     - toc.follow
-    - toc.integrate
 
 extra:
   analytics:
@@ -71,6 +70,9 @@ extra:
       name: E-mail
 
 copyright: © 2024 - 2025 MinerU. All Rights Reserved.
+
+extra_css:
+  - stylesheets/extra.css
 
 nav:
   - Home:
