@@ -1,0 +1,10 @@
+# 基于现有 mineru-server 镜像，添加 Pipeline 依赖
+# 支持所有 backend：pipeline / vlm-http-client / hybrid-http-client
+
+FROM mineru-server:v1.0
+
+# 安装 Pipeline 依赖（paddleocr、ppstructure 等）
+RUN pip install --no-cache-dir 'mineru[pipeline]' -i https://mirrors.aliyun.com/pypi/simple
+
+# 预下载 Pipeline 模型（布局检测、OCR、公式识别等）
+RUN python3 -c "from mineru.backend.pipeline.model_init import AtomModelSingleton; m=AtomModelSingleton(); m.get_atom_model(atom_model_name='layout')" || true

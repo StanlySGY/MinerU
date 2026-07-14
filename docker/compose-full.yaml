@@ -1,0 +1,72 @@
+# =============================================================================
+# MinerU 全功能部署 - 支持所有 backend
+# =============================================================================
+# 支持：pipeline / vlm-http-client / hybrid-http-client
+# =============================================================================
+
+services:
+  # =========================================================================
+  # VLM Server - 远程推理（NPU/GPU）
+  # =========================================================================
+  mineru-openai-server:
+    image: mineru-server:v1.0
+    container_name: mineru-openai-server
+    restart: always
+    profiles: ["openai-server"]
+    ports:
+      - ${VLM_PORT:-30000}:30000
+    environment:
+      MINERU_MODEL_SOURCE: ${MINERU_MODEL_SOURCE:-local}
+      MINERU_VLM_MODEL: ${MINERU_VLM_MODEL:-OpenDataLab/MinerU2.5-Pro-2604-1.2B}
+      VLLM_GPU_MEMORY_UTILIZATION: ${VLLM_GPU_MEMORY_UTILIZATION:-0.9}
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-1}
+    entrypoint: mineru-openai-server
+    command:
+      --host 0.0.0.0
+      --port 30000
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:30000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  # =========================================================================
+  # API Server - 全功能（支持 pipeline + vlm-http-client + hybrid-http-client）
+  # =========================================================================
+  mineru-api:
+    image: mineru-full:v1.0
+    container_name: mineru-api
+    restart: always
+    profiles: ["api"]
+    ports:
+      - ${API_PORT:-18000}:8000
+    environment:
+      # 远程 VLM 服务器地址（vlm-http-client / hybrid-http-client 需要）
+      MINERU_VL_SERVER: http://${VLM_SERVER_IP:-127.0.0.1}:${VLM_PORT:-30000}/v1
+      MINERU_VLM_SERVER_URL: http://${VLM_SERVER_IP:-127.0.0.1}:${VLM_PORT:-30000}/v1
+      MINERU_VLM_MODEL: ${MINERU_VLM_MODEL:-OpenDataLab/MinerU2.5-Pro-2604-1.2B}
+
+      # 性能配置
+      MINERU_PROCESSING_WINDOW_SIZE: ${MINERU_PROCESSING_WINDOW_SIZE:-32}
+      MINERU_API_MAX_CONCURRENT_REQUESTS: ${MINERU_API_MAX_CONCURRENT_REQUESTS:-3}
+
+      # 功能配置
+      MINERU_FORMULA_ENABLE: ${MINERU_FORMULA_ENABLE:-true}
+      MINERU_TABLE_ENABLE: ${MINERU_TABLE_ENABLE:-true}
+
+      MINERU_LOG_LEVEL: ${MINERU_LOG_LEVEL:-INFO}
+    entrypoint: mineru-api
+    command:
+      --host 0.0.0.0
+      --port 8000
+      --allow-public-http-client
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
