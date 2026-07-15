@@ -1,0 +1,19 @@
+# =============================================================================
+# MinerU 代码镜像 - 基于环境镜像 + MinerU 代码
+# =============================================================================
+# 代码更新时只需重新构建此镜像，环境镜像不变。
+#
+# 构建：DOCKER_BUILDKIT=0 docker build -t mineru-full:v1.0 -f Dockerfile.code .
+# =============================================================================
+
+FROM mineru-env:v1.0
+
+# 复制 MinerU 代码
+COPY ../mineru /app/mineru
+COPY ../pyproject.toml /app/pyproject.toml
+
+# 安装 MinerU（editable 模式，方便代码更新）
+RUN pip install --no-cache-dir -e '/app[core]' -i https://mirrors.aliyun.com/pypi/simple || \
+    pip install --no-cache-dir -e '/app' -i https://mirrors.aliyun.com/pypi/simple
+
+WORKDIR /app

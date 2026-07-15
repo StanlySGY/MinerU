@@ -19,21 +19,37 @@ API Server (:18000) ──→ VLM Server (:30000)
 
 ## 部署步骤
 
-### 1. 构建镜像
+### 1. 在有网机器构建镜像
 
 ```bash
-cd single
-./start.sh build
+cd docker/base
+./build.sh all
+./build.sh export
 ```
 
-### 2. 创建配置
+### 2. 拷贝到离线机器
 
 ```bash
+# 拷贝镜像
+scp -r export/ user@server:/path/to/docker/base/
+
+# 拷贝部署文件
+scp -r docker/single/ user@server:/path/to/docker/
+
+# 在离线机器导入镜像
+cd docker/base
+./build.sh import export/
+```
+
+### 3. 配置
+
+```bash
+cd docker/single
 cp env.example .env
 vim .env    # 编辑 VLM 服务器 IP 等配置
 ```
 
-### 3. 启动服务
+### 4. 启动
 
 ```bash
 # 同机部署（VLM 和 API 在同一台机器）
@@ -44,7 +60,7 @@ vim .env    # 编辑 VLM 服务器 IP 等配置
 ./start.sh api    # 在 CPU 机器上启动 API
 ```
 
-### 4. 验证
+### 5. 验证
 
 ```bash
 ./start.sh status
@@ -86,3 +102,23 @@ curl -X POST http://localhost:18000/file_parse \
 | `API_PORT` | API 服务端口 | `18000` |
 | `MINERU_API_MAX_CONCURRENT_REQUESTS` | 最大并发请求数 | `3` |
 | `MINERU_PROCESSING_WINDOW_SIZE` | 每窗口处理页数 | `32` |
+
+## 更新代码
+
+```bash
+# 1. 在有网机器：更新代码后重新构建
+cd docker/base
+./build.sh code
+./build.sh export-code
+
+# 2. 拷贝 mineru-full-v1.0.tar.gz 到离线机器
+
+# 3. 在离线机器：导入新代码镜像
+cd docker/base
+./build.sh import export/
+
+# 4. 重启服务
+cd docker/single
+./start.sh stop
+./start.sh api
+```

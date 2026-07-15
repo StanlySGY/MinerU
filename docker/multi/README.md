@@ -22,27 +22,43 @@ Router (:8002)  ← 统一入口，负载均衡
 
 ## 部署步骤
 
-### 1. 构建镜像
+### 1. 在有网机器构建镜像
 
 ```bash
-cd multi
-./start-multi.sh build
+cd docker/base
+./build.sh all
+./build.sh export
 ```
 
-### 2. 创建配置
+### 2. 拷贝到离线机器
 
 ```bash
+# 拷贝镜像
+scp -r export/ user@npu-server:/path/to/docker/base/
+
+# 拷贝部署文件
+scp -r docker/multi/ user@npu-server:/path/to/docker/
+
+# 在离线机器导入镜像
+cd docker/base
+./build.sh import export/
+```
+
+### 3. 配置
+
+```bash
+cd docker/multi
 cp env.multi.example env.multi
-vim env.multi    # 编辑端口、IP 等配置
+vim env.multi    # 编辑端口和 IP
 ```
 
-### 3. 启动服务
+### 4. 启动
 
 ```bash
 ./start-multi.sh start
 ```
 
-### 4. 验证
+### 5. 验证
 
 ```bash
 ./start-multi.sh status
@@ -99,3 +115,23 @@ Router 使用**最少连接 + 随机化**策略：
 1. 每台机器上启动各自的 API+VLM
 2. 在其中一台机器上启动 Router
 3. Router 的 `--upstream-url` 指向所有 API 的实际 IP
+
+### 更新代码
+
+```bash
+# 1. 在有网机器：更新代码后重新构建
+cd docker/base
+./build.sh code
+./build.sh export-code
+
+# 2. 拷贝 mineru-full-v1.0.tar.gz 到离线机器
+
+# 3. 在离线机器：导入新代码镜像
+cd docker/base
+./build.sh import export/
+
+# 4. 重启服务
+cd docker/multi
+./start-multi.sh stop
+./start-multi.sh start
+```
