@@ -3,16 +3,18 @@
 # =============================================================================
 # 代码更新时只需重新构建此镜像，环境镜像不变。
 #
-# 构建：DOCKER_BUILDKIT=0 docker build -t mineru-full:v1.0 -f Dockerfile.code .
+# 注意：构建上下文必须是仓库根目录，不能是 docker/base/
+# 构建：在仓库根目录执行
+#   DOCKER_BUILDKIT=0 docker build -t mineru-full:v1.0 -f docker/base/Dockerfile.code .
 # =============================================================================
 
 FROM mineru-env:v1.0
 
-# 复制 MinerU 代码
-COPY ../mineru /app/mineru
-COPY ../pyproject.toml /app/pyproject.toml
+# 复制 MinerU 代码（构建上下文为仓库根目录）
+COPY mineru /app/mineru
+COPY pyproject.toml /app/pyproject.toml
 
-# 安装 MinerU（editable 模式，方便代码更新）
+# 安装 MinerU
 RUN pip install --no-cache-dir -e '/app[core]' -i https://mirrors.aliyun.com/pypi/simple || \
     pip install --no-cache-dir -e '/app' -i https://mirrors.aliyun.com/pypi/simple
 

@@ -45,7 +45,9 @@ case "${1:-help}" in
             echo "环境镜像 ${IMAGE_ENV} 不存在，先构建环境镜像..."
             ./build.sh env
         fi
-        DOCKER_BUILDKIT=0 docker build -t ${IMAGE_CODE} -f Dockerfile.code ..
+        # 构建上下文为仓库根目录（Dockerfile.code 中 COPY 需要访问 mineru/ 和 pyproject.toml）
+        REPO_ROOT="$(cd ../.. && pwd)"
+        DOCKER_BUILDKIT=0 docker build -t ${IMAGE_CODE} -f Dockerfile.code "${REPO_ROOT}"
         echo "代码镜像构建完成！"
         docker images ${IMAGE_CODE}
         ;;
