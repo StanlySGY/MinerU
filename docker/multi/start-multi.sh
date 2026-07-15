@@ -31,7 +31,7 @@ COMMON_ARGS="-f $COMPOSE_FILE --env-file $ENV_FILE"
 case "${1:-help}" in
     build)
         echo "构建 MinerU 镜像..."
-        DOCKER_BUILDKIT=0 docker build -t mineru-full:v1.0 -f Dockerfile.full .
+        DOCKER_BUILDKIT=0 docker build -t mineru-full:v1.0 -f ../base/Dockerfile.full ..
         echo "构建完成！"
         ;;
 
