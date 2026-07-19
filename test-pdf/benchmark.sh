@@ -7,13 +7,14 @@
 #
 # 使用方式：
 #   cd test-pdf
-#   nohup bash benchmark.sh &
+#   VLM_URL=http://10.8.132.224:30000 nohup bash benchmark.sh &
 # =============================================================================
 
 set -e
 
 # ========== 配置 ==========
 API_URL="${API_URL:-http://127.0.0.1:18000}"
+VLM_URL="${VLM_URL:-http://10.8.132.224:6002/v1}"
 PDF_DIR="$(cd "$(dirname "$0")" && pwd)"
 RESULT_FILE="${PDF_DIR}/benchmark_result.md"
 CONCURRENT="${CONCURRENT:-3}"  # 同时请求数
@@ -34,11 +35,17 @@ test_single() {
     local filename=$(basename "$pdf_file")
     local start_time end_time duration status_code response
 
+    local server_url_param=""
+    if [[ "${backend}" == *"http-client"* ]]; then
+        server_url_param="-F server_url=${VLM_URL}"
+    fi
+
     start_time=$(date +%s%N)
     response=$(curl -s -w "\n%{http_code}" \
         -X POST "${API_URL}/file_parse" \
         -F "files=@${pdf_file}" \
         -F "backend=${backend}" \
+        ${server_url_param} \
         -F "return_md=true" \
         --max-time 1800)
     end_time=$(date +%s%N)
@@ -119,6 +126,7 @@ HEADER
 sed -i "s/PLACEHOLDER_TIME/$(date '+%Y-%m-%d %H:%M:%S')/" "${RESULT_FILE}"
 sed -i "s|PLACEHOLDER_API|${API_URL}|" "${RESULT_FILE}"
 sed -i "s/PLACEHOLDER_CONCURRENT/${CONCURRENT}/" "${RESULT_FILE}"
+echo "| VLM 地址 | ${VLM_URL} |" >> "${RESULT_FILE}"
 
 # 列出测试文件
 echo "| 文件名 | 大小 |" >> "${RESULT_FILE}"
