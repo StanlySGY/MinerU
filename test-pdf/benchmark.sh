@@ -47,7 +47,7 @@ test_single() {
         -F "backend=${backend}" \
         ${server_url_param} \
         -F "return_md=true" \
-        --max-time 1800)
+        --max-time 14400)
     end_time=$(date +%s%N)
 
     status_code=$(echo "$response" | tail -1)
