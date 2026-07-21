@@ -1,0 +1,30 @@
+# =============================================================================
+# Router 负载均衡服务部署
+# =============================================================================
+# 启动 MinerU Router（统一入口，负载均衡）
+# 镜像：mineru-full:v1.0（需要先构建）
+#
+# 启动：docker compose --env-file .env up -d
+# =============================================================================
+
+services:
+  mineru-router:
+    image: mineru-full:v1.0
+    container_name: mineru-router
+    restart: always
+    ports:
+      - ${ROUTER_PORT:-8002}:8002
+    entrypoint: mineru-router
+    command:
+      --host 0.0.0.0
+      --port 8002
+      --local-gpus none
+      # 后端 API 地址（根据实际部署填写）
+      --upstream-url http://${API_1_IP}:${API_1_PORT}
+      # --upstream-url http://${API_2_IP}:${API_2_PORT}
+      # --upstream-url http://${API_3_IP}:${API_3_PORT}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8002/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

@@ -1,0 +1,39 @@
+# =============================================================================
+# VLM 推理服务部署
+# =============================================================================
+# 启动 VLM Server（vLLM 推理服务）
+# 需要 NPU/CPU 卡，镜像：mineru-server:v1.0
+#
+# 启动：docker compose --env-file .env up -d
+# =============================================================================
+
+services:
+  mineru-vlm:
+    image: mineru-server:v1.0
+    container_name: mineru-vlm
+    restart: always
+    ports:
+      - ${VLM_PORT:-30000}:30000
+    environment:
+      MINERU_MODEL_SOURCE: ${MINERU_MODEL_SOURCE:-local}
+      MINERU_VLM_MODEL: ${MINERU_VLM_MODEL:-OpenDataLab/MinerU2.5-Pro-2604-1.2B}
+      VLLM_GPU_MEMORY_UTILIZATION: ${VLLM_GPU_MEMORY_UTILIZATION:-0.9}
+      OMP_NUM_THREADS: ${OMP_NUM_THREADS:-1}
+      # NPU 卡号（修改数字绑定对应卡）
+      ASCEND_VISIBLE_DEVICES: "${ASCEND_DEVICE:-0}"
+    entrypoint: mineru-openai-server
+    command:
+      --host 0.0.0.0
+      --port 30000
+      # 模型权重路径（留空则自动下载）
+      ${VLM_MODEL_PATH:+--model ${VLM_MODEL_PATH}}
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:30000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
