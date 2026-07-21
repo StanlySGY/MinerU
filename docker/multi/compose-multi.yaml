@@ -68,6 +68,8 @@ services:
       VLLM_GPU_MEMORY_UTILIZATION: ${VLLM_GPU_MEMORY_UTILIZATION:-0.9}
       # OMP 线程数（vLLM 推荐设为 1）
       OMP_NUM_THREADS: ${OMP_NUM_THREADS:-1}
+      # NPU 卡号（修改数字绑定对应卡，当前为 7 号卡）
+      ASCEND_VISIBLE_DEVICES: "${VLM_1_ASCEND_DEVICE:-7}"
     entrypoint: mineru-openai-server
     command:
       --host 0.0.0.0
