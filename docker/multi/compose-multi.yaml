@@ -29,6 +29,9 @@ services:
     image: mineru-full:v1.0
     container_name: mineru-router
     restart: always
+    depends_on:
+      mineru-api:
+        condition: service_healthy
     ports:
       - ${ROUTER_PORT:-8002}:8002
     entrypoint: mineru-router
