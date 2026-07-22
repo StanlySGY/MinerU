@@ -12,6 +12,7 @@ from dataclasses import dataclass
 
 from loguru import logger
 
+import pypdfium2 as pdfium
 from mineru.utils.pdfium_guard import pdfium_guard, open_pdfium_document
 
 
