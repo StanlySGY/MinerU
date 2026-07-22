@@ -1,4 +1,30 @@
 services:
+  mineru-api:
+    image: mineru-full:v1.0
+    container_name: mineru-api
+    restart: always
+    ports:
+      - ${API_1_PORT:-18000}:8000
+    environment:
+      MINERU_VL_SERVER: http://${VLM_1_IP}:${VLM_1_PORT}/v1
+      MINERU_VLM_SERVER_URL: http://${VLM_1_IP}:${VLM_1_PORT}/v1
+      MINERU_VLM_MODEL: ${MINERU_VLM_MODEL:-OpenDataLab/MinerU2.5-Pro-2604-1.2B}
+      MINERU_PROCESSING_WINDOW_SIZE: ${MINERU_PROCESSING_WINDOW_SIZE:-32}
+      MINERU_API_MAX_CONCURRENT_REQUESTS: ${MINERU_API_MAX_CONCURRENT_REQUESTS:-3}
+      MINERU_FORMULA_ENABLE: ${MINERU_FORMULA_ENABLE:-true}
+      MINERU_TABLE_ENABLE: ${MINERU_TABLE_ENABLE:-true}
+      MINERU_LOG_LEVEL: ${MINERU_LOG_LEVEL:-INFO}
+    entrypoint: mineru-api
+    command:
+      --host 0.0.0.0
+      --port 8000
+      --allow-public-http-client
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
   mineru-router:
     image: mineru-full:v1.0
     container_name: mineru-router
@@ -10,7 +36,7 @@ services:
       --host 0.0.0.0
       --port 8002
       --local-gpus none
-      --upstream-url http://${API_1_IP:-127.0.0.1}:${API_1_PORT:-18000}
+      --upstream-url http://127.0.0.1:${API_1_PORT:-18000}
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8002/health || exit 1"]
       interval: 30s
