@@ -14,6 +14,7 @@ PDF 预检查模块 - 在 VLM 处理前过滤有问题的 PDF
 
 from dataclasses import dataclass
 
+import pypdfium2 as pdfium
 from loguru import logger
 
 from mineru.utils.pdfium_guard import pdfium_guard, open_pdfium_document
