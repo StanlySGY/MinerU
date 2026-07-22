@@ -827,6 +827,44 @@ async def run_parse_job(
 ) -> list[str]:
     pdf_file_names, pdf_bytes_list = await asyncio.to_thread(load_parse_inputs, uploads)
     actual_lang_list = normalize_lang_list(request_options.lang_list, len(pdf_file_names))
+
+    # 预检查：过滤乱码/加密 PDF，避免 VLM 处理无效文件
+    from mineru.utils.pdf_precheck import check_pdf_quality
+    safe_names = []
+    safe_bytes = []
+    safe_langs = []
+    skipped = []
+    for name, pdf_bytes, lang in zip(pdf_file_names, pdf_bytes_list, actual_lang_list):
+        result = await asyncio.to_thread(check_pdf_quality, pdf_bytes)
+        if result.safe:
+            safe_names.append(name)
+            safe_bytes.append(pdf_bytes)
+            safe_langs.append(lang)
+        else:
+            skipped.append((name, result.reason))
+            logger.warning(f"PDF 预检查跳过: {name} - {result.reason}")
+
+    if skipped:
+        logger.warning(
+            f"跳过 {len(skipped)} 个问题 PDF: "
+            + "; ".join(f"{name}({reason})" for name, reason in skipped)
+        )
+
+    if not safe_names:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "所有上传的 PDF 都无法处理",
+                "skipped_files": [
+                    {"name": name, "reason": reason}
+                    for name, reason in skipped
+                ]
+            }
+        )
+
+    pdf_file_names = safe_names
+    pdf_bytes_list = safe_bytes
+    actual_lang_list = safe_langs
     response_file_names = list(pdf_file_names)
 
     parse_kwargs = dict(
