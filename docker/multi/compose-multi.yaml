@@ -1,102 +1,18 @@
-# =============================================================================
-# MinerU Router 部署配置
-# =============================================================================
-# 只启动 Router 负载均衡服务，API 和 VLM 由用户自行部署管理。
-#
-# 使用方式：
-#   1. 复制 env.multi.example 为 env.multi，编辑 IP 和端口
-#   2. docker compose -f compose-multi.yaml --env-file env.multi up -d
-#
-# 后续添加 API 后端：
-#   修改 env.multi 中的 API_1_IP、API_1_PORT 等配置，
-#   然后重启 Router：docker compose -f compose-multi.yaml --env-file env.multi up -d
-# =============================================================================
-
 services:
-
-  # ===========================================================================
-  # Router 负载均衡服务（唯一启用的服务）
-  # ===========================================================================
-  # 作用：接收所有用户请求，根据各 API 实例的负载情况智能分发
-  # 策略：最少连接 + 随机化，自动剔除不健康的 API，故障自动转移
-  # 访问地址：http://<服务器IP>:8002/docs
-  # ===========================================================================
   mineru-router:
     image: mineru-full:v1.0
     container_name: mineru-router
     restart: always
     ports:
-      # Router 对外端口（默认 8002）
       - ${ROUTER_PORT:-8002}:8002
     entrypoint: mineru-router
     command:
       --host 0.0.0.0
       --port 8002
       --local-gpus none
-      # 下面是 Router 分发到的后端 API 地址（根据 env.multi 配置）
       --upstream-url http://${API_1_IP:-127.0.0.1}:${API_1_PORT:-18000}
-      # --upstream-url http://${API_2_IP:-127.0.0.1}:${API_2_PORT:-18001}
-      # --upstream-url http://${API_3_IP:-127.0.0.1}:${API_3_PORT:-18002}
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8002/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
-
-  # ===========================================================================
-  # 以下服务已全部注释，由用户自行部署管理
-  # ===========================================================================
-
-  # mineru-vlm-1:
-  #   image: mineru-server:v1.0
-  #   container_name: mineru-vlm-1
-  #   restart: always
-  #   ports:
-  #     - ${VLM_1_PORT:-30000}:30000
-  #   environment:
-  #     MINERU_MODEL_SOURCE: ${MINERU_MODEL_SOURCE:-local}
-  #     MINERU_VLM_MODEL: ${MINERU_VLM_MODEL:-OpenDataLab/MinerU2.5-Pro-2604-1.2B}
-  #     VLLM_GPU_MEMORY_UTILIZATION: ${VLLM_GPU_MEMORY_UTILIZATION:-0.9}
-  #     OMP_NUM_THREADS: ${OMP_NUM_THREADS:-1}
-  #     ASCEND_VISIBLE_DEVICES: "${VLM_1_ASCEND_DEVICE:-7}"
-  #   entrypoint: mineru-openai-server
-  #   command:
-  #     --host 0.0.0.0
-  #     --port 30000
-  #     --model ${VLM_1_MODEL_PATH:-}
-  #   ulimits:
-  #     memlock: -1
-  #     stack: 67108864
-  #   ipc: host
-  #   healthcheck:
-  #     test: ["CMD-SHELL", "curl -f http://localhost:30000/health || exit 1"]
-  #     interval: 30s
-  #     timeout: 10s
-  #     retries: 5
-  #     start_period: 120s
-
-  # mineru-api-1:
-  #   image: mineru-full:v1.0
-  #   container_name: mineru-api-1
-  #   restart: always
-  #   ports:
-  #     - ${API_1_PORT:-18000}:8000
-  #   environment:
-  #     MINERU_VL_SERVER: http://${VLM_1_IP:-127.0.0.1}:${VLM_1_PORT:-30000}/v1
-  #     MINERU_VLM_SERVER_URL: http://${VLM_1_IP:-127.0.0.1}:${VLM_1_PORT:-30000}/v1
-  #     MINERU_VLM_MODEL: ${MINERU_VLM_MODEL:-OpenDataLab/MinerU2.5-Pro-2604-1.2B}
-  #     MINERU_PROCESSING_WINDOW_SIZE: ${MINERU_PROCESSING_WINDOW_SIZE:-32}
-  #     MINERU_API_MAX_CONCURRENT_REQUESTS: ${MINERU_API_MAX_CONCURRENT_REQUESTS:-3}
-  #     MINERU_FORMULA_ENABLE: ${MINERU_FORMULA_ENABLE:-true}
-  #     MINERU_TABLE_ENABLE: ${MINERU_TABLE_ENABLE:-true}
-  #     MINERU_LOG_LEVEL: ${MINERU_LOG_LEVEL:-INFO}
-  #   entrypoint: mineru-api
-  #   command:
-  #     --host 0.0.0.0
-  #     --port 8000
-  #     --allow-public-http-client
-  #   healthcheck:
-  #     test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
-  #     interval: 30s
-  #     timeout: 10s
-  #     retries: 3
