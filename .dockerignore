@@ -4,5 +4,10 @@
 docker/base/export
 htmlcov
 test-pdf
+*.pdf
+*.tar
+*.tar.gz
+models
+export
 __pycache__
 *.pyc

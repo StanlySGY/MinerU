@@ -42,7 +42,12 @@ case "${1:-help}" in
 
     code)
         echo "构建代码镜像：${IMAGE_CODE}"
-        docker build -t "$IMAGE_CODE" -f Dockerfile.code "$REPO_ROOT"
+        code_context="$(mktemp -d "${TMPDIR:-/tmp}/mineru-code-build.XXXXXX")"
+        trap 'rm -rf "$code_context"' EXIT
+        cp -a "$REPO_ROOT/mineru" "$code_context/mineru"
+        cp "$REPO_ROOT/pyproject.toml" "$code_context/pyproject.toml"
+        cp Dockerfile.code "$code_context/Dockerfile"
+        docker build -t "$IMAGE_CODE" "$code_context"
         ;;
 
     all)

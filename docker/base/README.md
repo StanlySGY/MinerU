@@ -26,6 +26,8 @@ MINERU_CODE_TAG=v3.4.2 ./build.sh code
 
 `Dockerfile.env` 默认使用 `mineru==3.4.2` 解析 Pipeline 依赖。升级依赖时显式传入 `MINERU_DEPENDENCY_VERSION` 并同时升级环境标签。
 
+`build.sh code` 会临时组装只包含 `mineru/`、`pyproject.toml` 和代码 Dockerfile 的构建上下文，不会把仓库中的测试资料或其他镜像层发送给 Docker。
+
 ## 导出和导入
 
 ```bash
