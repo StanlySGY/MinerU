@@ -1,0 +1,8 @@
+.git
+.codegraph
+.mimocode
+docker/base/export
+htmlcov
+test-pdf
+__pycache__
+*.pyc

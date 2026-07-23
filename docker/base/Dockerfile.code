@@ -1,18 +1,16 @@
 # =============================================================================
-# MinerU 代码镜像 - 独立构建，不依赖环境镜像
+# MinerU 代码镜像 - 只携带源码，不包含运行环境
 # =============================================================================
 # 构建上下文必须是仓库根目录。
-# DOCKER_BUILDKIT=0 docker build -t mineru-full:v1.0 -f docker/base/Dockerfile.code .
+# docker build -t mineru-code:v1.0 -f docker/base/Dockerfile.code .
 # =============================================================================
 
-FROM mineru-env:v1.0
+FROM busybox:1.37.0-musl
 
-# 复制 MinerU 代码
-COPY mineru /app/mineru
-COPY pyproject.toml /app/pyproject.toml
+COPY mineru /payload/mineru
+COPY pyproject.toml /payload/pyproject.toml
 
-# 安装 MinerU
-RUN pip install --no-cache-dir -e '/app[core]' -i https://mirrors.aliyun.com/pypi/simple || \
-    pip install --no-cache-dir -e '/app' -i https://mirrors.aliyun.com/pypi/simple
-
-WORKDIR /app
+# Compose 将 /target 挂载为共享代码卷。每次启动同步服务时先清理旧代码，
+# 确保源码中已经删除的文件不会残留在离线环境。
+ENTRYPOINT ["/bin/sh", "-c"]
+CMD ["rm -rf /target/* /target/.[!.]* /target/..?* 2>/dev/null || true; cp -a /payload/. /target/"]

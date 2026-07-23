@@ -1,124 +1,80 @@
 # 单机部署
 
-一个 API Server + 一个 VLM Server，适合开发测试或单卡环境。
+`single/` 在同一台机器启动一个 API 和一个 VLM。API 使用 CPU/小模型依赖，VLM 使用已经构建好的 GPU/NPU 推理镜像。
 
-## 架构
-
-```
-API Server (:18000) ──→ VLM Server (:30000)
-  (CPU，跑 Pipeline 小模型)    (NPU/GPU，跑 VLM 推理)
-```
-
-## 支持的 Backend
-
-| Backend | 说明 |
-|---|---|
-| `pipeline` | 纯本地小模型，不需要 VLM Server |
-| `vlm-http-client` | 远程 VLM 推理 |
-| `hybrid-http-client` | 本地小模型 + 远程 VLM |
-
-## 部署步骤
-
-### 1. 在有网机器构建镜像
+## 准备镜像和模型
 
 ```bash
 cd docker/base
-./build.sh all
-./build.sh export
-```
+./build.sh import /path/to/export
 
-### 2. 拷贝到离线机器
-
-```bash
-# 拷贝镜像
-scp -r export/ user@server:/path/to/docker/base/
-
-# 拷贝部署文件
-scp -r docker/single/ user@server:/path/to/docker/
-
-# 在离线机器导入镜像
-cd docker/base
-./build.sh import export/
-```
-
-### 3. 配置
-
-```bash
-cd docker/single
+cd ../single
+mkdir -p models
+# 将 VLM 模型复制到 models/，或在 .env 中设置绝对路径
 cp env.example .env
-vim .env    # 编辑 VLM 服务器 IP 等配置
 ```
 
-### 4. 启动
+至少确认 `.env` 中这些值正确：
+
+```dotenv
+MINERU_ENV_IMAGE=mineru-env:v1.0
+MINERU_CODE_IMAGE=mineru-code:v1.0
+MINERU_VLM_IMAGE=mineru-server:v1.0
+VLM_DEVICE_TYPE=ascend
+VLM_MODEL_HOST_PATH=./models
+VLM_MODEL_PATH=/models/mineru
+```
+
+## 启动
 
 ```bash
-# 同机部署（VLM 和 API 在同一台机器）
+./start.sh vlm
+./start.sh api
+# 或者同机一次启动
 ./start.sh all
-
-# 或分开部署
-./start.sh vlm    # 在 NPU/GPU 机器上启动 VLM
-./start.sh api    # 在 CPU 机器上启动 API
 ```
 
-### 5. 验证
+`compose-vlm.yaml` 和 `compose-api.yaml` 都会先运行 `mineru-code-sync`，把代码镜像内容复制到共享卷。VLM 模型不会在离线环境自动下载。
+
+`start.sh` 会根据 `VLM_DEVICE_TYPE` 自动叠加 `compose-vlm.ascend.yaml` 或 `compose-vlm.nvidia.yaml`，分别映射 Ascend 设备或 NVIDIA GPU。
 
 ```bash
 ./start.sh status
 ./start.sh logs
+./start.sh stop
 ```
 
-访问 `http://<服务器IP>:18000/docs` 查看 API 文档。
+API 地址默认为 `http://localhost:18000`，VLM 地址默认为 `http://localhost:30000`。
 
-## 测试不同 Backend
+API 为远程 VLM backend 启用了 `--allow-public-http-client`。生产环境应限制 API 端口的访问来源，避免把可指定远程地址的接口直接暴露到不可信网络。
+
+## Backend
 
 ```bash
-# pipeline（纯本地）
-curl -X POST http://localhost:18000/file_parse \
-  -F "files=@test.pdf" -F "backend=pipeline"
+# 纯 Pipeline，不需要远程 VLM，但需要已准备 Pipeline 模型
+curl -X POST http://localhost:18000/file_parse -F "files=@test.pdf" -F "backend=pipeline"
 
-# vlm-http-client（远程 VLM）
-curl -X POST http://localhost:18000/file_parse \
-  -F "files=@test.pdf" -F "backend=vlm-http-client"
+# 远程 VLM
+curl -X POST http://localhost:18000/file_parse -F "files=@test.pdf" -F "backend=vlm-http-client"
 
-# hybrid-http-client（本地 + 远程）
-curl -X POST http://localhost:18000/file_parse \
-  -F "files=@test.pdf" -F "backend=hybrid-http-client"
+# 本地小模型 + 远程 VLM
+curl -X POST http://localhost:18000/file_parse -F "files=@test.pdf" -F "backend=hybrid-http-client"
 ```
-
-## 文件说明
-
-| 文件 | 说明 |
-|---|---|
-| `compose-api.yaml` | API Server 配置 |
-| `env.example` | 配置模板 |
-| `start.sh` | 启动脚本 |
-
-## 配置项
-
-| 配置 | 说明 | 默认值 |
-|---|---|---|
-| `VLM_SERVER_IP` | VLM 服务器 IP | `127.0.0.1` |
-| `VLM_PORT` | VLM 服务端口 | `30000` |
-| `API_PORT` | API 服务端口 | `18000` |
-| `MINERU_API_MAX_CONCURRENT_REQUESTS` | 最大并发请求数 | `3` |
-| `MINERU_PROCESSING_WINDOW_SIZE` | 每窗口处理页数 | `32` |
 
 ## 更新代码
 
 ```bash
-# 1. 在有网机器：更新代码后重新构建
+# 有网机器构建并导出新代码镜像
 cd docker/base
-./build.sh code
-./build.sh export-code
+MINERU_CODE_TAG=v3.4.3 ./build.sh code
+MINERU_CODE_TAG=v3.4.3 ./build.sh export-code
 
-# 2. 拷贝 mineru-full-v1.0.tar.gz 到离线机器
-
-# 3. 在离线机器：导入新代码镜像
-cd docker/base
-./build.sh import export/
-
-# 4. 重启服务
-cd docker/single
+# 离线机器导入，并修改 docker/single/.env
+./build.sh import /path/to/export
+# MINERU_CODE_IMAGE=mineru-code:v3.4.3
+cd ../single
 ./start.sh stop
-./start.sh api
+./start.sh all
 ```
+
+只有 Python 依赖发生变化时才需要更新环境镜像。

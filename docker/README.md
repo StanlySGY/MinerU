@@ -1,117 +1,52 @@
 # MinerU Docker 部署
 
-## 目录结构
+## 镜像职责
 
-```
-docker/
-├── base/                   # 基础镜像与构建工具
-│   ├── Dockerfile.env      # 环境镜像（依赖包）
-│   ├── Dockerfile.code     # 代码镜像（MinerU 代码）
-│   ├── Dockerfile.full     # 一体镜像（兼容旧方式）
-│   ├── build.sh            # 构建与导出脚本
-│   ├── compose.yaml        # VLM Server 配置
-│   └── README.md           # 基础镜像说明
-│
-├── single/                 # 单机部署（1 API + 1 VLM）
-│   ├── compose-api.yaml    # API Server 配置
-│   ├── env.example         # 配置模板
-│   ├── start.sh            # 启动脚本
-│   └── README.md           # 单机部署文档
-│
-├── multi/                  # 多卡部署（Router + 多组 API+VLM）
-│   ├── compose-multi.yaml  # Router + 多组 API+VLM 配置
-│   ├── env.multi.example   # 配置模板
-│   ├── start-multi.sh      # 启动脚本
-│   └── README.md           # 多卡部署文档
-│
-├── china/                  # 各硬件平台 Dockerfile
-├── global/                 # 海外版 Dockerfile
-└── README.md               # 本文件
+```text
+mineru-env:<tag>   系统依赖、Python 依赖和运行时
+mineru-code:<tag>  MinerU 源码，独立的小镜像
+mineru-server:<tag> VLM 推理镜像，按 GPU/NPU 平台单独构建
 ```
 
-## 镜像分层架构
+API 和 Router 使用 `mineru-env`，通过共享卷加载 `mineru-code`。VLM 使用平台对应的 `mineru-server`，同样可以挂载代码卷。环境镜像和 VLM 镜像包含硬件/依赖绑定，不能用代码镜像替代。
 
-```
-mineru-env:v1.0     ← 环境镜像（torch、paddleocr 等依赖，~2-3 GB）
-  │
-  └── mineru-full:v1.0  ← 代码镜像（MinerU 代码，~50-100 MB）
-```
+## 部署模式
 
-**为什么要分离？**
-- 环境镜像构建一次，长期使用
-- 代码更新时只传代码镜像（小）
-- 离线部署更方便
+| 目录 | 作用 |
+|---|---|
+| `base/` | 构建、导出和导入环境/代码镜像 |
+| `single/` | 同一台机器上的一个 API 和一个 VLM |
+| `multi/` | 三个 API + Router，VLM 地址由配置指定 |
+| `deploy/` | API、Router、VLM 分机部署 |
 
-## 三种 Backend
-
-| Backend | 说明 | 需要 VLM Server |
-|---|---|---|
-| `pipeline` | 纯本地小模型 | 不需要 |
-| `vlm-http-client` | 远程 VLM | 需要 |
-| `hybrid-http-client` | 本地小模型 + 远程 VLM | 需要 |
-
-## 选择部署模式
-
-| 场景 | 推荐模式 | 说明 |
-|---|---|---|
-| 开发测试 | `single/` | 一个 API + 一个 VLM |
-| 单卡生产 | `single/` | 一个 API + 一个 VLM |
-| 多卡生产 | `multi/` | Router + 多组 API+VLM |
-| 跨机器部署 | `multi/` | Router 在一台，API+VLM 分布在多台 |
-
-## 离线部署流程
-
-### 首次部署
+## 首次离线部署
 
 ```bash
-# 1. 在有网机器：构建并导出
 cd docker/base
 ./build.sh all
 ./build.sh export
-
-# 2. 拷贝 export/ 目录到离线机器
-scp -r export/ user@offline-server:/path/to/docker/base/
-
-# 3. 在离线机器：导入镜像
-cd docker/base
-./build.sh import export/
-
-# 4. 选择部署模式（single 或 multi）
-cd docker/single   # 或 docker/multi
-cp env.example .env
-vim .env
-./start.sh all     # 或 ./start-multi.sh start
 ```
 
-### 更新代码
+将 `export/`、部署目录和模型文件复制到离线环境，然后：
 
 ```bash
-# 1. 在有网机器：更新代码后重新构建
-cd docker/base
-./build.sh code
-./build.sh export-code
-
-# 2. 拷贝 mineru-full-v1.0.tar.gz 到离线机器
-
-# 3. 在离线机器：导入新代码镜像
-cd docker/base
 ./build.sh import export/
-
-# 4. 重启服务
 ```
 
-## 测试 Backend
+在部署目录复制 `.env.example` 并设置 `MINERU_ENV_IMAGE`、`MINERU_CODE_IMAGE`。使用 `local` 模型源时，必须把模型文件预置到 VLM 的 `VLM_MODEL_HOST_PATH`；离线环境不会自动下载模型。
+
+## 只更新代码
 
 ```bash
-# pipeline（纯本地）
-curl -X POST http://localhost:18000/file_parse \
-  -F "files=@test.pdf" -F "backend=pipeline"
+# 有网机器
+cd docker/base
+MINERU_CODE_TAG=v3.4.3 ./build.sh code
+MINERU_CODE_TAG=v3.4.3 ./build.sh export-code
 
-# vlm-http-client（远程 VLM）
-curl -X POST http://localhost:18000/file_parse \
-  -F "files=@test.pdf" -F "backend=vlm-http-client"
-
-# hybrid-http-client（本地 + 远程）
-curl -X POST http://localhost:18000/file_parse \
-  -F "files=@test.pdf" -F "backend=hybrid-http-client"
+# 离线机器
+./build.sh import /path/to/export
+# 修改部署目录 .env：MINERU_CODE_IMAGE=mineru-code:v3.4.3
+docker compose --env-file .env up -d
 ```
+
+只有依赖变化时才需要更新 `mineru-env`。模型文件也应作为独立的离线部署资产管理。

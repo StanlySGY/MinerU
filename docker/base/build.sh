@@ -1,162 +1,112 @@
 #!/bin/bash
-# =============================================================================
-# MinerU 镜像构建与导出脚本
-# =============================================================================
-# 镜像分层策略：
-#   - mineru-env:v1.0  — 环境镜像（依赖包，~6GB，构建一次，传输一次）
-#   - mineru-full:v1.0 — 环境 + 代码（本地构建，不导出）
-#   - mineru-code.tar.gz — 纯代码包（~几MB，更新代码时传输）
-#
-# 离线部署流程：
-#   首次：传输 mineru-env.tar.gz → 导入 → 在离线机器构建 mineru-full
-#   更新：传输 mineru-code.tar.gz → 解压 → 重建 mineru-full
-# =============================================================================
+# Build, export, and import the two images used by offline deployments.
 
-set -e
+set -eu
 
 cd "$(dirname "$0")"
 
-IMAGE_ENV="mineru-env:v1.0"
-IMAGE_CODE="mineru-full:v1.0"
-EXPORT_DIR="./export"
+ENV_TAG="${MINERU_ENV_TAG:-v1.0}"
+CODE_TAG="${MINERU_CODE_TAG:-v1.0}"
+DEPENDENCY_VERSION="${MINERU_DEPENDENCY_VERSION:-3.4.2}"
+IMAGE_ENV="mineru-env:${ENV_TAG}"
+IMAGE_CODE="mineru-code:${CODE_TAG}"
+EXPORT_DIR="${MINERU_EXPORT_DIR:-./export}"
+REPO_ROOT="$(cd ../.. && pwd)"
+
+require_image() {
+    if ! docker image inspect "$1" >/dev/null 2>&1; then
+        echo "错误：镜像 $1 不存在，请先构建。" >&2
+        exit 1
+    fi
+}
+
+export_image() {
+    image="$1"
+    output="$2"
+    require_image "$image"
+    mkdir -p "$EXPORT_DIR"
+    echo "导出 $image -> $output"
+    docker save "$image" | gzip > "$output"
+    ls -lh "$output"
+}
 
 case "${1:-help}" in
     env)
-        echo "构建环境镜像: ${IMAGE_ENV}"
-        DOCKER_BUILDKIT=0 docker build -t ${IMAGE_ENV} -f Dockerfile.env .
-        echo "完成！"
-        docker images ${IMAGE_ENV}
+        echo "构建环境镜像：${IMAGE_ENV}（MinerU 依赖基线 ${DEPENDENCY_VERSION}）"
+        docker build \
+            --build-arg "MINERU_DEPENDENCY_VERSION=${DEPENDENCY_VERSION}" \
+            -t "$IMAGE_ENV" \
+            -f Dockerfile.env \
+            .
         ;;
 
     code)
-        echo "构建代码镜像: ${IMAGE_CODE}"
-        if ! docker image inspect ${IMAGE_ENV} &>/dev/null; then
-            echo "环境镜像不存在，先构建..."
-            $0 env
-        fi
-        REPO_ROOT="$(cd ../.. && pwd)"
-        DOCKER_BUILDKIT=0 docker build -t ${IMAGE_CODE} -f Dockerfile.code "${REPO_ROOT}"
-        echo "完成！"
-        docker images ${IMAGE_CODE}
+        echo "构建代码镜像：${IMAGE_CODE}"
+        docker build -t "$IMAGE_CODE" -f Dockerfile.code "$REPO_ROOT"
         ;;
 
     all)
-        $0 env
-        $0 code
-        echo ""
-        docker images | grep -E "mineru-env|mineru-full"
-        ;;
-
-    # ------------------------------------------------------------------
-    # 导出
-    # ------------------------------------------------------------------
-
-    export)
-        echo "导出环境镜像 + 代码包..."
-        mkdir -p ${EXPORT_DIR}
-
-        echo "[1/2] 导出环境镜像（~6GB，只传一次）..."
-        docker save ${IMAGE_ENV} | gzip > ${EXPORT_DIR}/mineru-env-v1.0.tar.gz
-
-        echo "[2/2] 导出代码包（~几MB，更新代码时传这个）..."
-        REPO_ROOT="$(cd ../.. && pwd)"
-        tar czf ${EXPORT_DIR}/mineru-code.tar.gz \
-            -C "${REPO_ROOT}" \
-            mineru/ pyproject.toml
-
-        echo ""
-        echo "导出完成："
-        ls -lh ${EXPORT_DIR}/*.tar.gz
+        "$0" env
+        "$0" code
         ;;
 
     export-env)
-        mkdir -p ${EXPORT_DIR}
-        echo "导出环境镜像..."
-        docker save ${IMAGE_ENV} | gzip > ${EXPORT_DIR}/mineru-env-v1.0.tar.gz
-        ls -lh ${EXPORT_DIR}/mineru-env-v1.0.tar.gz
+        export_image "$IMAGE_ENV" "$EXPORT_DIR/mineru-env-${ENV_TAG}.tar.gz"
         ;;
 
     export-code)
-        mkdir -p ${EXPORT_DIR}
-        echo "导出代码包..."
-        REPO_ROOT="$(cd ../.. && pwd)"
-        tar czf ${EXPORT_DIR}/mineru-code.tar.gz \
-            -C "${REPO_ROOT}" \
-            mineru/ pyproject.toml
-        ls -lh ${EXPORT_DIR}/mineru-code.tar.gz
+        export_image "$IMAGE_CODE" "$EXPORT_DIR/mineru-code-${CODE_TAG}.tar.gz"
         ;;
 
-    # ------------------------------------------------------------------
-    # 导入
-    # ------------------------------------------------------------------
+    export)
+        "$0" export-env
+        "$0" export-code
+        ;;
 
     import)
-        IMPORT_DIR="${2:-${EXPORT_DIR}}"
-        echo "从 ${IMPORT_DIR} 导入..."
-
-        if [ ! -d "${IMPORT_DIR}" ]; then
-            echo "错误：${IMPORT_DIR} 不存在"
+        import_dir="${2:-$EXPORT_DIR}"
+        if [ ! -d "$import_dir" ]; then
+            echo "错误：目录 $import_dir 不存在。" >&2
             exit 1
         fi
 
-        # 导入环境镜像
-        if [ -f "${IMPORT_DIR}/mineru-env-v1.0.tar.gz" ]; then
-            echo "导入环境镜像..."
-            gunzip -c "${IMPORT_DIR}/mineru-env-v1.0.tar.gz" | docker load
+        found=0
+        for archive in "$import_dir"/mineru-env-*.tar.gz "$import_dir"/mineru-code-*.tar.gz; do
+            if [ -f "$archive" ]; then
+                found=1
+                echo "导入 $(basename "$archive")"
+                gzip -dc "$archive" | docker load
+            fi
+        done
+        if [ "$found" -eq 0 ]; then
+            echo "错误：$import_dir 中没有 MinerU 镜像归档。" >&2
+            exit 1
         fi
-
-        echo "导入完成！"
-        docker images | grep -E "mineru-env|mineru-full"
         ;;
 
     update)
-        echo "=========================================="
-        echo "离线机器更新代码"
-        echo "=========================================="
-        echo ""
-        echo "步骤："
-        echo "  1. 将 mineru-code.tar.gz 拷贝到离线机器"
-        echo "  2. 在离线机器的 MinerU 仓库根目录执行："
-        echo ""
-        echo "     tar xzf mineru-code.tar.gz"
-        echo "     cd docker/base"
-        echo "     ./build.sh code"
-        echo ""
-        echo "这会用本地已有的 mineru-env 镜像重建 mineru-full。"
+        cat <<EOF
+离线代码更新：
+  1. 有网机器执行：MINERU_CODE_TAG=<新版本> $0 code
+  2. 有网机器执行：MINERU_CODE_TAG=<新版本> $0 export-code
+  3. 离线机器导入 mineru-code-<新版本>.tar.gz
+  4. 将部署目录 .env 中的 MINERU_CODE_IMAGE 改为 mineru-code:<新版本>
+  5. 执行 docker compose --env-file .env up -d
+
+只有 pyproject.toml 依赖发生变化时，才需要升级并重新传输 mineru-env。
+EOF
         ;;
 
     *)
-        echo "MinerU 镜像构建与导出脚本"
-        echo ""
-        echo "构建："
-        echo "  $0 env          构建环境镜像（依赖包，~6GB）"
-        echo "  $0 code         构建代码镜像（环境+代码）"
-        echo "  $0 all          构建全部"
-        echo ""
-        echo "导出："
-        echo "  $0 export       导出环境镜像 + 代码包"
-        echo "  $0 export-env   只导出环境镜像"
-        echo "  $0 export-code  只导出代码包（更新代码用）"
-        echo ""
-        echo "导入："
-        echo "  $0 import [dir] 导入环境镜像"
-        echo "  $0 update       查看离线更新步骤"
-        echo ""
-        echo "====== 离线部署流程 ======"
-        echo ""
-        echo "【首次部署】在有网机器："
-        echo "  $0 all && $0 export"
-        echo ""
-        echo "【首次部署】拷贝 export/ 到离线机器后："
-        echo "  $0 import export/"
-        echo "  $0 code  （在离线机器本地构建代码镜像）"
-        echo ""
-        echo "【更新代码】在有网机器："
-        echo "  $0 export-code"
-        echo ""
-        echo "【更新代码】拷贝 mineru-code.tar.gz 到离线机器后："
-        echo "  tar xzf mineru-code.tar.gz  （在仓库根目录）"
-        echo "  $0 code  （在离线机器重建代码镜像）"
+        cat <<EOF
+用法：$0 {env|code|all|export-env|export-code|export|import [目录]|update}
+
+环境变量：
+  MINERU_ENV_TAG                 环境镜像标签，默认 v1.0
+  MINERU_CODE_TAG                代码镜像标签，默认 v1.0
+  MINERU_DEPENDENCY_VERSION      依赖解析使用的 MinerU 版本，默认 3.4.2
+  MINERU_EXPORT_DIR              导出目录，默认 ./export
+EOF
         exit 1
         ;;
 esac

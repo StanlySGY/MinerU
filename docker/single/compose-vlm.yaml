@@ -25,7 +25,7 @@ services:
       OMP_NUM_THREADS: ${OMP_NUM_THREADS:-1}
     volumes:
       - mineru-code:/app:ro
-      - ${VLM_MODEL_HOST_PATH}:${VLM_MODEL_PATH:-/models/mineru}:ro
+      - ${VLM_MODEL_HOST_PATH:-./models}:${VLM_MODEL_PATH:-/models/mineru}:ro
     entrypoint: ["python", "-m"]
     command:
       - mineru.cli.vlm_server
@@ -37,10 +37,10 @@ services:
       - "30000"
       - --model
       - ${VLM_MODEL_PATH:-/models/mineru}
+    ipc: host
     ulimits:
       memlock: -1
       stack: 67108864
-    ipc: host
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:30000/health || exit 1"]
       interval: 30s

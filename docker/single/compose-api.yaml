@@ -1,16 +1,22 @@
-# =============================================================================
-# MinerU API Server - 支持三种 backend
-# =============================================================================
-# pipeline / vlm-http-client / hybrid-http-client
-
 services:
+  mineru-code-sync:
+    image: ${MINERU_CODE_IMAGE:-mineru-code:v1.0}
+    container_name: mineru-code-sync-api
+    restart: "no"
+    volumes:
+      - mineru-code:/target
+
   mineru-api:
-    image: mineru-full:v1.0
+    image: ${MINERU_ENV_IMAGE:-mineru-env:v1.0}
     container_name: mineru-api
     restart: always
+    depends_on:
+      mineru-code-sync:
+        condition: service_completed_successfully
     ports:
-      - ${API_PORT:-18000}:8000
+      - "${API_PORT:-18000}:8000"
     environment:
+      PYTHONPATH: /app
       MINERU_VL_SERVER: http://${VLM_SERVER_IP:-127.0.0.1}:${VLM_PORT:-30000}/v1
       MINERU_VLM_SERVER_URL: http://${VLM_SERVER_IP:-127.0.0.1}:${VLM_PORT:-30000}/v1
       MINERU_VLM_MODEL: ${MINERU_VLM_MODEL:-OpenDataLab/MinerU2.5-Pro-2604-1.2B}
@@ -19,13 +25,22 @@ services:
       MINERU_FORMULA_ENABLE: ${MINERU_FORMULA_ENABLE:-true}
       MINERU_TABLE_ENABLE: ${MINERU_TABLE_ENABLE:-true}
       MINERU_LOG_LEVEL: ${MINERU_LOG_LEVEL:-INFO}
-    entrypoint: mineru-api
+    volumes:
+      - mineru-code:/app:ro
+    entrypoint: ["python", "-m"]
     command:
-      --host 0.0.0.0
-      --port 8000
-      --allow-public-http-client
+      - mineru.cli.fast_api
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --allow-public-http-client
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
+
+volumes:
+  mineru-code:
+    name: ${MINERU_CODE_VOLUME:-mineru-code}

@@ -1,0 +1,9 @@
+services:
+  mineru-vlm:
+    devices:
+      - /dev/davinci_manager:/dev/davinci_manager
+      - /dev/hisi_hdc:/dev/hisi_hdc
+      - /dev/devmm_svm:/dev/devmm_svm
+      - /dev/davinci${ASCEND_DEVICE:-0}:/dev/davinci${ASCEND_DEVICE:-0}
+    volumes:
+      - /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro

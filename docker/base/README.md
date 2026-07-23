@@ -1,83 +1,78 @@
-# 基础镜像
+# 基础镜像与离线更新
 
-## 镜像分层架构
+本目录提供两个独立镜像：
 
+```text
+mineru-env:v1.0   系统库、Python 运行时和 MinerU 依赖
+mineru-code:v1.0  只包含 MinerU 源码，基于 BusyBox，体积很小
 ```
-mineru-env:v1.0     ← 环境镜像（依赖包，不常变，构建一次长期使用）
-  │
-  └── mineru-full:v1.0  ← 代码镜像（MinerU 代码，常更新）
-```
 
-### 为什么要分离？
+API、Router 和 VLM 容器使用环境镜像运行，并在启动时由 `mineru-code` 容器把源码同步到名为 `mineru-code` 的只读卷。因此更新代码只需要导入新的代码镜像，不需要重新传输环境镜像。
 
-| 镜像 | 大小 | 更新频率 | 说明 |
-|---|---|---|---|
-| `mineru-env` | ~2-3 GB | 很少 | torch、paddleocr 等依赖包 |
-| `mineru-full` | ~50-100 MB | 频繁 | MinerU 代码 |
-
-离线部署时：
-- 首次：传输两个镜像
-- 更新代码：只传 `mineru-full`（小）
-- 更新依赖：才需要重新传 `mineru-env`（大）
-
-## 文件说明
-
-| 文件 | 说明 |
-|---|---|
-| `Dockerfile.env` | 环境镜像（依赖包） |
-| `Dockerfile.code` | 代码镜像（MinerU 代码） |
-| `Dockerfile.full` | 一体镜像（兼容旧方式） |
-| `compose.yaml` | VLM Server 配置 |
-| `build.sh` | 构建与导出脚本 |
-
-## 在有网机器上构建
+## 有网机器构建
 
 ```bash
 cd docker/base
 
-# 构建全部镜像
+# 首次构建或依赖发生变化时执行
+MINERU_ENV_TAG=v1.0 ./build.sh env
+
+# 每次代码发布执行。建议每个版本使用新的标签
+MINERU_CODE_TAG=v3.4.2 ./build.sh code
+
+# 构建两个镜像
 ./build.sh all
-
-# 导出为 tar.gz
-./build.sh export
 ```
 
-导出的文件在 `export/` 目录：
-```
-export/
-├── mineru-env-v1.0.tar.gz    # 环境镜像（~2-3 GB）
-└── mineru-full-v1.0.tar.gz   # 代码镜像（~50-100 MB）
-```
+`Dockerfile.env` 默认使用 `mineru==3.4.2` 解析 Pipeline 依赖。升级依赖时显式传入 `MINERU_DEPENDENCY_VERSION` 并同时升级环境标签。
 
-## 拷贝到离线机器
+## 导出和导入
 
 ```bash
-# 拷贝 export 目录到离线机器
-scp -r export/ user@offline-server:/path/to/docker/base/
+# 导出环境镜像和代码镜像
+MINERU_ENV_TAG=v1.0 MINERU_CODE_TAG=v3.4.2 ./build.sh export
 
-# 在离线机器上导入
-cd docker/base
-./build.sh import export/
+# 离线机导入目录中的全部 MinerU 镜像
+./build.sh import /path/to/export
 ```
 
-## 更新代码（离线机器）
+导出文件类似：
+
+```text
+mineru-env-v1.0.tar.gz       # 只在首次部署或依赖升级时传输
+mineru-code-v3.4.2.tar.gz    # 每次代码更新时传输
+```
+
+`docker save` 的代码归档只包含 BusyBox 和源码层，不包含环境镜像的 Python/Torch 层。
+
+## 离线更新代码
+
+有网机器：
 
 ```bash
-# 1. 在有网机器：更新代码后重新构建
 cd docker/base
-./build.sh code
-./build.sh export-code
-
-# 2. 拷贝 mineru-full-v1.0.tar.gz 到离线机器
-
-# 3. 在离线机器：只导入代码镜像
-./build.sh import export/
+MINERU_CODE_TAG=v3.4.3 ./build.sh code
+MINERU_CODE_TAG=v3.4.3 ./build.sh export-code
 ```
 
-## 支持的 Backend
+离线机器：
 
-| Backend | 说明 |
-|---|---|
-| `pipeline` | 纯本地小模型 |
-| `vlm-http-client` | 远程 VLM |
-| `hybrid-http-client` | 本地小模型 + 远程 VLM |
+```bash
+./build.sh import /path/to/export
+# 在对应部署目录的 .env 中设置：
+# MINERU_CODE_IMAGE=mineru-code:v3.4.3
+docker compose --env-file .env up -d
+```
+
+Compose 会重新运行 `mineru-code-sync`，清空旧代码卷后复制新代码，再启动 API/Router/VLM。
+
+## 依赖更新
+
+如果 `pyproject.toml` 的依赖或 Python 版本发生变化，必须重新构建并导出环境镜像：
+
+```bash
+MINERU_ENV_TAG=v1.1 MINERU_DEPENDENCY_VERSION=3.4.3 ./build.sh env
+MINERU_ENV_TAG=v1.1 ./build.sh export-env
+```
+
+同时更新部署目录中的 `MINERU_ENV_IMAGE`。代码镜像不能提供新的 Python 依赖。

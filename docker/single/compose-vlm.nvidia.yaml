@@ -1,0 +1,3 @@
+services:
+  mineru-vlm:
+    gpus: all
