@@ -28,6 +28,8 @@ MINERU_CODE_TAG=v3.4.2 ./build.sh code
 
 `build.sh code` 会临时组装只包含 `mineru/`、`pyproject.toml` 和代码 Dockerfile 的构建上下文，不会把仓库中的测试资料或其他镜像层发送给 Docker。
 
+脚本默认设置 `DOCKER_BUILDKIT=0`，兼容现场旧版 Docker。若服务器已确认支持 BuildKit，可在命令前设置 `DOCKER_BUILDKIT=1` 覆盖默认值。
+
 ## 导出和导入
 
 ```bash

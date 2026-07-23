@@ -3,6 +3,10 @@
 
 set -eu
 
+# Docker 旧版本/现场环境可能无法使用 BuildKit。默认关闭，调用者仍可
+# 通过 DOCKER_BUILDKIT=1 显式启用新版构建器。
+export DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-0}"
+
 cd "$(dirname "$0")"
 
 ENV_TAG="${MINERU_ENV_TAG:-v1.0}"
