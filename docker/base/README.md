@@ -41,9 +41,11 @@ MINERU_DEPENDENCY_VERSION=3.4.2 \
 ./build.sh env-npu
 ```
 
-基础镜像必须已经包含可导入的 `torch_npu`，并且 PyTorch 版本满足
-`>=2.6,<3`。构建脚本会在安装 Pipeline 依赖前后分别检查
-`torch/torch_npu/torchvision`，避免普通 PyPI 包破坏华为官方配套版本。
+基础镜像必须已经安装 `torch_npu`，并且 PyTorch 版本满足 `>=2.6,<3`。
+ARM CPU 构建机没有 `libascend_hal.so`，因此构建阶段使用
+`TORCH_DEVICE_BACKEND_AUTOLOAD=0` 检查 `torch/torch-npu/torchvision` 的包版本，
+不直接加载 NPU 硬件扩展。`torch_npu` 导入、NPU 可用性和张量分配必须在
+离线 NPU 现场通过 `docker/multi/start-multi.sh check` 验证。
 
 同时构建环境镜像和小型代码镜像：
 
@@ -54,9 +56,9 @@ MINERU_CODE_TAG=v3.4.2 \
 ./build.sh all-npu
 ```
 
-不要使用 x86_64 服务器直接构建现场 ARM64 镜像。优先在联网 ARM64/NPU
-服务器构建并完成真机验证；基础镜像必须依据华为版本配套表选择，不能只按
-“最新版本”选择。
+不要使用 x86_64 服务器直接构建现场 ARM64 镜像。可以在联网 ARM64 CPU
+服务器构建和导出，但必须在离线 NPU 现场完成真机验证；基础镜像必须依据
+华为版本配套表选择，不能只按“最新版本”选择。
 
 `build.sh code` 会临时组装只包含 `mineru/`、`pyproject.toml` 和代码 Dockerfile 的构建上下文，不会把仓库中的测试资料或其他镜像层发送给 Docker。
 

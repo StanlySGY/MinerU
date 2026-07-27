@@ -59,9 +59,11 @@ case "${1:-help}" in
             -t "$IMAGE_ENV" \
             -f Dockerfile.env.npu \
             .
-        echo "验证环境镜像中的 torch_npu..."
-        docker run --rm --entrypoint python "$IMAGE_ENV" -c \
-            'import torch, torch_npu, torchvision; print("torch:", torch.__version__); print("torch_npu:", torch_npu.__version__); print("torchvision:", torchvision.__version__)'
+        echo "验证环境镜像中的 torch-npu 包（ARM CPU 构建机不加载 NPU 驱动）..."
+        docker run --rm --entrypoint python \
+            -e TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
+            "$IMAGE_ENV" -c \
+            'from importlib.metadata import version as dist_version; import torch, torchvision; print("torch:", torch.__version__); print("torch_npu package:", dist_version("torch-npu")); print("torchvision:", torchvision.__version__)'
         ;;
 
     code)
