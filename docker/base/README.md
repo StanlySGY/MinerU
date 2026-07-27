@@ -26,6 +26,38 @@ MINERU_CODE_TAG=v3.4.2 ./build.sh code
 
 `Dockerfile.env` 默认使用 `mineru==3.4.2` 解析 Pipeline 依赖。升级依赖时显式传入 `MINERU_DEPENDENCY_VERSION` 并同时升级环境标签。
 
+### Ascend NPU 环境镜像
+
+`Dockerfile.env` 是 CPU 环境，不包含 `torch_npu`。Ascend Pipeline 必须使用
+`Dockerfile.env.npu`，并传入与离线现场 CANN/驱动版本匹配的官方 ARM64
+Ascend PyTorch 基础镜像：
+
+```bash
+cd docker/base
+
+MINERU_NPU_BASE_IMAGE='<官方 Ascend PyTorch ARM64 镜像>' \
+MINERU_ENV_TAG=npu-v1.0 \
+MINERU_DEPENDENCY_VERSION=3.4.2 \
+./build.sh env-npu
+```
+
+基础镜像必须已经包含可导入的 `torch_npu`，并且 PyTorch 版本满足
+`>=2.6,<3`。构建脚本会在安装 Pipeline 依赖前后分别检查
+`torch/torch_npu/torchvision`，避免普通 PyPI 包破坏华为官方配套版本。
+
+同时构建环境镜像和小型代码镜像：
+
+```bash
+MINERU_NPU_BASE_IMAGE='<官方 Ascend PyTorch ARM64 镜像>' \
+MINERU_ENV_TAG=npu-v1.0 \
+MINERU_CODE_TAG=v3.4.2 \
+./build.sh all-npu
+```
+
+不要使用 x86_64 服务器直接构建现场 ARM64 镜像。优先在联网 ARM64/NPU
+服务器构建并完成真机验证；基础镜像必须依据华为版本配套表选择，不能只按
+“最新版本”选择。
+
 `build.sh code` 会临时组装只包含 `mineru/`、`pyproject.toml` 和代码 Dockerfile 的构建上下文，不会把仓库中的测试资料或其他镜像层发送给 Docker。
 
 脚本默认设置 `DOCKER_BUILDKIT=0`，兼容现场旧版 Docker。若服务器已确认支持 BuildKit，可在命令前设置 `DOCKER_BUILDKIT=1` 覆盖默认值。
@@ -48,6 +80,13 @@ mineru-code-v3.4.2.tar.gz    # 每次代码更新时传输
 ```
 
 `docker save` 的代码归档只包含 BusyBox 和源码层，不包含环境镜像的 Python/Torch 层。
+
+NPU 环境镜像使用单独标签时，相应导出命令为：
+
+```bash
+MINERU_ENV_TAG=npu-v1.0 MINERU_CODE_TAG=v3.4.2 ./build.sh export
+sha256sum export/*.tar.gz > export/SHA256SUMS
+```
 
 ## 离线更新代码
 

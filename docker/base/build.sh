@@ -12,6 +12,7 @@ cd "$(dirname "$0")"
 ENV_TAG="${MINERU_ENV_TAG:-v1.0}"
 CODE_TAG="${MINERU_CODE_TAG:-v1.0}"
 DEPENDENCY_VERSION="${MINERU_DEPENDENCY_VERSION:-3.4.2}"
+NPU_BASE_IMAGE="${MINERU_NPU_BASE_IMAGE:-}"
 IMAGE_ENV="mineru-env:${ENV_TAG}"
 IMAGE_CODE="mineru-code:${CODE_TAG}"
 EXPORT_DIR="${MINERU_EXPORT_DIR:-./export}"
@@ -44,6 +45,25 @@ case "${1:-help}" in
             .
         ;;
 
+    env-npu)
+        if [ -z "$NPU_BASE_IMAGE" ]; then
+            echo "错误：必须设置 MINERU_NPU_BASE_IMAGE。" >&2
+            echo "该镜像必须是与现场 CANN/驱动匹配、已包含 torch_npu 的 ARM64 Ascend PyTorch 镜像。" >&2
+            exit 1
+        fi
+        echo "构建 NPU 环境镜像：${IMAGE_ENV}"
+        echo "Ascend PyTorch 基础镜像：${NPU_BASE_IMAGE}"
+        docker build \
+            --build-arg "NPU_BASE_IMAGE=${NPU_BASE_IMAGE}" \
+            --build-arg "MINERU_DEPENDENCY_VERSION=${DEPENDENCY_VERSION}" \
+            -t "$IMAGE_ENV" \
+            -f Dockerfile.env.npu \
+            .
+        echo "验证环境镜像中的 torch_npu..."
+        docker run --rm --entrypoint python "$IMAGE_ENV" -c \
+            'import torch, torch_npu, torchvision; print("torch:", torch.__version__); print("torch_npu:", torch_npu.__version__); print("torchvision:", torchvision.__version__)'
+        ;;
+
     code)
         echo "构建代码镜像：${IMAGE_CODE}"
         code_context="$(mktemp -d "${TMPDIR:-/tmp}/mineru-code-build.XXXXXX")"
@@ -56,6 +76,11 @@ case "${1:-help}" in
 
     all)
         "$0" env
+        "$0" code
+        ;;
+
+    all-npu)
+        "$0" env-npu
         "$0" code
         ;;
 
@@ -108,12 +133,13 @@ EOF
 
     *)
         cat <<EOF
-用法：$0 {env|code|all|export-env|export-code|export|import [目录]|update}
+用法：$0 {env|env-npu|code|all|all-npu|export-env|export-code|export|import [目录]|update}
 
 环境变量：
   MINERU_ENV_TAG                 环境镜像标签，默认 v1.0
   MINERU_CODE_TAG                代码镜像标签，默认 v1.0
   MINERU_DEPENDENCY_VERSION      依赖解析使用的 MinerU 版本，默认 3.4.2
+  MINERU_NPU_BASE_IMAGE          env-npu 使用的 Ascend PyTorch ARM64 基础镜像（必填）
   MINERU_EXPORT_DIR              导出目录，默认 ./export
 EOF
         exit 1

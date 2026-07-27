@@ -1,0 +1,8 @@
+env.multi
+images/*.tar.gz
+images/*.sha256
+models/PDF-Extract-Kit-1.0/
+artifacts/*.tar.gz
+artifacts/*.sha256
+pipeline-test-result.json
+hybrid-test-result.json
