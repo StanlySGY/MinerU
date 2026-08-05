@@ -1,5 +1,6 @@
 # Copyright (c) Opendatalab. All rights reserved.
 import asyncio
+import json
 import mimetypes
 import multiprocessing
 import os
@@ -10,7 +11,7 @@ import threading
 import uuid
 import zipfile
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Optional
@@ -169,6 +170,8 @@ class AsyncParseTask:
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
     error: Optional[str] = None
+    partial_success: bool = False
+    file_results: list[dict[str, Any]] = field(default_factory=list)
 
     def to_status_payload(
         self,
@@ -184,6 +187,8 @@ class AsyncParseTask:
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "error": self.error,
+            "partial_success": self.partial_success,
+            "file_results": self.file_results,
             "status_url": str(
                 request.url_for("get_async_task_status", task_id=self.task_id)
             ),
@@ -198,6 +203,14 @@ class AsyncParseTask:
 
 class TaskWaitAbortedError(RuntimeError):
     """Raised when a synchronous file_parse request cannot keep waiting safely."""
+
+
+class ParseBatchFailedError(RuntimeError):
+    """Raised when a parse batch has no usable file result."""
+
+    def __init__(self, message: str, file_results: list[dict[str, Any]]):
+        super().__init__(message)
+        self.file_results = file_results
 
 
 @asynccontextmanager
@@ -500,11 +513,25 @@ def create_result_zip(
     return_content_list: bool,
     return_images: bool,
     return_original_file: bool,
+    partial_success: bool = False,
+    file_results: Optional[list[dict[str, Any]]] = None,
 ) -> str:
     zip_fd, zip_path = tempfile.mkstemp(suffix=".zip", prefix="mineru_results_")
     os.close(zip_fd)
 
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        if partial_success or file_results:
+            zf.writestr(
+                "_parse_report.json",
+                json.dumps(
+                    {
+                        "partial_success": partial_success,
+                        "file_results": file_results or [],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
         for pdf_name in pdf_file_names:
             try:
                 parse_dir = get_parse_dir(output_dir, pdf_name, backend, parse_method)
@@ -630,6 +657,8 @@ async def build_result_response(
     response_format_zip: bool,
     return_original_file: bool,
     zip_filename: str = "results.zip",
+    partial_success: bool = False,
+    file_results: Optional[list[dict[str, Any]]] = None,
 ) -> Response:
     if response_format_zip:
         zip_task = asyncio.create_task(
@@ -645,6 +674,8 @@ async def build_result_response(
                 return_content_list=return_content_list,
                 return_images=return_images,
                 return_original_file=return_original_file,
+                partial_success=partial_success,
+                file_results=file_results,
             )
         )
         try:
@@ -677,6 +708,8 @@ async def build_result_response(
         content={
             "backend": backend,
             "version": __version__,
+            "partial_success": partial_success,
+            "file_results": file_results or [],
             "results": result_dict,
         },
     )
@@ -714,6 +747,8 @@ async def build_sync_file_parse_response(
             response_format_zip=task.response_format_zip,
             return_original_file=task.return_original_file,
             zip_filename=f"{task.task_id}.zip",
+            partial_success=task.partial_success,
+            file_results=task.file_results,
         )
         response.headers[FILE_PARSE_TASK_ID_HEADER] = task.task_id
         response.headers[FILE_PARSE_TASK_STATUS_HEADER] = task.status
@@ -824,7 +859,7 @@ async def run_parse_job(
     uploads: list[StoredUpload],
     request_options: ParseRequestOptions | AsyncParseTask,
     config: dict[str, Any],
-) -> list[str]:
+) -> dict[str, Any]:
     pdf_file_names, pdf_bytes_list = await asyncio.to_thread(load_parse_inputs, uploads)
     actual_lang_list = normalize_lang_list(request_options.lang_list, len(pdf_file_names))
 
@@ -866,6 +901,20 @@ async def run_parse_job(
     pdf_bytes_list = safe_bytes
     actual_lang_list = safe_langs
     response_file_names = list(pdf_file_names)
+    precheck_file_results = [
+        {
+            "file_name": name,
+            "status": "failed",
+            "total_pages": None,
+            "successful_pages": 0,
+            "failed_pages": [],
+            "error": {
+                "type": "PdfPrecheckError",
+                "message": reason,
+            },
+        }
+        for name, reason in skipped
+    ]
 
     parse_kwargs = dict(
         output_dir=output_dir,
@@ -895,14 +944,71 @@ async def run_parse_job(
             "client_side_output_generation",
             False,
         ),
+        task_id=getattr(request_options, "task_id", None),
         **config,
     )
 
     if request_options.backend == "pipeline":
         await asyncio.to_thread(do_parse, **parse_kwargs)
+        parsed_file_results = [
+            {
+                "file_name": file_name,
+                "status": "completed",
+                "failed_pages": [],
+                "error": None,
+            }
+            for file_name in pdf_file_names
+        ]
     else:
-        await aio_do_parse(**parse_kwargs)
-    return response_file_names
+        parsed_file_results = await aio_do_parse(**parse_kwargs) or []
+
+    reported_names = {
+        result.get("file_name")
+        for result in parsed_file_results
+        if isinstance(result, dict)
+    }
+    parsed_file_results.extend(
+        {
+            "file_name": file_name,
+            "status": "completed",
+            "failed_pages": [],
+            "error": None,
+        }
+        for file_name in pdf_file_names
+        if file_name not in reported_names
+    )
+    file_results = [*precheck_file_results, *parsed_file_results]
+    successful_results = [
+        result
+        for result in file_results
+        if result.get("status") in {"completed", "partial"}
+    ]
+    if not successful_results:
+        errors = [
+            f"{result.get('file_name')}: "
+            f"{(result.get('error') or {}).get('message', 'unknown error')}"
+            for result in file_results
+        ]
+        raise ParseBatchFailedError(
+            "All files failed: " + "; ".join(errors),
+            file_results,
+        )
+    partial_success = any(
+        result.get("status") != "completed" for result in file_results
+    )
+    logger.info(
+        "Parse batch completed: total_files={}, completed_files={}, "
+        "partial_files={}, failed_files={}",
+        len(file_results),
+        sum(result.get("status") == "completed" for result in file_results),
+        sum(result.get("status") == "partial" for result in file_results),
+        sum(result.get("status") == "failed" for result in file_results),
+    )
+    return {
+        "file_names": response_file_names,
+        "partial_success": partial_success,
+        "file_results": file_results,
+    }
 
 
 def create_task_output_dir(task_id: str) -> str:
@@ -1185,6 +1291,9 @@ class AsyncTaskManager:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            if isinstance(exc, ParseBatchFailedError):
+                task.file_results = list(exc.file_results)
+                task.partial_success = False
             task.status = TASK_FAILED
             task.error = str(exc)
             task.completed_at = utc_now_iso()
@@ -1209,12 +1318,14 @@ class AsyncTaskManager:
             )
         ]
         config = getattr(self.app.state, "config", {})
-        await run_parse_job(
+        job_result = await run_parse_job(
             output_dir=task.output_dir,
             uploads=uploads,
             request_options=task,
             config=config,
         )
+        task.partial_success = bool(job_result.get("partial_success", False))
+        task.file_results = list(job_result.get("file_results", []))
         task.status = TASK_COMPLETED
         task.completed_at = utc_now_iso()
         self._signal_task_event(task.task_id)
@@ -1384,6 +1495,8 @@ async def get_async_task_result(
         response_format_zip=task.response_format_zip,
         return_original_file=task.return_original_file,
         zip_filename=f"{task.task_id}.zip",
+        partial_success=task.partial_success,
+        file_results=task.file_results,
     )
 
 

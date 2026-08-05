@@ -365,6 +365,8 @@ class RouterTaskRecord:
     completed_at: Optional[str] = None
     error: Optional[str] = None
     queued_ahead: int | None = None
+    partial_success: bool = False
+    file_results: list[dict[str, Any]] = field(default_factory=list)
     upstream_error_count: int = 0
 
     def to_status_payload(self, request: Request) -> dict[str, Any]:
@@ -377,6 +379,8 @@ class RouterTaskRecord:
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "error": self.error,
+            "partial_success": self.partial_success,
+            "file_results": self.file_results,
             "status_url": str(request.url_for("get_router_task_status", task_id=self.task_id)),
             "result_url": str(request.url_for("get_router_task_result", task_id=self.task_id)),
         }
@@ -915,6 +919,14 @@ class RouterTaskRegistry:
             task.started_at = payload.get("started_at") if payload.get("started_at") is None else str(payload.get("started_at"))
             task.completed_at = payload.get("completed_at") if payload.get("completed_at") is None else str(payload.get("completed_at"))
             task.error = payload.get("error") if payload.get("error") is None else str(payload.get("error"))
+            task.partial_success = bool(payload.get("partial_success", False))
+            file_results = payload.get("file_results")
+            task.file_results = (
+                list(file_results)
+                if isinstance(file_results, list)
+                and all(isinstance(item, dict) for item in file_results)
+                else []
+            )
             queued_ahead = payload.get("queued_ahead")
             task.queued_ahead = queued_ahead if isinstance(queued_ahead, int) else None
             task.upstream_error_count = 0

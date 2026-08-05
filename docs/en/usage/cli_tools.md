@@ -145,6 +145,22 @@ Here are the environment variables and their descriptions:
     * Used to control the maximum concurrent requests handled by `mineru-api` or router-managed workers.
     * Default is `3`, and it must be a positive integer.
 
+- `MINERU_VLM_FAILURE_POLICY`:
+    * Controls page failure handling for `vlm-http-client`: `skip_page` or `fail_fast`.
+    * `skip_page` records timed-out pages and continues processing. The default is `fail_fast`.
+
+- `MINERU_VLM_GLOBAL_PAGE_CONCURRENCY`:
+    * Limits VLM pages across all tasks in one MinerU API process.
+    * Defaults to `2` to prevent concurrent files from overwhelming a capacity-limited VLM server.
+
+- `MINERU_VLM_PAGE_TIMEOUT_SECONDS`:
+    * Sets the total VLM inference timeout per page. The default is `600` seconds.
+    * With `skip_page`, timed-out pages are recorded and processing continues.
+
+- `MINERU_VLM_CONNECT_MAX_RETRIES`:
+    * Controls page-level retries for connection failures and HTTP 429/502/503/504. The default is `1`.
+    * `ReadTimeout` is not retried so slow pages do not repeatedly occupy the VLM server.
+
 - `MINERU_API_ENABLE_FASTAPI_DOCS`:
     * Used to control whether FastAPI documentation endpoints such as `/docs`, `/openapi.json`, and `/redoc` are enabled.
     * Default is `true`.

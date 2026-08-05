@@ -137,6 +137,22 @@ MinerU命令行工具的某些参数存在相同功能的环境变量配置，�
     * 用于设置 `mineru-api` 或 `mineru-router` 管理的 worker 最大并发请求数
     * 默认为`3`，需设置为正整数。
 
+- `MINERU_VLM_FAILURE_POLICY`：
+    * 控制 `vlm-http-client` 的页面失败策略，可选 `skip_page` 或 `fail_fast`。
+    * `skip_page` 会记录超时页并继续解析其他页面，默认为 `fail_fast`。
+
+- `MINERU_VLM_GLOBAL_PAGE_CONCURRENCY`：
+    * 控制同一 MinerU API 进程中所有任务共享的 VLM 页面并发数。
+    * 默认为 `2`，用于避免多个文件同时向容量有限的 VLM Server 发送大量请求。
+
+- `MINERU_VLM_PAGE_TIMEOUT_SECONDS`：
+    * 控制单页 VLM 推理的总超时时间，默认为 `600` 秒。
+    * 超时后在 `skip_page` 策略下记录该页并继续处理。
+
+- `MINERU_VLM_CONNECT_MAX_RETRIES`：
+    * 控制连接中断和 HTTP 429/502/503/504 等瞬时错误的页级重试次数，默认为 `1`。
+    * `ReadTimeout` 不会重试，避免慢页重复占用 VLM。
+
 - `MINERU_API_ENABLE_FASTAPI_DOCS`：
     * 用于控制是否启用 FastAPI 自动生成的 `/docs`、`/openapi.json`、`/redoc`
     * 默认为`true`。

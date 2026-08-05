@@ -39,8 +39,12 @@ services:
       # CANN/torch_npu 使用该变量限制当前 Pipeline 进程只看见指定的物理 NPU。
       # 只暴露一张物理卡后，程序内部看到的设备索引是 npu:0。
       ASCEND_RT_VISIBLE_DEVICES: "${PIPELINE_NPU_ID:-6}"
-      MINERU_PROCESSING_WINDOW_SIZE: ${MINERU_PROCESSING_WINDOW_SIZE:-32}
+      MINERU_PROCESSING_WINDOW_SIZE: ${MINERU_PROCESSING_WINDOW_SIZE:-8}
       MINERU_API_MAX_CONCURRENT_REQUESTS: ${MINERU_API_MAX_CONCURRENT_REQUESTS:-1}
+      MINERU_VLM_FAILURE_POLICY: ${MINERU_VLM_FAILURE_POLICY:-skip_page}
+      MINERU_VLM_GLOBAL_PAGE_CONCURRENCY: ${MINERU_VLM_GLOBAL_PAGE_CONCURRENCY:-2}
+      MINERU_VLM_PAGE_TIMEOUT_SECONDS: ${MINERU_VLM_PAGE_TIMEOUT_SECONDS:-600}
+      MINERU_VLM_CONNECT_MAX_RETRIES: ${MINERU_VLM_CONNECT_MAX_RETRIES:-1}
       # /app 是只读代码目录，解析结果必须写入独立的可写目录。
       MINERU_API_OUTPUT_ROOT: ${MINERU_API_OUTPUT_ROOT:-/var/lib/mineru/output}
       MINERU_FORMULA_ENABLE: ${MINERU_FORMULA_ENABLE:-true}
@@ -66,6 +70,12 @@ services:
       - --port
       - "8000"
       - --allow-public-http-client
+      - --max-concurrency
+      - ${MINERU_VLM_CLIENT_MAX_CONCURRENCY:-4}
+      - --max-retries
+      - ${MINERU_VLM_CLIENT_MAX_RETRIES:-0}
+      - --http-timeout
+      - ${MINERU_VLM_CLIENT_HTTP_TIMEOUT:-600}
     healthcheck: &api-healthcheck
       test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
       interval: 30s

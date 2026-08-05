@@ -19,6 +19,7 @@ from .model_output_to_middle_json import (
     finalize_middle_json,
     init_middle_json,
 )
+from .resilience import aio_extract_pages_with_failure_isolation
 from mineru.backend.utils.runtime_utils import exclude_progress_bar_idle_time
 from ...data.data_reader_writer import DataWriter
 from mineru.utils.pdf_image_tools import (
@@ -26,7 +27,11 @@ from mineru.utils.pdf_image_tools import (
     load_images_from_pdf_doc,
 )
 from ...utils.check_sys_env import is_mac_os_version_supported
-from ...utils.config_reader import get_device, get_processing_window_size
+from ...utils.config_reader import (
+    get_device,
+    get_processing_window_size,
+    get_vlm_failure_policy,
+)
 
 from ...utils.enum_class import ImageType
 from ...utils.pdfium_guard import (
@@ -530,6 +535,8 @@ async def aio_doc_analyze(
     image_analysis: bool = True,
     **kwargs,
 ):
+    task_id = kwargs.pop("task_id", None)
+    source_file_name = kwargs.pop("source_file_name", None)
     client_side_output_generation = bool(
         kwargs.pop("client_side_output_generation", False)
     )
@@ -575,11 +582,30 @@ async def aio_doc_analyze(
                         f'({len(images_pil_list)} pages)'
                     )
                     async with aio_predictor_execution_guard(predictor):
-                        window_results = await predictor.aio_batch_two_step_extract(
-                            images=images_pil_list,
-                            image_analysis=image_analysis,
-                        )
+                        if (
+                            backend == "http-client"
+                            and get_vlm_failure_policy(default="fail_fast") == "skip_page"
+                        ):
+                            window_results, page_failures = (
+                                await aio_extract_pages_with_failure_isolation(
+                                    predictor,
+                                    images_pil_list,
+                                    page_start_index=window_start,
+                                    image_analysis=image_analysis,
+                                    task_id=task_id,
+                                    source_file_name=source_file_name,
+                                )
+                            )
+                        else:
+                            window_results = await predictor.aio_batch_two_step_extract(
+                                images=images_pil_list,
+                                image_analysis=image_analysis,
+                            )
+                            page_failures = []
                     results.extend(window_results)
+                    if page_failures:
+                        middle_json.setdefault("_failed_pages", []).extend(page_failures)
+                        middle_json["_parse_status"] = "partial"
                     if progress_bar is None:
                         progress_bar = tqdm(total=page_count, desc="Processing pages")
                     else:
@@ -596,6 +622,7 @@ async def aio_doc_analyze(
                         image_writer,
                         page_start_index=window_start,
                         progress_bar=progress_bar,
+                        page_failures=page_failures,
                     )
                     last_append_end_time = time.time()
                 finally:
@@ -611,6 +638,17 @@ async def aio_doc_analyze(
             )
         if not client_side_output_generation:
             await asyncio.to_thread(finalize_middle_json, middle_json["pdf_info"])
+        failed_pages = middle_json.get("_failed_pages", [])
+        if failed_pages:
+            logger.warning(
+                "VLM document partially completed: task_id={}, file_name={}, "
+                "total_pages={}, successful_pages={}, skipped_pages={}",
+                task_id or "-",
+                source_file_name or "-",
+                page_count,
+                page_count - len(failed_pages),
+                [failure["page_number"] for failure in failed_pages],
+            )
         close_pdfium_document(pdf_doc)
         doc_closed = True
         return middle_json, results

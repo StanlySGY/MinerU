@@ -445,23 +445,64 @@ async def _async_process_vlm(
     if not backend.endswith("client"):
         server_url = None
 
+    file_results = []
     for idx, pdf_bytes in enumerate(pdf_bytes_list):
         pdf_file_name = pdf_file_names[idx]
-        local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, parse_method)
-        image_writer, md_writer = FileBasedDataWriter(local_image_dir), FileBasedDataWriter(local_md_dir)
+        try:
+            local_image_dir, local_md_dir = prepare_env(
+                output_dir, pdf_file_name, parse_method
+            )
+            image_writer = FileBasedDataWriter(local_image_dir)
+            md_writer = FileBasedDataWriter(local_md_dir)
+            middle_json, infer_result = await aio_vlm_doc_analyze(
+                pdf_bytes,
+                image_writer=image_writer,
+                backend=backend,
+                server_url=server_url,
+                source_file_name=pdf_file_name,
+                **kwargs,
+            )
 
-        middle_json, infer_result = await aio_vlm_doc_analyze(
-            pdf_bytes, image_writer=image_writer, backend=backend, server_url=server_url, **kwargs,
-        )
+            pdf_info = middle_json["pdf_info"]
 
-        pdf_info = middle_json["pdf_info"]
-
-        _process_output(
-            pdf_info, pdf_bytes, pdf_file_name, local_md_dir, local_image_dir,
-            md_writer, f_draw_layout_bbox, f_draw_span_bbox, f_dump_orig_pdf,
-            f_dump_md, f_dump_content_list, f_dump_middle_json, f_dump_model_output,
-            f_make_md_mode, middle_json, infer_result, process_mode="vlm"
-        )
+            _process_output(
+                pdf_info, pdf_bytes, pdf_file_name, local_md_dir, local_image_dir,
+                md_writer, f_draw_layout_bbox, f_draw_span_bbox, f_dump_orig_pdf,
+                f_dump_md, f_dump_content_list, f_dump_middle_json, f_dump_model_output,
+                f_make_md_mode, middle_json, infer_result, process_mode="vlm"
+            )
+            failed_pages = list(middle_json.get("_failed_pages", []))
+            file_results.append(
+                {
+                    "file_name": pdf_file_name,
+                    "status": "partial" if failed_pages else "completed",
+                    "total_pages": len(pdf_info),
+                    "successful_pages": len(pdf_info) - len(failed_pages),
+                    "failed_pages": failed_pages,
+                    "error": None,
+                }
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception(
+                "VLM document failed and the remaining files will continue: "
+                f"file_name={pdf_file_name}"
+            )
+            file_results.append(
+                {
+                    "file_name": pdf_file_name,
+                    "status": "failed",
+                    "total_pages": None,
+                    "successful_pages": 0,
+                    "failed_pages": [],
+                    "error": {
+                        "type": type(exc).__name__,
+                        "message": str(exc) or repr(exc),
+                    },
+                }
+            )
+    return file_results
 
 
 def _process_vlm(
@@ -586,33 +627,71 @@ async def _async_process_hybrid(
     """异步处理hybrid后端逻辑"""
     if not backend.endswith("client"):
         server_url = None
+    hybrid_kwargs = dict(kwargs)
+    hybrid_kwargs.pop("task_id", None)
 
+    file_results = []
     for idx, pdf_bytes in enumerate(pdf_bytes_list):
         pdf_file_name = pdf_file_names[idx]
-        local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, f"hybrid_{parse_method}")
-        image_writer, md_writer = FileBasedDataWriter(local_image_dir), FileBasedDataWriter(local_md_dir)
+        try:
+            local_image_dir, local_md_dir = prepare_env(
+                output_dir, pdf_file_name, f"hybrid_{parse_method}"
+            )
+            image_writer = FileBasedDataWriter(local_image_dir)
+            md_writer = FileBasedDataWriter(local_md_dir)
+            middle_json, infer_result = await aio_hybrid_doc_analyze(
+                pdf_bytes,
+                image_writer=image_writer,
+                backend=backend,
+                parse_method=parse_method,
+                inline_formula_enable=inline_formula_enable,
+                server_url=server_url,
+                effort=validate_effort(effort),
+                **hybrid_kwargs,
+            )
 
-        middle_json, infer_result = await aio_hybrid_doc_analyze(
-            pdf_bytes,
-            image_writer=image_writer,
-            backend=backend,
-            parse_method=parse_method,
-            inline_formula_enable=inline_formula_enable,
-            server_url=server_url,
-            effort=validate_effort(effort),
-            **kwargs,
-        )
+            pdf_info = middle_json["pdf_info"]
 
-        pdf_info = middle_json["pdf_info"]
+            f_draw_span_bbox = False
 
-        f_draw_span_bbox = False
-
-        _process_output(
-            pdf_info, pdf_bytes, pdf_file_name, local_md_dir, local_image_dir,
-            md_writer, f_draw_layout_bbox, f_draw_span_bbox, f_dump_orig_pdf,
-            f_dump_md, f_dump_content_list, f_dump_middle_json, f_dump_model_output,
-            f_make_md_mode, middle_json, infer_result, process_mode="vlm"
-        )
+            _process_output(
+                pdf_info, pdf_bytes, pdf_file_name, local_md_dir, local_image_dir,
+                md_writer, f_draw_layout_bbox, f_draw_span_bbox, f_dump_orig_pdf,
+                f_dump_md, f_dump_content_list, f_dump_middle_json, f_dump_model_output,
+                f_make_md_mode, middle_json, infer_result, process_mode="vlm"
+            )
+            failed_pages = list(middle_json.get("_failed_pages", []))
+            file_results.append(
+                {
+                    "file_name": pdf_file_name,
+                    "status": "partial" if failed_pages else "completed",
+                    "total_pages": len(pdf_info),
+                    "successful_pages": len(pdf_info) - len(failed_pages),
+                    "failed_pages": failed_pages,
+                    "error": None,
+                }
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception(
+                "Hybrid document failed and the remaining files will continue: "
+                f"file_name={pdf_file_name}"
+            )
+            file_results.append(
+                {
+                    "file_name": pdf_file_name,
+                    "status": "failed",
+                    "total_pages": None,
+                    "successful_pages": 0,
+                    "failed_pages": [],
+                    "error": {
+                        "type": type(exc).__name__,
+                        "message": str(exc) or repr(exc),
+                    },
+                }
+            )
+    return file_results
 
 
 def _process_office_doc(
@@ -816,6 +895,15 @@ async def aio_do_parse(
             f_dump_model_output, f_dump_orig_pdf, f_dump_content_list, f_make_md_mode,
             client_side_output_generation=client_side_output_generation,
         )
+        return [
+            {
+                "file_name": file_name,
+                "status": "completed",
+                "failed_pages": [],
+                "error": None,
+            }
+            for file_name in pdf_file_names
+        ]
     else:
         if backend.startswith("vlm-"):
             backend = backend[4:]
@@ -826,7 +914,7 @@ async def aio_do_parse(
             os.environ['MINERU_VLM_FORMULA_ENABLE'] = str(formula_enable)
             os.environ['MINERU_VLM_TABLE_ENABLE'] = str(table_enable)
 
-            await _async_process_vlm(
+            return await _async_process_vlm(
                 output_dir, pdf_file_names, pdf_bytes_list, backend,
                 f_draw_layout_bbox, f_draw_span_bbox, f_dump_md, f_dump_middle_json,
                 f_dump_model_output, f_dump_orig_pdf, f_dump_content_list, f_make_md_mode,
@@ -843,13 +931,14 @@ async def aio_do_parse(
             os.environ['MINERU_VLM_TABLE_ENABLE'] = str(table_enable)
             os.environ['MINERU_VLM_FORMULA_ENABLE'] = "true"
 
-            await _async_process_hybrid(
+            return await _async_process_hybrid(
                 output_dir, pdf_file_names, pdf_bytes_list, parse_method, formula_enable, backend,
                 f_draw_layout_bbox, f_draw_span_bbox, f_dump_md, f_dump_middle_json,
                 f_dump_model_output, f_dump_orig_pdf, f_dump_content_list, f_make_md_mode,
                 server_url, effort=effort, image_analysis=image_analysis,
                 client_side_output_generation=client_side_output_generation, **kwargs,
             )
+    return []
 
 
 if __name__ == "__main__":

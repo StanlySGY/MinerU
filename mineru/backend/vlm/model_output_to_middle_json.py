@@ -88,7 +88,13 @@ def append_page_blocks_to_middle_json(
     image_writer,
     page_start_index=0,
     progress_bar=None,
+    page_failures=None,
 ):
+    failure_by_page = {
+        failure.get("page_idx"): failure
+        for failure in (page_failures or [])
+        if isinstance(failure, dict) and isinstance(failure.get("page_idx"), int)
+    }
     for offset, (page_blocks, image_dict) in enumerate(zip(model_output_blocks_list, images_list)):
         page_index = page_start_index + offset
         page = None
@@ -98,6 +104,14 @@ def append_page_blocks_to_middle_json(
             page_info = blocks_to_page_info(page_blocks, image_dict, page, image_writer, page_index)
         finally:
             close_pdfium_child(page)
+        failure = failure_by_page.get(page_index)
+        if failure is not None:
+            page_info["parse_status"] = "skipped"
+            page_info["parse_error"] = {
+                key: value
+                for key, value in failure.items()
+                if key not in {"page_idx", "page_number"}
+            }
         middle_json["pdf_info"].append(page_info)
         if progress_bar is not None:
             progress_bar.update(1)

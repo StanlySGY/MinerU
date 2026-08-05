@@ -192,6 +192,65 @@ def get_max_concurrent_requests(default: int = 3) -> int:
     return max_concurrent_requests
 
 
+def get_vlm_failure_policy(default: str = "fail_fast") -> str:
+    value = os.getenv("MINERU_VLM_FAILURE_POLICY", default).strip().lower()
+    supported = {"fail_fast", "skip_page"}
+    if value not in supported:
+        logger.warning(
+            f"Invalid MINERU_VLM_FAILURE_POLICY value: {value}, use {default}"
+        )
+        return default
+    return value
+
+
+def get_vlm_global_page_concurrency(default: int = 2) -> int:
+    value = os.getenv("MINERU_VLM_GLOBAL_PAGE_CONCURRENCY")
+    if value is None:
+        return default
+    try:
+        concurrency = int(value)
+    except ValueError:
+        logger.warning(
+            "Invalid MINERU_VLM_GLOBAL_PAGE_CONCURRENCY value: "
+            f"{value}, use {default}"
+        )
+        return default
+    return max(1, concurrency)
+
+
+def get_vlm_page_timeout_seconds(default: float = 600.0) -> float:
+    value = os.getenv("MINERU_VLM_PAGE_TIMEOUT_SECONDS")
+    if value is None:
+        return default
+    try:
+        timeout = float(value)
+    except ValueError:
+        logger.warning(
+            f"Invalid MINERU_VLM_PAGE_TIMEOUT_SECONDS value: {value}, use {default}"
+        )
+        return default
+    if timeout < 1:
+        logger.warning(
+            f"MINERU_VLM_PAGE_TIMEOUT_SECONDS must be >= 1, use {default}"
+        )
+        return default
+    return timeout
+
+
+def get_vlm_connect_max_retries(default: int = 1) -> int:
+    value = os.getenv("MINERU_VLM_CONNECT_MAX_RETRIES")
+    if value is None:
+        return default
+    try:
+        retries = int(value)
+    except ValueError:
+        logger.warning(
+            f"Invalid MINERU_VLM_CONNECT_MAX_RETRIES value: {value}, use {default}"
+        )
+        return default
+    return max(0, retries)
+
+
 def get_latex_delimiter_config():
     config = read_config()
     if config is None:
