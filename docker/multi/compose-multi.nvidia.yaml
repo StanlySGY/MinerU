@@ -1,0 +1,8 @@
+# NVIDIA GPU 硬件映射叠加文件，只在 MINERU_DEVICE_MODE=cuda 时使用。
+# start-multi.sh 会自动把本文件追加到 compose-multi.yaml 之后；不要单独使用。
+# 仅适用于已安装 NVIDIA Container Toolkit 的主机，启动前先用 nvidia-smi 确认驱动。
+# 同时注意 MINERU_ENV_IMAGE 必须是带 CUDA 版 torch 的镜像。
+services:
+  mineru-api-1:
+    # 等价于 docker run --gpus all；只想暴露部分卡时改成 "device=0" 这类取值。
+    gpus: ${NVIDIA_GPUS:-all}

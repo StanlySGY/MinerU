@@ -367,6 +367,7 @@ class RouterTaskRecord:
     queued_ahead: int | None = None
     partial_success: bool = False
     file_results: list[dict[str, Any]] = field(default_factory=list)
+    progress: dict[str, Any] = field(default_factory=dict)
     upstream_error_count: int = 0
 
     def to_status_payload(self, request: Request) -> dict[str, Any]:
@@ -381,6 +382,7 @@ class RouterTaskRecord:
             "error": self.error,
             "partial_success": self.partial_success,
             "file_results": self.file_results,
+            "progress": self.progress,
             "status_url": str(request.url_for("get_router_task_status", task_id=self.task_id)),
             "result_url": str(request.url_for("get_router_task_result", task_id=self.task_id)),
         }
@@ -901,6 +903,13 @@ class RouterTaskRegistry:
         async with self._lock:
             return self._tasks.get(task_id)
 
+    async def list(self, status: str | None = None) -> list[RouterTaskRecord]:
+        async with self._lock:
+            tasks = list(self._tasks.values())
+        if status:
+            tasks = [task for task in tasks if task.status == status]
+        return sorted(tasks, key=lambda task: task.created_at, reverse=True)
+
     async def update_from_upstream_payload(
         self,
         task_id: str,
@@ -927,6 +936,8 @@ class RouterTaskRegistry:
                 and all(isinstance(item, dict) for item in file_results)
                 else []
             )
+            progress = payload.get("progress")
+            task.progress = dict(progress) if isinstance(progress, dict) else {}
             queued_ahead = payload.get("queued_ahead")
             task.queued_ahead = queued_ahead if isinstance(queued_ahead, int) else None
             task.upstream_error_count = 0
@@ -1501,6 +1512,61 @@ def create_app(settings: RouterSettings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Task not found")
         task = await fetch_router_task_status(request, task)
         return task.to_status_payload(request)
+
+    @app.get(path="/tasks", name="list_router_tasks")
+    async def list_router_tasks(
+        request: Request,
+        status: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ):
+        registry: RouterTaskRegistry = request.app.state.router_task_registry
+        normalized_limit = min(max(limit, 1), 500)
+        normalized_offset = max(offset, 0)
+        tasks = await registry.list(status=status)
+        selected = tasks[normalized_offset : normalized_offset + normalized_limit]
+        refreshed = await asyncio.gather(
+            *(fetch_router_task_status(request, task) for task in selected),
+            return_exceptions=True,
+        )
+        payloads = []
+        for original, item in zip(selected, refreshed):
+            task = original if isinstance(item, Exception) else item
+            payloads.append(task.to_status_payload(request))
+        return {
+            "items": payloads,
+            "total": len(tasks),
+            "limit": normalized_limit,
+            "offset": normalized_offset,
+        }
+
+    @app.get(path="/tasks/{task_id}/events", name="stream_router_task_events")
+    async def stream_router_task_events(task_id: str, request: Request):
+        registry: RouterTaskRegistry = request.app.state.router_task_registry
+        if await registry.get(task_id) is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        async def event_stream():
+            last_signature: tuple[str, int] | None = None
+            while True:
+                task = await registry.get(task_id)
+                if task is None:
+                    break
+                task = await fetch_router_task_status(request, task)
+                progress = task.progress or {}
+                signature = (task.status, int(progress.get("version", 0)))
+                if signature != last_signature:
+                    yield f"data: {json.dumps(task.to_status_payload(request), ensure_ascii=False)}\n\n"
+                    last_signature = signature
+                if is_task_terminal(task.status) or await request.is_disconnected():
+                    break
+                await asyncio.sleep(1.0)
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.get(path="/tasks/{task_id}/result", name="get_router_task_result")
     async def get_router_task_result(task_id: str, request: Request):

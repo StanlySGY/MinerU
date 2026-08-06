@@ -13,6 +13,7 @@ from mineru.utils.config_reader import (
     get_vlm_global_page_concurrency,
     get_vlm_page_timeout_seconds,
 )
+from mineru.utils.task_progress import task_progress_registry
 
 
 _vlm_page_semaphores = weakref.WeakKeyDictionary()
@@ -103,6 +104,12 @@ async def aio_extract_pages_with_failure_isolation(
     semaphore = get_vlm_page_semaphore()
     timeout_seconds = get_vlm_page_timeout_seconds(default=600.0)
     connect_max_retries = get_vlm_connect_max_retries(default=1)
+    task_progress_registry.queue_pages(
+        task_id,
+        source_file_name,
+        page_start_index,
+        len(images),
+    )
 
     async def extract_page(offset, image):
         page_index = page_start_index + offset
@@ -112,6 +119,12 @@ async def aio_extract_pages_with_failure_isolation(
             attempts += 1
             try:
                 async with semaphore:
+                    task_progress_registry.page_started(
+                        task_id,
+                        source_file_name,
+                        page_index,
+                        attempts,
+                    )
                     page_results = await asyncio.wait_for(
                         predictor.aio_batch_two_step_extract(
                             images=[image],
@@ -124,11 +137,24 @@ async def aio_extract_pages_with_failure_isolation(
                         "VLM page extraction returned an unexpected result count: "
                         f"expected 1, got {len(page_results)}"
                     )
+                task_progress_registry.page_completed(
+                    task_id,
+                    source_file_name,
+                    page_index,
+                    attempts,
+                )
                 return page_results[0], None, None
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 if not is_skippable_vlm_page_error(exc):
+                    task_progress_registry.page_failed(
+                        task_id,
+                        source_file_name,
+                        page_index,
+                        exc,
+                        attempts,
+                    )
                     return None, None, exc
                 if (
                     is_retryable_vlm_page_error(exc)
@@ -138,6 +164,11 @@ async def aio_extract_pages_with_failure_isolation(
                     continue
                 elapsed = time.monotonic() - started_at
                 failure = build_page_failure(page_index, exc, elapsed, attempts)
+                task_progress_registry.page_skipped(
+                    task_id,
+                    source_file_name,
+                    failure,
+                )
                 logger.warning(
                     "VLM page skipped: task_id={}, file_name={}, page_number={}, "
                     "page_idx={}, error_type={}, attempts={}, elapsed_seconds={}, "

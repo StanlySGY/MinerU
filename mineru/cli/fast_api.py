@@ -27,7 +27,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from loguru import logger
 
 from base64 import b64encode
@@ -69,6 +69,7 @@ from mineru.utils.config_reader import (
 )
 from mineru.utils.guess_suffix_or_lang import guess_suffix_by_path
 from mineru.utils.pdf_image_tools import shutdown_pdf_render_executor
+from mineru.utils.task_progress import task_progress_registry
 from mineru.version import __version__
 
 os.environ["TORCH_CUDNN_V8_API_DISABLED"] = "1"
@@ -189,6 +190,7 @@ class AsyncParseTask:
             "error": self.error,
             "partial_success": self.partial_success,
             "file_results": self.file_results,
+            "progress": task_progress_registry.snapshot(self.task_id),
             "status_url": str(
                 request.url_for("get_async_task_status", task_id=self.task_id)
             ),
@@ -1124,11 +1126,18 @@ class AsyncTaskManager:
         task.submit_order = self._next_submit_order
         self._next_submit_order += 1
         self.tasks[task.task_id] = task
+        task_progress_registry.initialize(task.task_id, task.file_names)
         self.task_events[task.task_id] = asyncio.Event()
         await self.queue.put(task.task_id)
 
     def get(self, task_id: str) -> Optional[AsyncParseTask]:
         return self.tasks.get(task_id)
+
+    def list(self, status: str | None = None) -> list[AsyncParseTask]:
+        tasks = list(self.tasks.values())
+        if status:
+            tasks = [task for task in tasks if task.status == status]
+        return sorted(tasks, key=lambda task: task.created_at, reverse=True)
 
     def get_queued_ahead(self, task_id: str) -> int | None:
         task = self.tasks.get(task_id)
@@ -1297,6 +1306,11 @@ class AsyncTaskManager:
             task.status = TASK_FAILED
             task.error = str(exc)
             task.completed_at = utc_now_iso()
+            task_progress_registry.set_phase(
+                task.task_id,
+                "failed",
+                error=task.error,
+            )
             self._signal_task_event(task_id)
             logger.exception(f"Async task failed: {task_id}")
 
@@ -1304,6 +1318,7 @@ class AsyncTaskManager:
         task.status = TASK_PROCESSING
         task.started_at = utc_now_iso()
         task.error = None
+        task_progress_registry.set_phase(task.task_id, "preparing_inputs")
 
         uploads = [
             StoredUpload(
@@ -1318,6 +1333,7 @@ class AsyncTaskManager:
             )
         ]
         config = getattr(self.app.state, "config", {})
+        task_progress_registry.set_phase(task.task_id, "parsing")
         job_result = await run_parse_job(
             output_dir=task.output_dir,
             uploads=uploads,
@@ -1328,6 +1344,11 @@ class AsyncTaskManager:
         task.file_results = list(job_result.get("file_results", []))
         task.status = TASK_COMPLETED
         task.completed_at = utc_now_iso()
+        task_progress_registry.set_phase(
+            task.task_id,
+            "completed",
+            partial_success=task.partial_success,
+        )
         self._signal_task_event(task.task_id)
 
     def cleanup_expired_tasks(self) -> int:
@@ -1349,6 +1370,7 @@ class AsyncTaskManager:
             if task_event is not None:
                 task_event.set()
             cleanup_file(task.output_dir)
+            task_progress_registry.remove(task_id)
             logger.info(f"Cleaned expired async task: {task_id}")
         return len(expired_task_ids)
 
@@ -1442,6 +1464,26 @@ async def submit_parse_task(
     return build_task_submission_response(task, http_request, task_manager)
 
 
+@app.get(path="/tasks", name="list_async_tasks")
+async def list_async_tasks(
+    request: Request,
+    status: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+):
+    task_manager = get_task_manager()
+    normalized_limit = min(max(limit, 1), 500)
+    normalized_offset = max(offset, 0)
+    tasks = task_manager.list(status=status)
+    selected = tasks[normalized_offset : normalized_offset + normalized_limit]
+    return {
+        "items": [task_manager.build_status_payload(task, request) for task in selected],
+        "total": len(tasks),
+        "limit": normalized_limit,
+        "offset": normalized_offset,
+    }
+
+
 @app.get(path="/tasks/{task_id}", name="get_async_task_status")
 async def get_async_task_status(task_id: str, request: Request):
     task_manager = get_task_manager()
@@ -1449,6 +1491,35 @@ async def get_async_task_status(task_id: str, request: Request):
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
     return task_manager.build_status_payload(task, request)
+
+
+@app.get(path="/tasks/{task_id}/events", name="stream_async_task_events")
+async def stream_async_task_events(task_id: str, request: Request):
+    task_manager = get_task_manager()
+    if task_manager.get(task_id) is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    async def event_stream():
+        last_signature: tuple[str, int] | None = None
+        while True:
+            task = task_manager.get(task_id)
+            if task is None:
+                break
+            payload = task_manager.build_status_payload(task, request)
+            progress = payload.get("progress") or {}
+            signature = (task.status, int(progress.get("version", 0)))
+            if signature != last_signature:
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                last_signature = signature
+            if is_task_terminal(task.status) or await request.is_disconnected():
+                break
+            await asyncio.sleep(1.0)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get(path="/tasks/{task_id}/result", name="get_async_task_result")

@@ -6,3 +6,5 @@ artifacts/*.tar.gz
 artifacts/*.sha256
 pipeline-test-result.json
 hybrid-test-result.json
+.mineru-ops/
+test-pdfs/

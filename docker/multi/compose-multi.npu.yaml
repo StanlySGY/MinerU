@@ -1,0 +1,34 @@
+# Ascend NPU 硬件映射叠加文件，只在 MINERU_DEVICE_MODE=npu 时使用。
+# start-multi.sh 会自动把本文件追加到 compose-multi.yaml 之后；不要单独使用。
+# 启动前应先用 npu-smi info 确认卡号和驱动状态。
+services:
+  mineru-api-1:
+    # 未安装 Ascend Docker Runtime 时，手工把指定物理 NPU 和公共管理节点映射进容器。
+    # PIPELINE_NPU_ID=6 时，第一项会展开为 /dev/davinci6:/dev/davinci6。
+    devices:
+      - "/dev/davinci${PIPELINE_NPU_ID:-6}:/dev/davinci${PIPELINE_NPU_ID:-6}"
+      - /dev/davinci_manager:/dev/davinci_manager
+      - /dev/devmm_svm:/dev/devmm_svm
+      - /dev/hisi_hdc:/dev/hisi_hdc
+    environment:
+      # CANN/torch_npu 使用该变量限制当前 Pipeline 进程只看见指定的物理 NPU。
+      # 只暴露一张物理卡后，程序内部看到的设备索引是 npu:0。
+      ASCEND_RT_VISIBLE_DEVICES: "${PIPELINE_NPU_ID:-6}"
+    volumes:
+      # 手工设备映射不会自动注入宿主机驱动库，因此显式只读挂载 Ascend 驱动和附加库。
+      # 现场启动前必须确认这两个宿主机目录存在，并与镜像内 CANN/torch_npu 版本匹配。
+      - /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro
+      - /usr/local/Ascend/add-ons:/usr/local/Ascend/add-ons:ro
+
+  # 启用 API-2/API-3 时，在这里同样补上设备映射和驱动挂载。
+  # mineru-api-2:
+  #   devices:
+  #     - "/dev/davinci${PIPELINE_2_NPU_ID:-7}:/dev/davinci${PIPELINE_2_NPU_ID:-7}"
+  #     - /dev/davinci_manager:/dev/davinci_manager
+  #     - /dev/devmm_svm:/dev/devmm_svm
+  #     - /dev/hisi_hdc:/dev/hisi_hdc
+  #   environment:
+  #     ASCEND_RT_VISIBLE_DEVICES: "${PIPELINE_2_NPU_ID:-7}"
+  #   volumes:
+  #     - /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro
+  #     - /usr/local/Ascend/add-ons:/usr/local/Ascend/add-ons:ro

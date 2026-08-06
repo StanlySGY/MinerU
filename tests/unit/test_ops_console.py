@@ -1,0 +1,72 @@
+import asyncio
+from pathlib import Path
+
+import yaml
+
+from mineru.cli.ops import OpsRuntime, OpsStore, create_app
+
+
+def test_ops_store_persists_task_snapshots(tmp_path: Path):
+    store = OpsStore(tmp_path / "ops.db")
+    payload = {"task_id": "task-1", "status": "processing", "file_names": ["a.pdf"]}
+
+    store.upsert_tasks([payload])
+
+    assert store.cached_task("task-1") == payload
+    assert store.cached_tasks() == [payload]
+
+
+def test_ops_runtime_discovers_compose_roles_and_external_vlm(tmp_path: Path, monkeypatch):
+    compose_path = tmp_path / "compose-config.yaml"
+    compose_path.write_text(
+        yaml.safe_dump(
+            {
+                "services": {
+                    "mineru-router": {
+                        "image": "mineru-env:test",
+                        "labels": {"com.mineru.role": "router"},
+                    },
+                    "mineru-api-1": {
+                        "image": "mineru-env:test",
+                        "labels": {"com.mineru.role": "api"},
+                        "environment": {"MINERU_VL_SERVER": "http://10.0.0.8:30000/v1"},
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
+    monkeypatch.setenv("MINERU_OPS_COMPOSE_CONFIG", str(compose_path))
+    runtime = OpsRuntime()
+
+    services = runtime.discover_services()
+
+    assert [service["role"] for service in services] == ["api", "router", "vlm"] or [
+        service["role"] for service in services
+    ] == ["router", "api", "vlm"]
+    assert next(service for service in services if service["role"] == "router")["endpoint"] == (
+        "http://mineru-router:8002/health"
+    )
+    assert next(service for service in services if service["role"] == "vlm")["endpoint"] == ("http://10.0.0.8:30000/v1/models")
+
+    asyncio.run(runtime.close())
+
+
+def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
+    monkeypatch.setenv("MINERU_OPS_COMPOSE_CONFIG", str(tmp_path / "missing.yaml"))
+    monkeypatch.setenv("MINERU_OPS_AGENT_SOCKET", str(tmp_path / "missing.sock"))
+
+    app = create_app()
+    paths = {route.path for route in app.routes}
+    static_dir = Path(__file__).resolve().parents[2] / "mineru" / "ops" / "static"
+
+    assert "/api/health" in paths
+    assert "/api/services" in paths
+    assert "/api/tasks" in paths
+    assert "/api/batch-runs" in paths
+    assert "/" in paths
+    assert "MinerU 运维控制台" in (static_dir / "index.html").read_text(encoding="utf-8")

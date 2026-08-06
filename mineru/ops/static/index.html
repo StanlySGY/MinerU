@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MinerU 运维控制台</title>
+  <link rel="stylesheet" href="/assets/ops.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">MU</span>
+        <div><strong>MinerU</strong><small>运维控制台</small></div>
+      </div>
+      <nav id="nav">
+        <button class="nav-item active" data-view="overview">总览</button>
+        <button class="nav-item" data-view="services">服务</button>
+        <button class="nav-item" data-view="tasks">任务</button>
+        <button class="nav-item" data-view="batch">批量测试</button>
+        <button class="nav-item" data-view="logs">日志</button>
+      </nav>
+      <div class="sidebar-foot">
+        <span id="connection-dot" class="dot unknown"></span>
+        <span id="connection-text">正在连接</span>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <div>
+          <h1 id="page-title">总览</h1>
+          <p id="page-meta">最后更新：-</p>
+        </div>
+        <div class="top-actions">
+          <label class="token-field">
+            <span>管理令牌</span>
+            <input id="token" type="password" autocomplete="off" placeholder="未配置">
+          </label>
+          <button id="refresh" class="icon-button" title="刷新" aria-label="刷新">↻</button>
+        </div>
+      </header>
+
+      <section id="notice" class="notice hidden"></section>
+
+      <section id="view-overview" class="view active">
+        <div id="summary-strip" class="summary-strip"></div>
+        <div class="section-heading"><h2>服务状态</h2><span id="overview-health-count"></span></div>
+        <div id="overview-services" class="service-grid"></div>
+        <div class="two-column">
+          <section class="panel">
+            <div class="section-heading"><h2>进行中的任务</h2><button data-go="tasks" class="text-button">查看全部</button></div>
+            <div id="overview-tasks" class="table-wrap"></div>
+          </section>
+          <section class="panel">
+            <div class="section-heading"><h2>最近批量测试</h2><button data-go="batch" class="text-button">查看全部</button></div>
+            <div id="overview-batches" class="table-wrap"></div>
+          </section>
+        </div>
+      </section>
+
+      <section id="view-services" class="view">
+        <div class="toolbar">
+          <div class="segmented" id="service-filter">
+            <button class="active" data-filter="all">全部</button>
+            <button data-filter="router">Router</button>
+            <button data-filter="api">API</button>
+            <button data-filter="vlm">VLM</button>
+          </div>
+          <div class="actions stack-actions">
+            <button class="secondary-button" data-system-action="test">全链路测试</button>
+            <button class="secondary-button" data-system-action="start">启动业务服务</button>
+            <button class="secondary-button" data-system-action="restart">重启业务服务</button>
+            <button class="secondary-button danger" data-system-action="stop">停止业务服务</button>
+          </div>
+        </div>
+        <div id="services-table" class="table-wrap panel"></div>
+      </section>
+
+      <section id="view-tasks" class="view">
+        <div class="toolbar">
+          <select id="task-status">
+            <option value="">全部状态</option>
+            <option value="pending">等待中</option>
+            <option value="processing">处理中</option>
+            <option value="completed">已完成</option>
+            <option value="failed">失败</option>
+          </select>
+          <input id="task-search" type="search" placeholder="任务 ID 或文件名">
+        </div>
+        <div class="split-view">
+          <div id="tasks-table" class="table-wrap panel"></div>
+          <aside id="task-detail" class="detail-panel"><div class="empty-state">选择一个任务</div></aside>
+        </div>
+      </section>
+
+      <section id="view-batch" class="view">
+        <section class="form-band">
+          <form id="batch-form">
+            <label><span>测试目录</span><input name="input_path" value="." required></label>
+            <label><span>后端</span>
+              <select name="backend">
+                <option value="vlm-http-client">vlm-http-client</option>
+                <option value="hybrid-http-client">hybrid-http-client</option>
+                <option value="pipeline">pipeline</option>
+              </select>
+            </label>
+            <label><span>语言</span><input name="lang" value="ch"></label>
+            <label><span>单文件超时（秒）</span><input name="task_timeout" type="number" value="7200" min="60"></label>
+            <label class="wide"><span>VLM Server URL</span><input name="server_url" placeholder="可选，例如 http://10.0.0.8:30000"></label>
+            <label class="check-label"><input name="recursive" type="checkbox" checked><span>包含子目录</span></label>
+            <button type="submit" class="primary-button">开始测试</button>
+          </form>
+        </section>
+        <div class="section-heading"><h2>测试记录</h2><span>默认串行提交 PDF</span></div>
+        <div id="batch-table" class="table-wrap panel"></div>
+      </section>
+
+      <section id="view-logs" class="view">
+        <div class="toolbar">
+          <select id="log-service"></select>
+          <select id="log-tail"><option value="200">200 行</option><option value="500">500 行</option><option value="1000">1000 行</option></select>
+          <button id="load-logs" class="secondary-button">读取日志</button>
+        </div>
+        <pre id="log-output" class="log-output">请选择服务。</pre>
+      </section>
+    </main>
+  </div>
+  <script src="/assets/ops.js"></script>
+</body>
+</html>

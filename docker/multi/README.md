@@ -54,7 +54,13 @@ docker/multi/
 │   ├── mineru-env-npu-v1.0.tar.gz
 │   └── mineru-code-v3.4.2.tar.gz
 ├── compose-multi.yaml
+├── compose-multi.npu.yaml
+├── compose-multi.nvidia.yaml
 ├── env.multi.example
+├── mineru-ops-agent.py
+├── batch-router-diagnose.py
+├── BATCH_DIAGNOSIS.md
+├── OPS_CONSOLE.md
 ├── mineru.pipeline.json
 ├── prepare-pipeline-models.sh
 ├── start-multi.sh
@@ -84,4 +90,10 @@ cp env.multi.example env.multi
 ./start-multi.sh test /data/test.pdf
 ```
 
-`check` 会检查镜像、模型目录、JSON、容器挂载和外部 VLM 连通性。`test` 会依次测试 `pipeline` 和 `hybrid-http-client`。
+`start` 会同时启动运维控制台，默认地址为 `http://服务器IP:19000`。控制台读取同一份 Compose 和 env，显示 Router/API/VLM 健康状态、任务页级进度，并提供文件夹批量诊断和报告导出。详细配置见 [OPS_CONSOLE.md](./OPS_CONSOLE.md)。
+
+`stop` 只停止 Router/API，保留控制台用于检查和恢复；`stop-all` 才会停止全部容器和宿主机控制代理。
+
+`check` 会检查镜像、模型目录、JSON 和容器挂载；`MINERU_DEVICE_MODE=npu` 时还会检查 NPU 设备节点和 `torch_npu`；只有填写了 `VLM_1_IP` 才检查外部 VLM 连通性。`test` 会测试 `pipeline`，填写了 `VLM_1_IP` 时再测试 `hybrid-http-client`。
+
+只部署 Router + API 的纯 CPU 主机（x86_64 或 ARM64），在 `env.multi` 中设置 `MINERU_DEVICE_MODE=cpu`、把 `MINERU_ENV_IMAGE` 换成同架构的 CPU 版镜像、`VLM_1_IP` 留空即可，不需要 `/dev/davinci*`。
