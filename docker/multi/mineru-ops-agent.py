@@ -79,6 +79,7 @@ def parse_compose_ps(output: str) -> dict[str, dict[str, Any]]:
             "container": payload.get("Name") or payload.get("name"),
             "state": payload.get("State") or payload.get("state"),
             "status": payload.get("Status") or payload.get("status"),
+            "exit_code": payload.get("ExitCode") if "ExitCode" in payload else payload.get("exit_code"),
             "health": payload.get("Health") or payload.get("health"),
             "image": payload.get("Image") or payload.get("image"),
             "ports": payload.get("Publishers") or payload.get("publishers"),

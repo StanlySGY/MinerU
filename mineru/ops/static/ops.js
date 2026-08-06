@@ -3,6 +3,10 @@ const state = {
   services: [],
   tasks: [],
   batches: [],
+  uploadItems: [],
+  activeBatchId: null,
+  activeBatchDetail: null,
+  previewObjectUrls: [],
   serviceFilter: "all",
   token: sessionStorage.getItem("mineruOpsToken") || "",
 };
@@ -12,7 +16,8 @@ const statusText = {
   pending: "等待中", processing: "处理中", completed: "已完成", failed: "失败",
   partial_success: "部分成功", running: "运行中", paused: "已暂停", cancelled: "已取消",
   completed_with_failures: "完成（存在失败）", interrupted: "已中断", unhealthy: "异常",
-  healthy: "健康", unavailable: "不可用", unknown: "未知"
+  healthy: "健康", unavailable: "不可用", unknown: "未知", success: "成功", partial: "部分成功",
+  client_error: "客户端错误"
 };
 
 const tokenInput = document.getElementById("token");
@@ -29,8 +34,8 @@ function esc(value) {
 
 function badge(value) {
   const text = statusText[value] || value || "未知";
-  const cls = ["healthy", "completed", "running"].includes(value) ? "good" :
-    ["pending", "processing", "paused", "partial_success", "completed_with_failures"].includes(value) ? "warn" :
+  const cls = ["healthy", "completed", "running", "success"].includes(value) ? "good" :
+    ["pending", "processing", "paused", "partial", "partial_success", "completed_with_failures"].includes(value) ? "warn" :
     ["failed", "unhealthy", "unavailable", "cancelled", "interrupted"].includes(value) ? "bad" : "";
   return `<span class="badge ${cls}">${esc(text)}</span>`;
 }
@@ -44,6 +49,42 @@ async function api(path, options = {}) {
   try { payload = await response.json(); } catch { payload = {detail: await response.text()}; }
   if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
   return payload;
+}
+
+async function authorizedFetch(path, options = {}) {
+  const headers = {...(options.headers || {})};
+  if (state.token) headers["X-MinerU-Ops-Token"] = state.token;
+  const response = await fetch(path, {...options, headers});
+  if (!response.ok) {
+    let detail = `HTTP ${response.status}`;
+    try {
+      const payload = await response.json();
+      detail = payload.detail || detail;
+    } catch {}
+    throw new Error(detail);
+  }
+  return response;
+}
+
+function artifactUrl(runId, kind, path) {
+  const encodedPath = String(path).split("/").map(encodeURIComponent).join("/");
+  return `/api/batch-runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(kind)}/${encodedPath}`;
+}
+
+function clearPreviewObjectUrls() {
+  for (const url of state.previewObjectUrls) URL.revokeObjectURL(url);
+  state.previewObjectUrls = [];
+}
+
+async function downloadPath(path, filename) {
+  const response = await authorizedFetch(path);
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
 }
 
 function uploadForm(path, formData, onProgress) {
@@ -156,7 +197,7 @@ function renderServicesTable() {
   const services = state.services.filter(item => state.serviceFilter === "all" || item.role === state.serviceFilter);
   document.getElementById("services-table").innerHTML = `<table><thead><tr><th>服务</th><th>角色</th><th>容器</th><th>健康</th><th>镜像/端点</th><th>操作</th></tr></thead><tbody>${services.map(service => {
     const actions = service.control_enabled ? ["check", "start", "stop", "restart"] : ["check"];
-    return `<tr><td><strong>${esc(service.name)}</strong></td><td>${esc(service.role)}</td><td>${esc(service.runtime?.state || "unknown")}</td><td>${badge(service.health)}</td><td><div class="mono">${esc(service.image || service.endpoint || "-")}</div></td><td><div class="actions">${actions.map(action => `<button class="action-button ${action === "stop" ? "danger" : ""}" data-service="${esc(service.name)}" data-action="${action}">${{check:"检查",start:"启动",stop:"停止",restart:"重启"}[action]}</button>`).join("")}</div></td></tr>`;
+    return `<tr><td><strong>${esc(service.name)}</strong></td><td>${esc(service.role)}</td><td>${esc(service.runtime?.state || "unknown")}</td><td>${badge(service.health)}${service.health_message ? `<div class="muted">${esc(service.health_message)}</div>` : ""}</td><td><div class="mono">${esc(service.image || service.endpoint || "-")}</div></td><td><div class="actions">${actions.map(action => `<button class="action-button ${action === "stop" ? "danger" : ""}" data-service="${esc(service.name)}" data-action="${action}">${{check:"检查",start:"启动",stop:"停止",restart:"重启"}[action]}</button>`).join("")}</div></td></tr>`;
   }).join("")}</tbody></table>`;
 }
 
@@ -240,86 +281,161 @@ function compactBatchRows(items, limit = 100) {
   if (!items.length) return `<div class="empty-state">暂无批量测试</div>`;
   return `<table><thead><tr><th>目录</th><th>状态</th><th>PDF</th><th>开始时间</th><th>报告</th><th>操作</th></tr></thead><tbody>${items.slice(0, limit).map(run => {
     const active = ["pending", "running", "paused", "cancelling"].includes(run.status);
-    return `<tr><td><strong>${esc(run.settings?.input_path || run.input_path)}</strong><div class="mono muted">${esc(run.run_id)}</div></td><td>${badge(run.status)}</td><td>${run.settings?.pdf_count || "-"}</td><td>${esc(formatDate(run.started_at || run.created_at))}</td><td>${run.report_ready ? `<button class="text-button" data-export="markdown" data-batch="${run.run_id}">Markdown</button> · <button class="text-button" data-export="zip" data-batch="${run.run_id}">ZIP</button>` : "-"}</td><td><div class="actions">${active ? `<button class="action-button" data-batch="${run.run_id}" data-batch-action="${run.status === "paused" ? "resume" : "pause"}">${run.status === "paused" ? "继续" : "暂停"}</button><button class="action-button danger" data-batch="${run.run_id}" data-batch-action="cancel">取消</button>` : `<button class="action-button" data-batch="${run.run_id}" data-batch-action="retry">重试</button>`}</div></td></tr>${run.log_tail ? `<tr><td colspan="6"><pre class="mono">${esc(run.log_tail)}</pre></td></tr>` : ""}`;
+    const previewText = run.input_preview_ready || run.result_preview_ready ? "可预览" : "";
+    return `<tr><td><strong>${esc(run.settings?.input_path || run.input_path)}</strong><div class="mono muted">${esc(run.run_id)}</div></td><td>${badge(run.status)}${previewText ? `<div class="muted">${previewText}</div>` : ""}</td><td>${run.settings?.pdf_count || "-"}</td><td>${esc(formatDate(run.started_at || run.created_at))}</td><td><button class="text-button" data-batch-detail="${run.run_id}">详情/预览</button> · <button class="text-button" data-export="process_markdown" data-batch="${run.run_id}">过程日志</button>${run.report_ready ? ` · <button class="text-button" data-export="markdown" data-batch="${run.run_id}">报告</button> · <button class="text-button" data-export="zip" data-batch="${run.run_id}">ZIP</button>` : ""}</td><td><div class="actions">${active ? `<button class="action-button" data-batch="${run.run_id}" data-batch-action="${run.status === "paused" ? "resume" : "pause"}">${run.status === "paused" ? "继续" : "暂停"}</button><button class="action-button danger" data-batch="${run.run_id}" data-batch-action="cancel">取消</button>` : `<button class="action-button" data-batch="${run.run_id}" data-batch-action="retry">重试</button><button class="action-button danger" data-batch="${run.run_id}" data-batch-action="delete">删除</button>`}</div></td></tr>`;
   }).join("")}</tbody></table>`;
 }
 
 async function loadBatches() {
   const data = await api("/api/batch-runs");
   state.batches = data.items || [];
+  const storage = data.storage || {};
+  document.getElementById("batch-storage").textContent = storage.max_bytes ? `产物空间 ${formatBytes(storage.used_bytes || 0)} / ${formatBytes(storage.max_bytes)}（${storage.usage_percent || 0}%），保留 ${storage.retention_days} 天` : "默认串行提交 PDF";
   document.getElementById("batch-table").innerHTML = compactBatchRows(state.batches);
 }
 
 const batchFilesInput = document.getElementById("batch-files");
 const batchFolderInput = document.getElementById("batch-folder");
 const uploadSummary = document.getElementById("upload-summary");
-
-function pdfFiles(input) {
-  return Array.from(input.files || []).filter(file => file.name.toLowerCase().endsWith(".pdf"));
-}
+const uploadDropZone = document.getElementById("upload-drop-zone");
+const uploadFileList = document.getElementById("upload-file-list");
 
 function formatBytes(bytes) {
   if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function updateUploadSummary() {
-  const directFiles = pdfFiles(batchFilesInput);
-  const folderFiles = pdfFiles(batchFolderInput);
-  const files = directFiles.length ? directFiles : folderFiles;
-  if (!files.length) {
+  if (!state.uploadItems.length) {
     uploadSummary.textContent = "当前使用服务器测试目录";
+    uploadFileList.innerHTML = "";
+    document.getElementById("clear-upload").classList.add("hidden");
     return;
   }
-  const source = directFiles.length ? "浏览器文件" : "浏览器文件夹";
-  const ignored = (directFiles.length ? batchFilesInput.files.length : batchFolderInput.files.length) - files.length;
-  const totalBytes = files.reduce((total, file) => total + file.size, 0);
-  uploadSummary.textContent = `${source}：${files.length} 个 PDF，${formatBytes(totalBytes)}${ignored ? `；忽略 ${ignored} 个非 PDF 文件` : ""}`;
+  const totalBytes = state.uploadItems.reduce((total, item) => total + item.file.size, 0);
+  const folderUpload = state.uploadItems.some(item => item.path.includes("/"));
+  uploadSummary.textContent = `${folderUpload ? "浏览器文件/文件夹" : "浏览器文件"}：${state.uploadItems.length} 个 PDF，${formatBytes(totalBytes)}`;
+  document.getElementById("clear-upload").classList.remove("hidden");
+  const visibleItems = state.uploadItems.slice(0, 100);
+  uploadFileList.innerHTML = visibleItems.map((item, index) => `<div class="upload-file-row"><span title="${esc(item.path)}">${esc(item.path)}</span><span class="muted">${formatBytes(item.file.size)}</span><button type="button" data-upload-remove="${index}">移除</button></div>`).join("") + (state.uploadItems.length > visibleItems.length ? `<div class="muted">另有 ${state.uploadItems.length - visibleItems.length} 个文件未展开显示</div>` : "");
+}
+
+function setUploadItems(items, append = false) {
+  const selected = append ? [...state.uploadItems] : [];
+  const knownPaths = new Set(selected.map(item => item.path.toLowerCase()));
+  let ignored = 0;
+  for (const item of items) {
+    if (!item.file.name.toLowerCase().endsWith(".pdf")) { ignored += 1; continue; }
+    const normalizedPath = String(item.path || item.file.name).replaceAll("\\", "/").replace(/^\/+/, "");
+    if (!normalizedPath || knownPaths.has(normalizedPath.toLowerCase())) continue;
+    knownPaths.add(normalizedPath.toLowerCase());
+    selected.push({file: item.file, path: normalizedPath});
+  }
+  state.uploadItems = selected;
+  updateUploadSummary();
+  if (ignored) notice(`已忽略 ${ignored} 个非 PDF 文件`, false);
+}
+
+function clearUploadItems() {
+  state.uploadItems = [];
+  batchFilesInput.value = "";
+  batchFolderInput.value = "";
+  updateUploadSummary();
+}
+
+function readFileEntry(entry, path) {
+  return new Promise((resolve, reject) => entry.file(file => resolve({file, path: `${path}${file.name}`}), reject));
+}
+
+function readDirectoryEntries(reader) {
+  return new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+}
+
+async function collectDroppedEntry(entry, prefix = "") {
+  if (entry.isFile) return [await readFileEntry(entry, prefix)];
+  if (!entry.isDirectory) return [];
+  const directoryPrefix = `${prefix}${entry.name}/`;
+  const reader = entry.createReader();
+  const collected = [];
+  while (true) {
+    const entries = await readDirectoryEntries(reader);
+    if (!entries.length) break;
+    for (const child of entries) collected.push(...await collectDroppedEntry(child, directoryPrefix));
+  }
+  return collected;
 }
 
 batchFilesInput.addEventListener("change", () => {
-  if (batchFilesInput.files.length) batchFolderInput.value = "";
-  updateUploadSummary();
+  setUploadItems(Array.from(batchFilesInput.files || []).map(file => ({file, path: file.name})));
 });
 
 batchFolderInput.addEventListener("change", () => {
-  if (batchFolderInput.files.length) batchFilesInput.value = "";
+  setUploadItems(Array.from(batchFolderInput.files || []).map(file => ({file, path: file.webkitRelativePath || file.name})));
+});
+
+document.getElementById("choose-files").addEventListener("click", () => batchFilesInput.click());
+document.getElementById("choose-folder").addEventListener("click", () => batchFolderInput.click());
+document.getElementById("clear-upload").addEventListener("click", clearUploadItems);
+uploadFileList.addEventListener("click", event => {
+  const button = event.target.closest("[data-upload-remove]");
+  if (!button) return;
+  state.uploadItems.splice(Number(button.dataset.uploadRemove), 1);
   updateUploadSummary();
+});
+
+for (const eventName of ["dragenter", "dragover"]) {
+  uploadDropZone.addEventListener(eventName, event => {
+    event.preventDefault();
+    uploadDropZone.classList.add("drag-active");
+  });
+}
+for (const eventName of ["dragleave", "drop"]) {
+  uploadDropZone.addEventListener(eventName, event => {
+    event.preventDefault();
+    uploadDropZone.classList.remove("drag-active");
+  });
+}
+uploadDropZone.addEventListener("drop", async event => {
+  try {
+    const entries = Array.from(event.dataTransfer.items || []).map(item => item.webkitGetAsEntry?.()).filter(Boolean);
+    let items = [];
+    if (entries.length) {
+      for (const entry of entries) items.push(...await collectDroppedEntry(entry));
+    } else {
+      items = Array.from(event.dataTransfer.files || []).map(file => ({file, path: file.webkitRelativePath || file.name}));
+    }
+    setUploadItems(items, true);
+  } catch (error) { notice(`读取拖拽文件失败：${error.message}`); }
+});
+uploadDropZone.addEventListener("keydown", event => {
+  if (event.key === "Enter" || event.key === " ") { event.preventDefault(); batchFilesInput.click(); }
 });
 
 document.getElementById("batch-form").addEventListener("submit", async event => {
   event.preventDefault();
   const form = new FormData(event.target);
-  const directFiles = pdfFiles(batchFilesInput);
-  const folderFiles = pdfFiles(batchFolderInput);
   const submitButton = document.getElementById("batch-submit");
-  if (directFiles.length && folderFiles.length) {
-    notice("文件和文件夹不能同时上传，请保留一种选择");
-    return;
-  }
   const payload = {
     input_path: form.get("input_path"), backend: form.get("backend"), lang: form.get("lang"),
     task_timeout: Number(form.get("task_timeout")), server_url: form.get("server_url") || null,
     recursive: form.get("recursive") === "on", effort: "medium", parse_method: "auto", pause_seconds: 2
   };
-  const browserFiles = directFiles.length ? directFiles : folderFiles;
   try {
     submitButton.disabled = true;
-    if (browserFiles.length) {
+    if (state.uploadItems.length) {
       const upload = new FormData();
-      for (const file of browserFiles) upload.append("files", file, file.webkitRelativePath || file.name);
+      for (const item of state.uploadItems) upload.append("files", item.file, item.path);
       upload.append("backend", payload.backend);
       upload.append("lang", payload.lang);
       upload.append("task_timeout", String(payload.task_timeout));
       upload.append("server_url", payload.server_url || "");
-      upload.append("recursive", String(payload.recursive || folderFiles.length > 0));
+      upload.append("recursive", String(payload.recursive || state.uploadItems.some(item => item.path.includes("/"))));
       submitButton.textContent = `正在上传 0%`;
       await uploadForm("/api/batch-runs/upload", upload, percent => {
         submitButton.textContent = percent < 100 ? `正在上传 ${percent}%` : "正在启动测试";
       });
-      batchFilesInput.value = "";
-      batchFolderInput.value = "";
-      updateUploadSummary();
+      clearUploadItems();
     } else {
       if (!String(payload.input_path || "").trim()) throw new Error("请上传 PDF，或填写服务器测试目录");
       submitButton.textContent = "正在启动测试";
@@ -335,31 +451,236 @@ document.getElementById("batch-form").addEventListener("submit", async event => 
   }
 });
 
-document.getElementById("batch-table").addEventListener("click", async event => {
+function exportFilename(runId, format) {
+  if (format === "zip") return `mineru-batch-${runId}.zip`;
+  if (format === "process_markdown") return `PROCESS_LOG-${runId}.md`;
+  return `BATCH_DIAGNOSIS-${runId}.md`;
+}
+
+async function exportBatch(runId, format) {
+  await downloadPath(
+    `/api/batch-runs/${encodeURIComponent(runId)}/export?format=${encodeURIComponent(format)}`,
+    exportFilename(runId, format),
+  );
+}
+
+async function handleBatchTableClick(event) {
+  const detailButton = event.target.closest("[data-batch-detail]");
+  if (detailButton) {
+    await loadBatchDetail(detailButton.dataset.batchDetail);
+    return;
+  }
   const exportButton = event.target.closest("[data-export]");
   if (exportButton) {
     try {
-      const headers = state.token ? {"X-MinerU-Ops-Token": state.token} : {};
-      const response = await fetch(`/api/batch-runs/${exportButton.dataset.batch}/export?format=${exportButton.dataset.export}`, {headers});
-      if (!response.ok) throw new Error(`导出失败：HTTP ${response.status}`);
-      const blob = await response.blob();
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = exportButton.dataset.export === "zip" ? `mineru-batch-${exportButton.dataset.batch}.zip` : `BATCH_DIAGNOSIS-${exportButton.dataset.batch}.md`;
-      link.click();
-      URL.revokeObjectURL(url);
+      await exportBatch(exportButton.dataset.batch, exportButton.dataset.export);
     } catch (error) { notice(error.message); }
     return;
   }
   const button = event.target.closest("[data-batch-action]");
   if (!button) return;
-  if (["cancel", "retry"].includes(button.dataset.batchAction) && !confirm(`确认${button.textContent}该批次？`)) return;
+  if (["cancel", "retry", "delete"].includes(button.dataset.batchAction) && !confirm(`确认${button.textContent}该批次？`)) return;
   try {
     await api(`/api/batch-runs/${button.dataset.batch}/${button.dataset.batchAction}`, {method: "POST"});
     await loadBatches();
   } catch (error) { notice(error.message); }
+}
+
+document.getElementById("batch-table").addEventListener("click", handleBatchTableClick);
+document.getElementById("overview-batches").addEventListener("click", handleBatchTableClick);
+
+function renderInlineMarkdown(value) {
+  return esc(value)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+}
+
+function renderMarkdown(value) {
+  const lines = String(value || "").replaceAll("\r\n", "\n").split("\n");
+  const output = [];
+  let codeLines = [];
+  let inCode = false;
+  for (const line of lines) {
+    if (line.trim().startsWith("```")) {
+      if (inCode) {
+        output.push(`<pre><code>${esc(codeLines.join("\n"))}</code></pre>`);
+        codeLines = [];
+      }
+      inCode = !inCode;
+      continue;
+    }
+    if (inCode) { codeLines.push(line); continue; }
+    const heading = line.match(/^(#{1,3})\s+(.+)$/);
+    if (heading) {
+      const level = heading[1].length;
+      output.push(`<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`);
+    } else if (/^[-*]\s+/.test(line)) {
+      output.push(`<p>• ${renderInlineMarkdown(line.replace(/^[-*]\s+/, ""))}</p>`);
+    } else if (/^>\s?/.test(line)) {
+      output.push(`<p class="muted">${renderInlineMarkdown(line.replace(/^>\s?/, ""))}</p>`);
+    } else if (line.trim()) {
+      output.push(`<p>${renderInlineMarkdown(line)}</p>`);
+    }
+  }
+  if (codeLines.length) output.push(`<pre><code>${esc(codeLines.join("\n"))}</code></pre>`);
+  return output.join("") || `<div class="empty-state">提取结果为空</div>`;
+}
+
+function batchFiles(detail) {
+  const items = new Map();
+  for (const original of detail.artifacts?.originals || []) {
+    items.set(original.path, {path: original.path, name: original.name, original});
+  }
+  for (const preview of detail.artifacts?.previews || []) {
+    const path = preview.relative_path || preview.file_name;
+    const current = items.get(path) || {path, name: preview.file_name || path};
+    current.preview = preview;
+    items.set(path, current);
+  }
+  return [...items.values()];
+}
+
+async function fetchArtifactBlob(runId, kind, path) {
+  const response = await authorizedFetch(artifactUrl(runId, kind, path));
+  return response.blob();
+}
+
+async function selectBatchFile(detail, item) {
+  clearPreviewObjectUrls();
+  document.querySelectorAll(".batch-file-button").forEach(button => button.classList.toggle("active", button.dataset.filePath === item.path));
+  const originalFrame = document.getElementById("original-preview");
+  const originalEmpty = document.getElementById("original-preview-empty");
+  const resultPreview = document.getElementById("result-preview");
+  const resultImages = document.getElementById("result-images");
+  const downloadOriginal = document.getElementById("download-original");
+  const downloadResult = document.getElementById("download-result");
+  originalFrame.removeAttribute("src");
+  originalFrame.style.display = "none";
+  originalEmpty.classList.remove("hidden");
+  downloadOriginal.classList.add("hidden");
+  downloadResult.classList.add("hidden");
+  resultPreview.innerHTML = `<div class="empty-state">正在读取提取结果...</div>`;
+  resultImages.innerHTML = "";
+
+  const preview = item.preview;
+  const failedPages = preview?.failed_pages || [];
+  document.getElementById("batch-file-status").innerHTML = `${badge(preview?.classification || preview?.task_status || "unknown")} <strong>${esc(item.path)}</strong>${preview?.task_id ? ` <span class="mono">${esc(preview.task_id)}</span>` : ""}${failedPages.length ? `<div>跳过/失败页：${esc(failedPages.map(page => page.page_number || Number(page.page_idx) + 1).join(", "))}</div>` : ""}${preview?.error ? `<div class="bad-text">${esc(preview.error)}</div>` : ""}`;
+
+  if (item.original) {
+    try {
+      const blob = await fetchArtifactBlob(detail.run_id, "input", item.original.path);
+      const url = URL.createObjectURL(blob);
+      state.previewObjectUrls.push(url);
+      originalFrame.src = url;
+      originalFrame.style.display = "block";
+      originalEmpty.classList.add("hidden");
+      downloadOriginal.classList.remove("hidden");
+      downloadOriginal.dataset.path = item.original.path;
+      downloadOriginal.dataset.filename = item.original.name;
+    } catch (error) {
+      originalEmpty.textContent = `原始 PDF 读取失败：${error.message}`;
+    }
+  } else {
+    originalEmpty.textContent = "原始 PDF 已过保留期，或任务使用了服务器目录";
+  }
+
+  const previewFiles = preview?.preview || {};
+  if (previewFiles.markdown_path) {
+    try {
+      const response = await authorizedFetch(artifactUrl(detail.run_id, "results", previewFiles.markdown_path));
+      resultPreview.innerHTML = renderMarkdown(await response.text());
+    } catch (error) {
+      resultPreview.innerHTML = `<div class="empty-state">提取结果读取失败：${esc(error.message)}</div>`;
+    }
+  } else {
+    resultPreview.innerHTML = `<div class="empty-state">该文件尚无 Markdown 提取结果</div>`;
+  }
+  if (previewFiles.archive_path) {
+    downloadResult.classList.remove("hidden");
+    downloadResult.dataset.path = previewFiles.archive_path;
+    downloadResult.dataset.filename = `${item.name || "result"}-result.zip`;
+  }
+  const imagePaths = (previewFiles.image_paths || []).slice(0, 30);
+  const loadedImages = await Promise.all(imagePaths.map(async path => {
+    try {
+      const blob = await fetchArtifactBlob(detail.run_id, "results", path);
+      const url = URL.createObjectURL(blob);
+      state.previewObjectUrls.push(url);
+      return {url, path};
+    } catch { return null; }
+  }));
+  resultImages.innerHTML = loadedImages.filter(Boolean).map(image => `<img src="${image.url}" alt="${esc(image.path)}" title="${esc(image.path)}">`).join("");
+}
+
+async function loadBatchDetail(runId) {
+  const dialog = document.getElementById("batch-detail-dialog");
+  try {
+    const detail = await api(`/api/batch-runs/${encodeURIComponent(runId)}`);
+    state.activeBatchId = runId;
+    state.activeBatchDetail = detail;
+    document.getElementById("batch-detail-title").textContent = detail.settings?.input_path || "批量任务详情";
+    document.getElementById("batch-detail-meta").textContent = `${runId} · ${statusText[detail.status] || detail.status} · ${detail.settings?.pdf_count || 0} 个 PDF · 产物 ${formatBytes(detail.artifacts?.storage_bytes || 0)} · 保留 ${detail.artifacts?.retention_days ?? "-"} 天`;
+    const files = batchFiles(detail);
+    document.getElementById("batch-detail-files").innerHTML = files.length ? files.map(item => `<button type="button" class="batch-file-button" data-file-path="${esc(item.path)}"><strong>${esc(item.name || item.path)}</strong><small>${esc(item.path)} · ${statusText[item.preview?.classification] || item.preview?.classification || "等待结果"}</small></button>`).join("") : `<div class="empty-state">暂无文件产物</div>`;
+    document.getElementById("batch-process-log").textContent = "正在读取过程日志...";
+    if (!dialog.open) dialog.showModal();
+    const response = await authorizedFetch(`/api/batch-runs/${encodeURIComponent(runId)}/export?format=process_markdown`);
+    document.getElementById("batch-process-log").textContent = await response.text();
+    if (files.length) await selectBatchFile(detail, files[0]);
+  } catch (error) { notice(error.message); }
+}
+
+document.getElementById("batch-detail-files").addEventListener("click", async event => {
+  const button = event.target.closest("[data-file-path]");
+  if (!button || !state.activeBatchDetail) return;
+  const item = batchFiles(state.activeBatchDetail).find(candidate => candidate.path === button.dataset.filePath);
+  if (item) await selectBatchFile(state.activeBatchDetail, item);
 });
+
+document.getElementById("download-original").addEventListener("click", async event => {
+  if (!state.activeBatchId) return;
+  try { await downloadPath(artifactUrl(state.activeBatchId, "input", event.currentTarget.dataset.path), event.currentTarget.dataset.filename); }
+  catch (error) { notice(error.message); }
+});
+
+document.getElementById("download-result").addEventListener("click", async event => {
+  if (!state.activeBatchId) return;
+  try { await downloadPath(artifactUrl(state.activeBatchId, "results", event.currentTarget.dataset.path), event.currentTarget.dataset.filename); }
+  catch (error) { notice(error.message); }
+});
+
+document.querySelector(".dialog-actions").addEventListener("click", async event => {
+  const button = event.target.closest("[data-dialog-export]");
+  if (!button || !state.activeBatchId) return;
+  try { await exportBatch(state.activeBatchId, button.dataset.dialogExport); }
+  catch (error) { notice(error.message); }
+});
+
+function closeBatchDetail() {
+  const dialog = document.getElementById("batch-detail-dialog");
+  clearPreviewObjectUrls();
+  state.activeBatchId = null;
+  state.activeBatchDetail = null;
+  if (dialog.open) dialog.close();
+}
+
+document.getElementById("close-batch-detail").addEventListener("click", closeBatchDetail);
+document.getElementById("batch-detail-dialog").addEventListener("close", () => {
+  clearPreviewObjectUrls();
+  state.activeBatchId = null;
+  state.activeBatchDetail = null;
+});
+
+async function refreshActiveBatchLog() {
+  if (!state.activeBatchId) return;
+  try {
+    const detail = await api(`/api/batch-runs/${encodeURIComponent(state.activeBatchId)}`);
+    state.activeBatchDetail = detail;
+    document.getElementById("batch-detail-meta").textContent = `${detail.run_id} · ${statusText[detail.status] || detail.status} · ${detail.settings?.pdf_count || 0} 个 PDF · 产物 ${formatBytes(detail.artifacts?.storage_bytes || 0)} · 保留 ${detail.artifacts?.retention_days ?? "-"} 天`;
+    const response = await authorizedFetch(`/api/batch-runs/${encodeURIComponent(state.activeBatchId)}/export?format=process_markdown`);
+    document.getElementById("batch-process-log").textContent = await response.text();
+  } catch {}
+}
 
 function updateLogServices() {
   const select = document.getElementById("log-service");
@@ -396,5 +717,6 @@ async function refreshCurrent() {
 
 setInterval(() => {
   if (["overview", "tasks", "batch"].includes(state.view)) refreshCurrent();
+  if (state.activeBatchId) refreshActiveBatchLog();
 }, 5000);
 refreshCurrent();

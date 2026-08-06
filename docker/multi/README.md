@@ -90,7 +90,7 @@ cp env.multi.example env.multi
 ./start-multi.sh test /data/test.pdf
 ```
 
-`start` 会同时启动运维控制台，默认地址为 `http://服务器IP:19000`。控制台读取同一份 Compose 和 env，显示 Router/API/VLM 健康状态、任务页级进度，并提供文件夹批量诊断和报告导出。详细配置见 [OPS_CONSOLE.md](./OPS_CONSOLE.md)。
+`start` 会同时启动运维控制台，默认地址为 `http://服务器IP:19000`。控制台读取同一份 Compose 和 env，显示 Router/API/VLM 健康状态、任务页级进度，并提供文件/文件夹拖拽批量诊断、原始 PDF 与提取结果预览、过程日志 Markdown 和诊断包导出。详细配置见 [OPS_CONSOLE.md](./OPS_CONSOLE.md)。
 
 `stop` 只停止 Router/API，保留控制台用于检查和恢复；`stop-all` 才会停止全部容器和宿主机控制代理。
 

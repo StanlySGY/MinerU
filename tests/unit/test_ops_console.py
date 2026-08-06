@@ -6,7 +6,7 @@ import pytest
 import yaml
 from fastapi import HTTPException, UploadFile
 
-from mineru.cli.ops import OpsRuntime, OpsStore, create_app
+from mineru.cli.ops import BatchRunRequest, OpsRuntime, OpsStore, apply_service_runtime_health, create_app
 
 
 def test_ops_store_persists_task_snapshots(tmp_path: Path):
@@ -72,8 +72,12 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "/api/tasks" in paths
     assert "/api/batch-runs" in paths
     assert "/api/batch-runs/upload" in paths
+    assert "/api/batch-runs/{run_id}/artifacts/{kind}/{artifact_path:path}" in paths
     assert "/" in paths
-    assert "MinerU 运维控制台" in (static_dir / "index.html").read_text(encoding="utf-8")
+    dashboard_html = (static_dir / "index.html").read_text(encoding="utf-8")
+    assert "MinerU 运维控制台" in dashboard_html
+    assert "拖拽 PDF 文件或文件夹到这里" in dashboard_html
+    assert "batch-detail-dialog" in dashboard_html
 
 
 @pytest.mark.parametrize(
@@ -110,4 +114,107 @@ def test_save_uploaded_files_streams_pdf_tree(tmp_path: Path, monkeypatch) -> No
     assert saved_count == 2
     assert (tmp_path / "uploaded/folder/a.pdf").read_bytes() == b"%PDF-a"
     assert (tmp_path / "uploaded/folder/b.pdf").read_bytes() == b"%PDF-b"
+    asyncio.run(runtime.close())
+
+
+def test_code_sync_exit_zero_is_reported_as_healthy() -> None:
+    service = {"name": "mineru-code-sync", "role": "code-sync", "health": "unknown"}
+
+    apply_service_runtime_health(
+        service,
+        {"state": "exited", "status": "Exited (0) 2 minutes ago"},
+    )
+
+    assert service["health"] == "healthy"
+    assert "同步完成" in service["health_message"]
+
+
+def test_batch_artifacts_list_originals_and_result_previews(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
+    runtime = OpsRuntime()
+    run_dir = runtime.report_dir / "run-1"
+    input_pdf = run_dir / "input/folder/a.pdf"
+    input_pdf.parent.mkdir(parents=True)
+    input_pdf.write_bytes(b"%PDF-preview")
+    result_dir = run_dir / "results/0001-a"
+    result_dir.mkdir(parents=True)
+    markdown_path = result_dir / "result.md"
+    markdown_path.write_text("# result", encoding="utf-8")
+    (result_dir / "preview.json").write_text(
+        '{"file_name":"a.pdf","relative_path":"folder/a.pdf","preview":{"markdown_path":"0001-a/result.md"}}',
+        encoding="utf-8",
+    )
+    record = {
+        "run_id": "run-1",
+        "report_path": str(run_dir / "BATCH_DIAGNOSIS.md"),
+        "log_path": str(run_dir / "batch.log"),
+        "settings": {"input_path": "browser upload", "pdf_count": 1},
+    }
+
+    artifacts = runtime.batch_artifacts(record)
+
+    assert artifacts["originals"][0]["path"] == "folder/a.pdf"
+    assert artifacts["previews"][0]["preview"]["markdown_path"] == "0001-a/result.md"
+    assert runtime.resolve_artifact(record, "input", "folder/a.pdf") == input_pdf
+    assert runtime.resolve_artifact(record, "results", "0001-a/result.md") == markdown_path
+    with pytest.raises(HTTPException):
+        runtime.resolve_artifact(record, "input", "../outside.pdf")
+    asyncio.run(runtime.close())
+
+
+def test_process_log_markdown_contains_run_context(tmp_path: Path) -> None:
+    log_path = tmp_path / "batch.log"
+    log_path.write_text("Found 1 PDF\nstatus=processing\n", encoding="utf-8")
+    record = {
+        "run_id": "run-2",
+        "status": "running",
+        "input_path": str(tmp_path),
+        "created_at": "2026-08-06T00:00:00+00:00",
+        "started_at": "2026-08-06T00:00:01+00:00",
+        "completed_at": None,
+        "log_path": str(log_path),
+        "settings": {"input_path": "浏览器上传", "backend": "vlm-http-client", "pdf_count": 1},
+    }
+
+    content = OpsRuntime.process_log_markdown(record)
+
+    assert "# MinerU 批量任务过程日志" in content
+    assert "run-2" in content
+    assert "status=processing" in content
+
+
+def test_start_batch_preserves_browser_upload_for_preview(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
+    runtime = OpsRuntime()
+    batch_script = tmp_path / "batch.py"
+    batch_script.write_text("pass\n", encoding="utf-8")
+    runtime.batch_script = batch_script
+    upload_dir = runtime.upload_dir / "upload-1"
+    upload_dir.mkdir()
+    (upload_dir / "a.pdf").write_bytes(b"%PDF-preview")
+
+    async def fake_batch_process(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(runtime, "_run_batch_process", fake_batch_process)
+
+    async def run_test():
+        record = await runtime.start_batch_path(
+            upload_dir,
+            BatchRunRequest(),
+            "浏览器上传（1 个 PDF）",
+            source_type="browser_upload",
+            preserve_input="move",
+        )
+        await asyncio.sleep(0)
+        return record
+
+    record = asyncio.run(run_test())
+
+    preserved_input = Path(record["input_path"])
+    assert not upload_dir.exists()
+    assert (preserved_input / "a.pdf").is_file()
+    assert record["settings"]["source_type"] == "browser_upload"
     asyncio.run(runtime.close())

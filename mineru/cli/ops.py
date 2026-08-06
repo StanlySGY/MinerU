@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -22,7 +23,7 @@ import httpx
 import uvicorn
 import yaml
 from fastapi import File, Form, FastAPI, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -40,6 +41,47 @@ TERMINAL_BATCH_STATES = {
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def apply_service_runtime_health(service: dict[str, Any], state: dict[str, Any]) -> None:
+    service["runtime"] = state
+    if service.get("role") != "code-sync":
+        return
+    runtime_state = str(state.get("state") or "").lower()
+    runtime_status = str(state.get("status") or "")
+    exit_code = state.get("exit_code")
+    successful_exit = exit_code == 0 or str(exit_code) == "0" or re.search(r"\(0\)", runtime_status)
+    if runtime_state == "exited" and successful_exit:
+        service.update(
+            {
+                "health": "healthy",
+                "health_error": None,
+                "health_message": "代码同步完成（exit 0）",
+            }
+        )
+    elif runtime_state == "exited":
+        service.update(
+            {
+                "health": "unhealthy",
+                "health_error": runtime_status or "code sync exited unsuccessfully",
+                "health_message": "代码同步失败",
+            }
+        )
+    elif runtime_state in {"running", "restarting"}:
+        service.update(
+            {
+                "health": "processing",
+                "health_error": None,
+                "health_message": "正在同步代码",
+            }
+        )
 
 
 def json_loads_object(value: str | None) -> dict[str, Any]:
@@ -243,6 +285,10 @@ class OpsStore:
                 (utc_now_iso(), action, target, 1 if success else 0, detail[:4000]),
             )
 
+    def delete_batch_run(self, run_id: str) -> None:
+        with self.connect() as connection:
+            connection.execute("DELETE FROM batch_runs WHERE run_id = ?", (run_id,))
+
     @staticmethod
     def _batch_row(row: sqlite3.Row) -> dict[str, Any]:
         payload = dict(row)
@@ -252,6 +298,9 @@ class OpsStore:
         if log_path.is_file():
             payload["log_tail"] = "\n".join(log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-80:])
         payload["report_ready"] = Path(payload["report_path"]).is_file()
+        run_dir = Path(payload["report_path"]).parent
+        payload["input_preview_ready"] = (run_dir / "input").is_dir()
+        payload["result_preview_ready"] = (run_dir / "results").is_dir()
         return payload
 
 
@@ -303,6 +352,16 @@ class OpsRuntime:
             * 1024
             * 1024
         )
+        self.artifact_retention_days = max(
+            0,
+            int(os.getenv("MINERU_OPS_ARTIFACT_RETENTION_DAYS", "7")),
+        )
+        self.artifact_max_bytes = max(
+            1,
+            int(float(os.getenv("MINERU_OPS_ARTIFACT_MAX_GB", "50")) * 1024 * 1024 * 1024),
+        )
+        self.save_result_images = env_bool("MINERU_OPS_SAVE_RESULT_IMAGES", True)
+        self.cleanup_expired_artifacts()
         self.http_client = httpx.AsyncClient(timeout=15.0, follow_redirects=True)
 
     async def close(self) -> None:
@@ -409,11 +468,176 @@ class OpsRuntime:
             raise HTTPException(status_code=404, detail=f"input directory not found: {relative_path}")
         return candidate
 
+    @staticmethod
+    def directory_size(path: Path) -> int:
+        total = 0
+        if not path.exists():
+            return total
+        for item in path.rglob("*"):
+            if not item.is_file():
+                continue
+            try:
+                total += item.stat().st_size
+            except OSError:
+                continue
+        return total
+
+    def artifact_storage_bytes(self) -> int:
+        total = self.directory_size(self.upload_dir)
+        for run_dir in self.report_dir.iterdir():
+            if not run_dir.is_dir():
+                continue
+            total += self.directory_size(run_dir / "input")
+            total += self.directory_size(run_dir / "results")
+        return total
+
+    def artifact_storage_status(self) -> dict[str, Any]:
+        used_bytes = self.artifact_storage_bytes()
+        return {
+            "used_bytes": used_bytes,
+            "max_bytes": self.artifact_max_bytes,
+            "usage_percent": round(min(100, used_bytes * 100 / self.artifact_max_bytes), 1),
+            "retention_days": self.artifact_retention_days,
+            "save_result_images": self.save_result_images,
+        }
+
+    def cleanup_expired_artifacts(self) -> None:
+        now = datetime.now(timezone.utc)
+        for upload_path in self.upload_dir.iterdir():
+            try:
+                age_seconds = now.timestamp() - upload_path.stat().st_mtime
+            except OSError:
+                continue
+            if age_seconds > 86400:
+                shutil.rmtree(upload_path, ignore_errors=True)
+        if self.artifact_retention_days <= 0:
+            return
+        retention_seconds = self.artifact_retention_days * 86400
+        for record in self.store.list_batch_runs(limit=10000):
+            completed_at = record.get("completed_at")
+            if not completed_at:
+                continue
+            try:
+                completed = datetime.fromisoformat(str(completed_at))
+            except ValueError:
+                continue
+            if completed.tzinfo is None:
+                completed = completed.replace(tzinfo=timezone.utc)
+            if (now - completed).total_seconds() < retention_seconds:
+                continue
+            try:
+                run_dir = self.run_dir_for_record(record)
+            except HTTPException:
+                continue
+            shutil.rmtree(run_dir / "input", ignore_errors=True)
+            shutil.rmtree(run_dir / "results", ignore_errors=True)
+            for zip_path in run_dir.glob("mineru-batch-*.zip"):
+                zip_path.unlink(missing_ok=True)
+
+    def run_dir_for_record(self, record: dict[str, Any]) -> Path:
+        run_dir = Path(record["report_path"]).parent.resolve()
+        try:
+            run_dir.relative_to(self.report_dir)
+        except ValueError as exc:
+            raise HTTPException(status_code=500, detail="batch artifact path is invalid") from exc
+        return run_dir
+
+    def batch_artifacts(self, record: dict[str, Any]) -> dict[str, Any]:
+        run_dir = self.run_dir_for_record(record)
+        originals = []
+        input_root = run_dir / "input"
+        if input_root.is_dir():
+            for path in sorted(input_root.rglob("*")):
+                if path.is_file() and path.suffix.lower() == ".pdf":
+                    originals.append(
+                        {
+                            "path": path.relative_to(input_root).as_posix(),
+                            "name": path.name,
+                            "size_bytes": path.stat().st_size,
+                        }
+                    )
+        previews = []
+        results_root = run_dir / "results"
+        if results_root.is_dir():
+            for metadata_path in sorted(results_root.glob("*/preview.json")):
+                try:
+                    payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if isinstance(payload, dict):
+                    previews.append(payload)
+        return {
+            "originals": originals,
+            "previews": previews,
+            "storage_bytes": self.directory_size(input_root) + self.directory_size(results_root),
+            "retention_days": self.artifact_retention_days,
+        }
+
+    def resolve_artifact(self, record: dict[str, Any], kind: str, artifact_path: str) -> Path:
+        run_dir = self.run_dir_for_record(record)
+        roots = {"input": run_dir / "input", "results": run_dir / "results"}
+        root = roots.get(kind)
+        if root is None:
+            raise HTTPException(status_code=400, detail="unsupported artifact kind")
+        relative = self.normalize_artifact_path(artifact_path)
+        target = (root / relative).resolve()
+        try:
+            target.relative_to(root.resolve())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="artifact path is outside the task") from exc
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail="artifact not found")
+        allowed_suffixes = {
+            "input": {".pdf"},
+            "results": {".md", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".json", ".zip"},
+        }
+        if target.suffix.lower() not in allowed_suffixes[kind]:
+            raise HTTPException(status_code=403, detail="artifact type is not previewable")
+        return target
+
+    @staticmethod
+    def normalize_artifact_path(value: str) -> Path:
+        path = PurePosixPath(value.replace("\\", "/"))
+        if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+            raise HTTPException(status_code=400, detail="invalid artifact path")
+        return Path(*path.parts)
+
+    @staticmethod
+    def process_log_markdown(record: dict[str, Any]) -> str:
+        settings = record.get("settings") or {}
+        log_path = Path(record["log_path"])
+        log_content = log_path.read_text(encoding="utf-8", errors="replace") if log_path.is_file() else "尚无过程日志。"
+        lines = [
+            "# MinerU 批量任务过程日志",
+            "",
+            f"- Run ID：`{record['run_id']}`",
+            f"- 输入：`{settings.get('input_path', record.get('input_path', '-'))}`",
+            f"- 状态：`{record.get('status', '-')}`",
+            f"- 创建时间：`{record.get('created_at', '-')}`",
+            f"- 开始时间：`{record.get('started_at') or '-'}`",
+            f"- 完成时间：`{record.get('completed_at') or '-'}`",
+            f"- Backend：`{settings.get('backend', '-')}`",
+            f"- PDF 数量：`{settings.get('pdf_count', '-')}`",
+            "",
+            "## 完整过程输出",
+            "",
+            "```text",
+            log_content.replace("```", "'''"),
+            "```",
+            "",
+        ]
+        return "\n".join(lines)
+
     async def start_batch(self, request: BatchRunRequest) -> dict[str, Any]:
         if not self.batch_script.is_file():
             raise HTTPException(status_code=503, detail="batch diagnosis script is unavailable")
         input_path = self.resolve_input_path(request.input_path)
-        return await self.start_batch_path(input_path, request, request.input_path)
+        return await self.start_batch_path(
+            input_path,
+            request,
+            request.input_path,
+            source_type="server_directory",
+        )
 
     async def start_batch_path(
         self,
@@ -421,7 +645,8 @@ class OpsRuntime:
         request: BatchRunRequest,
         display_path: str,
         *,
-        cleanup_input_path: bool = False,
+        source_type: str,
+        preserve_input: str | None = None,
     ) -> dict[str, Any]:
         if not self.batch_script.is_file():
             raise HTTPException(status_code=503, detail="batch diagnosis script is unavailable")
@@ -432,15 +657,31 @@ class OpsRuntime:
         run_id = str(uuid.uuid4())
         run_dir = self.report_dir / run_id
         run_dir.mkdir(parents=True, exist_ok=False)
+        effective_input_path = input_path
+        if preserve_input is not None:
+            preserved_input = run_dir / "input"
+            try:
+                if preserve_input == "move":
+                    shutil.move(str(input_path), str(preserved_input))
+                elif preserve_input == "copy":
+                    shutil.copytree(input_path, preserved_input)
+                else:
+                    raise ValueError(f"unsupported input preservation mode: {preserve_input}")
+            except Exception:
+                shutil.rmtree(run_dir, ignore_errors=True)
+                raise
+            effective_input_path = preserved_input
         report_path = run_dir / "BATCH_DIAGNOSIS.md"
         raw_dir = run_dir / "raw"
+        preview_dir = run_dir / "results"
         log_path = run_dir / "batch.log"
         settings = request.model_dump()
         settings["input_path"] = display_path
         settings["pdf_count"] = pdf_count
+        settings["source_type"] = source_type
         record = self.store.create_batch_run(
             run_id,
-            input_path,
+            effective_input_path,
             settings,
             report_path,
             raw_dir,
@@ -449,12 +690,12 @@ class OpsRuntime:
         asyncio.create_task(
             self._run_batch_process(
                 run_id,
-                input_path,
+                effective_input_path,
                 request,
                 report_path,
                 raw_dir,
+                preview_dir,
                 log_path,
-                cleanup_input_path=cleanup_input_path,
             ),
             name=f"mineru-ops-batch-{run_id}",
         )
@@ -477,6 +718,8 @@ class OpsRuntime:
         destination.mkdir(parents=True, exist_ok=False)
         total_bytes = 0
         saved_count = 0
+        self.cleanup_expired_artifacts()
+        stored_bytes = self.artifact_storage_bytes()
         try:
             for upload in files:
                 relative_path = self.normalize_upload_name(upload.filename)
@@ -494,6 +737,14 @@ class OpsRuntime:
                             raise HTTPException(
                                 status_code=413,
                                 detail=f"uploaded files exceed {self.max_upload_bytes // 1024 // 1024} MB",
+                            )
+                        if stored_bytes + total_bytes > self.artifact_max_bytes:
+                            raise HTTPException(
+                                status_code=507,
+                                detail=(
+                                    "operations artifact storage limit exceeded; "
+                                    "delete old tasks or raise MINERU_OPS_ARTIFACT_MAX_GB"
+                                ),
                             )
                         output.write(chunk)
                 saved_count += 1
@@ -565,9 +816,8 @@ class OpsRuntime:
         request: BatchRunRequest,
         report_path: Path,
         raw_dir: Path,
+        preview_dir: Path,
         log_path: Path,
-        *,
-        cleanup_input_path: bool = False,
     ) -> None:
         command = [
             "python",
@@ -591,8 +841,11 @@ class OpsRuntime:
             str(report_path),
             "--raw-dir",
             str(raw_dir),
+            "--preview-dir",
+            str(preview_dir),
             "--no-collect-diagnostics",
         ]
+        command.append("--save-result-images" if self.save_result_images else "--no-save-result-images")
         if request.recursive:
             command.append("--recursive")
         if request.server_url:
@@ -639,8 +892,6 @@ class OpsRuntime:
             )
         finally:
             self.batch_processes.pop(run_id, None)
-            if cleanup_input_path:
-                shutil.rmtree(input_path, ignore_errors=True)
 
     async def _collect_batch_diagnostics(self, run_dir: Path, report_path: Path) -> None:
         diagnostics = await self.agent_call(
@@ -778,7 +1029,7 @@ def create_app() -> FastAPI:
         runtime_states = agent_result.get("services", {}) if agent_result.get("ok") else {}
         for service in health_results:
             state = runtime_states.get(service["name"], {}) if isinstance(runtime_states, dict) else {}
-            service["runtime"] = state
+            apply_service_runtime_health(service, state)
             if not agent_result.get("ok"):
                 service["agent_error"] = agent_result.get("error")
         return health_results
@@ -797,6 +1048,11 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="service not found")
         if action in {"check", "test"}:
             result = await query_service(definition)
+            if definition.get("role") == "code-sync":
+                agent_result = await runtime.agent_call({"action": "services"}, timeout=15)
+                runtime_states = agent_result.get("services", {}) if agent_result.get("ok") else {}
+                state = runtime_states.get(service_name, {}) if isinstance(runtime_states, dict) else {}
+                apply_service_runtime_health(result, state)
             success = result.get("health") == "healthy"
             runtime.store.audit(action, service_name, success, json.dumps(result, ensure_ascii=False))
             return result
@@ -934,7 +1190,10 @@ def create_app() -> FastAPI:
     @app.get("/api/batch-runs")
     async def batch_runs(request: Request):
         authorize(request)
-        return {"items": runtime.store.list_batch_runs()}
+        return {
+            "items": runtime.store.list_batch_runs(),
+            "storage": runtime.artifact_storage_status(),
+        }
 
     @app.post("/api/batch-runs", status_code=202)
     async def create_batch_run(payload: BatchRunRequest, request: Request):
@@ -971,7 +1230,8 @@ def create_app() -> FastAPI:
                 upload_path,
                 payload,
                 display_path,
-                cleanup_input_path=True,
+                source_type="browser_upload",
+                preserve_input="move",
             )
         except Exception:
             shutil.rmtree(upload_path, ignore_errors=True)
@@ -992,7 +1252,22 @@ def create_app() -> FastAPI:
         result = runtime.store.get_batch_run(run_id)
         if result is None:
             raise HTTPException(status_code=404, detail="batch run not found")
+        result["artifacts"] = runtime.batch_artifacts(result)
         return result
+
+    @app.get("/api/batch-runs/{run_id}/artifacts/{kind}/{artifact_path:path}")
+    async def batch_artifact(
+        run_id: str,
+        kind: str,
+        artifact_path: str,
+        request: Request,
+    ):
+        authorize(request)
+        record = runtime.store.get_batch_run(run_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="batch run not found")
+        path = runtime.resolve_artifact(record, kind, artifact_path)
+        return FileResponse(path)
 
     @app.post("/api/batch-runs/{run_id}/{action}")
     async def batch_action(run_id: str, action: str, request: Request):
@@ -1017,18 +1292,36 @@ def create_app() -> FastAPI:
             process.send_signal(signal.SIGCONT)
             runtime.store.update_batch_run(run_id, status="running")
         elif action == "retry":
-            stored_input_path = Path(record["input_path"])
-            try:
-                stored_input_path.relative_to(runtime.upload_dir)
-            except ValueError:
-                pass
-            else:
-                raise HTTPException(
-                    status_code=409,
-                    detail="browser-uploaded files are removed after a run; upload them again to retry",
+            settings = dict(record["settings"])
+            source_type = str(settings.pop("source_type", "server_directory"))
+            settings.pop("pdf_count", None)
+            display_path = str(settings.get("input_path") or ".")
+            if source_type == "browser_upload":
+                input_path = runtime.run_dir_for_record(record) / "input"
+                if not input_path.is_dir():
+                    raise HTTPException(
+                        status_code=409,
+                        detail="uploaded files have expired; upload them again to retry",
+                    )
+                settings["input_path"] = "."
+                retry_payload = BatchRunRequest(**settings)
+                return await runtime.start_batch_path(
+                    input_path,
+                    retry_payload,
+                    f"重试：{display_path}",
+                    source_type="browser_upload",
+                    preserve_input="copy",
                 )
-            retry_payload = BatchRunRequest(**record["settings"])
+            retry_payload = BatchRunRequest(**settings)
             return await runtime.start_batch(retry_payload)
+        elif action == "delete":
+            if process is not None and process.returncode is None:
+                raise HTTPException(status_code=409, detail="cancel the active batch run before deleting it")
+            run_dir = runtime.run_dir_for_record(record)
+            shutil.rmtree(run_dir)
+            runtime.store.delete_batch_run(run_id)
+            runtime.store.audit("batch_delete", run_id, True)
+            return {"ok": True, "run_id": run_id}
         else:
             raise HTTPException(status_code=400, detail="unsupported batch action")
         runtime.store.audit(f"batch_{action}", run_id, True)
@@ -1047,13 +1340,26 @@ def create_app() -> FastAPI:
             if not report_path.is_file():
                 raise HTTPException(status_code=404, detail="report is not ready")
             return FileResponse(report_path, filename=f"BATCH_DIAGNOSIS-{run_id}.md")
+        if format == "process_markdown":
+            content = runtime.process_log_markdown(record)
+            return Response(
+                content=content,
+                media_type="text/markdown; charset=utf-8",
+                headers={"Content-Disposition": f'attachment; filename="PROCESS_LOG-{run_id}.md"'},
+            )
         if format != "zip":
-            raise HTTPException(status_code=400, detail="format must be markdown, json, or zip")
+            raise HTTPException(
+                status_code=400,
+                detail="format must be markdown, process_markdown, json, or zip",
+            )
         zip_path = report_path.parent / f"mineru-batch-{run_id}.zip"
         with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for path in report_path.parent.rglob("*"):
                 if path.is_file() and path != zip_path:
-                    archive.write(path, path.relative_to(report_path.parent))
+                    relative_path = path.relative_to(report_path.parent)
+                    if relative_path.parts and relative_path.parts[0] == "input":
+                        continue
+                    archive.write(path, relative_path)
         return FileResponse(zip_path, filename=zip_path.name)
 
     if static_dir.is_dir():

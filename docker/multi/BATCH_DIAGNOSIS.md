@@ -40,6 +40,17 @@ router_container=mineru-router
 api_container=mineru-api-1
 ```
 
+如需同时保存 MinerU 提取结果用于预览，可以指定：
+
+```bash
+./batch-router-diagnose.py \
+  /data/mineru-diagnose \
+  --router-url http://127.0.0.1:8002 \
+  --preview-dir ./preview-results
+```
+
+脚本会为每个 PDF 下载结果 ZIP，并安全解压 Markdown 和图片。使用 `--no-save-result-images` 可以只保存 Markdown、减少磁盘占用。运维控制台会自动传入该参数，无需手工配置。
+
 ## 采集本机 VLM 日志
 
 如果 VLM 容器与 Router 在同一台主机：

@@ -13,9 +13,10 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import quote
 
@@ -57,6 +58,8 @@ class RunConfig:
     curl_bin: str
     output_path: Path
     raw_dir: Path
+    preview_dir: Path | None
+    save_result_images: bool
     collect_diagnostics: bool
     router_container: str
     api_container: str
@@ -71,9 +74,7 @@ def utc_now_iso() -> str:
 
 
 def utc_docker_timestamp() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace(
-        "+00:00", "Z"
-    )
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def format_duration(seconds: float | int | None) -> str:
@@ -158,9 +159,7 @@ def curl_request(
         for key, value in forms or []:
             command.extend(["--form-string", f"{key}={value}"])
         if file_path is not None:
-            command.extend(
-                ["--form", f"files=@{file_path};type=application/pdf"]
-            )
+            command.extend(["--form", f"files=@{file_path};type=application/pdf"])
         command.append(url)
 
         completed = subprocess.run(
@@ -177,9 +176,7 @@ def curl_request(
         try:
             status_code = int(completed.stdout.strip())
         except ValueError as exc:
-            raise CurlRequestError(
-                f"curl returned an invalid HTTP status: {completed.stdout!r}"
-            ) from exc
+            raise CurlRequestError(f"curl returned an invalid HTTP status: {completed.stdout!r}") from exc
 
         payload: dict[str, Any] | None = None
         try:
@@ -219,6 +216,158 @@ def write_raw_text(raw_dir: Path, prefix: str, label: str, content: str) -> Path
         encoding="utf-8",
     )
     return path
+
+
+def download_file(
+    config: RunConfig,
+    url: str,
+    destination: Path,
+    *,
+    max_time: int = 600,
+) -> tuple[int, str, str]:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial_path = destination.with_suffix(destination.suffix + ".part")
+    command = [
+        config.curl_bin,
+        "--silent",
+        "--show-error",
+        "--location",
+        "--connect-timeout",
+        "10",
+        "--max-time",
+        str(max_time),
+        "--output",
+        str(partial_path),
+        "--write-out",
+        "%{http_code}\n%{content_type}",
+        url,
+    ]
+    completed = subprocess.run(
+        command,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if completed.returncode != 0:
+        partial_path.unlink(missing_ok=True)
+        message = completed.stderr.strip() or f"curl exited with {completed.returncode}"
+        raise CurlRequestError(message)
+    output_lines = completed.stdout.splitlines()
+    try:
+        status_code = int(output_lines[0].strip())
+    except (IndexError, ValueError) as exc:
+        partial_path.unlink(missing_ok=True)
+        raise CurlRequestError(f"curl returned invalid download metadata: {completed.stdout!r}") from exc
+    content_type = output_lines[1].strip() if len(output_lines) > 1 else ""
+    if status_code != 200:
+        body = partial_path.read_text(encoding="utf-8", errors="replace")[:4000]
+        partial_path.unlink(missing_ok=True)
+        return status_code, content_type, body
+    partial_path.replace(destination)
+    return status_code, content_type, ""
+
+
+def safe_extract_zip(archive_path: Path, destination: Path) -> list[Path]:
+    destination.mkdir(parents=True, exist_ok=True)
+    extracted: list[Path] = []
+    total_size = 0
+    with zipfile.ZipFile(archive_path) as archive:
+        entries = archive.infolist()
+        if len(entries) > 20000:
+            raise CurlRequestError("result archive contains too many files")
+        for entry in entries:
+            normalized_name = entry.filename.replace("\\", "/")
+            relative = PurePosixPath(normalized_name)
+            if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+                raise CurlRequestError(f"unsafe path in result archive: {entry.filename}")
+            file_type = (entry.external_attr >> 16) & 0o170000
+            if file_type == 0o120000:
+                raise CurlRequestError(f"symbolic link is not allowed in result archive: {entry.filename}")
+            total_size += max(0, entry.file_size)
+            if total_size > 4 * 1024 * 1024 * 1024:
+                raise CurlRequestError("result archive expands beyond 4 GB")
+            target = (destination / Path(*relative.parts)).resolve()
+            try:
+                target.relative_to(destination.resolve())
+            except ValueError as exc:
+                raise CurlRequestError(f"unsafe path in result archive: {entry.filename}") from exc
+            if entry.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(entry) as source, target.open("wb") as output:
+                shutil.copyfileobj(source, output, length=1024 * 1024)
+            extracted.append(target)
+    return extracted
+
+
+def download_result_preview(
+    config: RunConfig,
+    result_url: str,
+    pdf_path: Path,
+    index: int,
+) -> tuple[dict[str, Any], dict[str, Any] | None, list[Path]]:
+    if config.preview_dir is None:
+        raise CurlRequestError("preview directory is not configured")
+    preview_root = config.preview_dir / f"{index:04d}-{safe_name(pdf_path.stem)}"
+    archive_path = preview_root / "result.zip"
+    status_code, content_type, error_body = download_file(
+        config,
+        result_url,
+        archive_path,
+    )
+    if status_code != 200:
+        raise CurlRequestError(
+            f"result download failed: HTTP {status_code} {content_type}: {markdown_escape(error_body, 1000)}"
+        )
+    extract_dir = preview_root / "extracted"
+    extracted_paths = safe_extract_zip(archive_path, extract_dir)
+    markdown_paths = sorted(path for path in extracted_paths if path.suffix.lower() == ".md")
+    image_paths = sorted(path for path in extracted_paths if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif"})
+    report_payload: dict[str, Any] | None = None
+    parse_report = next((path for path in extracted_paths if path.name == "_parse_report.json"), None)
+    if parse_report is not None:
+        try:
+            decoded = json.loads(parse_report.read_text(encoding="utf-8"))
+            if isinstance(decoded, dict):
+                report_payload = decoded
+        except (OSError, json.JSONDecodeError):
+            pass
+    preview = {
+        "archive_path": archive_path.relative_to(config.preview_dir).as_posix(),
+        "markdown_path": (markdown_paths[0].relative_to(config.preview_dir).as_posix() if markdown_paths else None),
+        "image_paths": [path.relative_to(config.preview_dir).as_posix() for path in image_paths],
+        "image_count": len(image_paths),
+        "extracted_file_count": len(extracted_paths),
+    }
+    return preview, report_payload, [archive_path]
+
+
+def write_preview_metadata(config: RunConfig, result: dict[str, Any]) -> None:
+    if config.preview_dir is None:
+        return
+    index = int(result["index"])
+    file_name = str(result["file_name"])
+    preview_root = config.preview_dir / f"{index:04d}-{safe_name(Path(file_name).stem)}"
+    preview_root.mkdir(parents=True, exist_ok=True)
+    metadata = {
+        "index": index,
+        "file_name": file_name,
+        "relative_path": result.get("relative_path"),
+        "task_id": result.get("task_id"),
+        "task_status": result.get("task_status"),
+        "classification": result.get("classification"),
+        "partial_success": result.get("partial_success", False),
+        "failed_pages": result.get("failed_pages") or [],
+        "error": result.get("error"),
+        "elapsed_seconds": result.get("elapsed_seconds"),
+        "preview": result.get("preview") or {},
+    }
+    (preview_root / "preview.json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def run_command(command: list[str], timeout: int = 60) -> tuple[int, str]:
@@ -279,9 +428,7 @@ def log_excerpt(text: str, task_id: str | None, pdf_name: str) -> str:
     selected = []
     for line in text.splitlines():
         lowered = line.lower()
-        if any(identifier in lowered for identifier in identifiers) or any(
-            keyword in lowered for keyword in keywords
-        ):
+        if any(identifier in lowered for identifier in identifiers) or any(keyword in lowered for keyword in keywords):
             selected.append(line)
     if not selected:
         selected = text.splitlines()[-40:]
@@ -339,9 +486,7 @@ def capture_metrics(config: RunConfig) -> tuple[int, str]:
         "vllm:request_decode_time_seconds",
     )
     selected = [
-        line
-        for line in response.body.splitlines()
-        if not line.startswith("#") and any(name in line for name in metric_names)
+        line for line in response.body.splitlines() if not line.startswith("#") and any(name in line for name in metric_names)
     ]
     return 0, "\n".join(selected[-200:])
 
@@ -388,18 +533,13 @@ def capture_task_diagnostics(
     metrics_return_code, metrics_output = capture_metrics(config)
     if config.vlm_metrics_url:
         if metrics_return_code != 0:
-            metrics_output = (
-                f"UNAVAILABLE (status={metrics_return_code}): {metrics_output}"
-            )
-        raw_paths.append(
-            write_raw_text(config.raw_dir, raw_prefix, "vllm-metrics", metrics_output)
-        )
+            metrics_output = f"UNAVAILABLE (status={metrics_return_code}): {metrics_output}"
+        raw_paths.append(write_raw_text(config.raw_dir, raw_prefix, "vllm-metrics", metrics_output))
         diagnostics["vllm_metrics"] = metrics_output
 
     if not config.vlm_container:
         diagnostics["vlm_logs"] = (
-            "UNAVAILABLE: no VLM container was configured. "
-            "Use --vlm-container and, for a remote host, --vlm-ssh."
+            "UNAVAILABLE: no VLM container was configured. Use --vlm-container and, for a remote host, --vlm-ssh."
         )
     return diagnostics, raw_paths
 
@@ -413,9 +553,7 @@ def extract_file_results(*payloads: dict[str, Any] | None) -> list[dict[str, Any
         if not isinstance(payload, dict):
             continue
         file_results = payload.get("file_results")
-        if isinstance(file_results, list) and all(
-            isinstance(item, dict) for item in file_results
-        ):
+        if isinstance(file_results, list) and all(isinstance(item, dict) for item in file_results):
             return list(file_results)
     return []
 
@@ -451,6 +589,7 @@ def classify_result(
 
 
 def build_submit_forms(config: RunConfig) -> list[tuple[str, str]]:
+    preview_enabled = config.preview_dir is not None
     forms = [
         ("lang_list", config.lang),
         ("backend", config.backend),
@@ -459,12 +598,12 @@ def build_submit_forms(config: RunConfig) -> list[tuple[str, str]]:
         ("formula_enable", bool_form(config.formula_enable)),
         ("table_enable", bool_form(config.table_enable)),
         ("image_analysis", bool_form(config.image_analysis)),
-        ("return_md", "false"),
+        ("return_md", bool_form(preview_enabled)),
         ("return_middle_json", "false"),
         ("return_model_output", "false"),
         ("return_content_list", "false"),
-        ("return_images", "false"),
-        ("response_format_zip", "false"),
+        ("return_images", bool_form(preview_enabled and config.save_result_images)),
+        ("response_format_zip", bool_form(preview_enabled)),
         ("return_original_file", "false"),
         ("client_side_output_generation", "false"),
         ("start_page_id", str(config.start_page_id)),
@@ -488,10 +627,7 @@ def submit_pdf(config: RunConfig, pdf_path: Path) -> HttpResponse:
                 file_path=pdf_path,
                 max_time=300,
             )
-            if (
-                response.status_code not in RETRYABLE_HTTP_STATUSES
-                or attempt >= config.submit_retries
-            ):
+            if response.status_code not in RETRYABLE_HTTP_STATUSES or attempt >= config.submit_retries:
                 return response
         except CurlRequestError as exc:
             last_error = exc
@@ -520,8 +656,7 @@ def poll_task(
                 time.sleep(config.poll_interval)
                 continue
             raise CurlRequestError(
-                f"status request failed: HTTP {response.status_code}: "
-                f"{markdown_escape(response.body, 1000)}"
+                f"status request failed: HTTP {response.status_code}: {markdown_escape(response.body, 1000)}"
             )
         last_payload = response.payload
         status = str(last_payload.get("status", "unknown"))
@@ -529,20 +664,14 @@ def poll_task(
         queued_text = f", queued_ahead={queued}" if queued is not None else ""
         print(f"    status={status}{queued_text}", flush=True)
         if status in TERMINAL_STATUSES:
-            raw_paths.append(
-                write_raw_response(config.raw_dir, raw_prefix, "status", response)
-            )
+            raw_paths.append(write_raw_response(config.raw_dir, raw_prefix, "status", response))
             return last_payload, raw_paths
         time.sleep(config.poll_interval)
 
     if last_payload is not None:
         timeout_response = HttpResponse(200, last_payload, json.dumps(last_payload))
-        raw_paths.append(
-            write_raw_response(config.raw_dir, raw_prefix, "status-timeout", timeout_response)
-        )
-    raise TimeoutError(
-        f"task did not reach a terminal state within {format_duration(config.task_timeout)}"
-    )
+        raw_paths.append(write_raw_response(config.raw_dir, raw_prefix, "status-timeout", timeout_response))
+    raise TimeoutError(f"task did not reach a terminal state within {format_duration(config.task_timeout)}")
 
 
 def diagnose_pdf(config: RunConfig, pdf_path: Path, index: int) -> dict[str, Any]:
@@ -553,16 +682,14 @@ def diagnose_pdf(config: RunConfig, pdf_path: Path, index: int) -> dict[str, Any
     started = time.monotonic()
     raw_paths: list[Path] = []
     task_id: str | None = None
+    preview: dict[str, Any] | None = None
 
     try:
         submit_response = submit_pdf(config, pdf_path)
-        raw_paths.append(
-            write_raw_response(config.raw_dir, raw_prefix, "submit", submit_response)
-        )
+        raw_paths.append(write_raw_response(config.raw_dir, raw_prefix, "submit", submit_response))
         if submit_response.status_code != 202 or submit_response.payload is None:
             raise CurlRequestError(
-                f"submission failed: HTTP {submit_response.status_code}: "
-                f"{markdown_escape(submit_response.body, 1000)}"
+                f"submission failed: HTTP {submit_response.status_code}: {markdown_escape(submit_response.body, 1000)}"
             )
         task_id_value = submit_response.payload.get("task_id")
         if not isinstance(task_id_value, str) or not task_id_value:
@@ -576,28 +703,29 @@ def diagnose_pdf(config: RunConfig, pdf_path: Path, index: int) -> dict[str, Any
         result_payload: dict[str, Any] | None = None
 
         if task_status == "completed":
-            result_url = (
-                f"{config.router_url}/tasks/{quote(task_id, safe='')}/result"
-            )
-            result_response = curl_request(config, "GET", result_url, max_time=300)
-            raw_paths.append(
-                write_raw_response(config.raw_dir, raw_prefix, "result", result_response)
-            )
-            if result_response.status_code == 200 and result_response.payload is not None:
-                result_payload = result_response.payload
-            elif result_response.status_code != 200:
-                raise CurlRequestError(
-                    f"result request failed: HTTP {result_response.status_code}: "
-                    f"{markdown_escape(result_response.body, 1000)}"
+            result_url = f"{config.router_url}/tasks/{quote(task_id, safe='')}/result"
+            if config.preview_dir is not None:
+                preview, result_payload, preview_paths = download_result_preview(
+                    config,
+                    result_url,
+                    pdf_path,
+                    index,
                 )
+                raw_paths.extend(preview_paths)
+            else:
+                result_response = curl_request(config, "GET", result_url, max_time=300)
+                raw_paths.append(write_raw_response(config.raw_dir, raw_prefix, "result", result_response))
+                if result_response.status_code == 200 and result_response.payload is not None:
+                    result_payload = result_response.payload
+                elif result_response.status_code != 200:
+                    raise CurlRequestError(
+                        f"result request failed: HTTP {result_response.status_code}: "
+                        f"{markdown_escape(result_response.body, 1000)}"
+                    )
 
         file_results = extract_file_results(result_payload, status_payload)
         failed_pages = collect_failed_pages(file_results)
-        partial_success = bool(
-            (result_payload or {}).get(
-                "partial_success", status_payload.get("partial_success", False)
-            )
-        )
+        partial_success = bool((result_payload or {}).get("partial_success", status_payload.get("partial_success", False)))
         classification = classify_result(
             task_status,
             partial_success,
@@ -622,6 +750,7 @@ def diagnose_pdf(config: RunConfig, pdf_path: Path, index: int) -> dict[str, Any
             "elapsed_seconds": round(time.monotonic() - started, 2),
             "raw_paths": raw_paths,
             "page_report_available": bool(file_results),
+            "preview": preview,
         }
     except (CurlRequestError, TimeoutError, OSError) as exc:
         result = {
@@ -641,6 +770,7 @@ def diagnose_pdf(config: RunConfig, pdf_path: Path, index: int) -> dict[str, Any
             "elapsed_seconds": round(time.monotonic() - started, 2),
             "raw_paths": raw_paths,
             "page_report_available": False,
+            "preview": preview,
         }
     completed_at_utc = utc_docker_timestamp()
     diagnostics, diagnostic_raw_paths = capture_task_diagnostics(
@@ -653,6 +783,7 @@ def diagnose_pdf(config: RunConfig, pdf_path: Path, index: int) -> dict[str, Any
     )
     result["diagnostics"] = diagnostics
     result["raw_paths"].extend(diagnostic_raw_paths)
+    write_preview_metadata(config, result)
     return result
 
 
@@ -682,10 +813,7 @@ def render_report(
     health_payload: dict[str, Any] | None,
     run_started_at: str,
 ) -> str:
-    counts = {
-        key: sum(item["classification"] == key for item in results)
-        for key in ("success", "partial", "failed")
-    }
+    counts = {key: sum(item["classification"] == key for item in results) for key in ("success", "partial", "failed")}
     lines = [
         "# MinerU Router PDF 批量诊断报告",
         "",
@@ -851,10 +979,7 @@ def render_report(
 
         raw_paths = item.get("raw_paths") or []
         if raw_paths:
-            links = [
-                f"[{path.name}]({relative_link(path, config.output_path)})"
-                for path in raw_paths
-            ]
+            links = [f"[{path.name}]({relative_link(path, config.output_path)})" for path in raw_paths]
             lines.extend(["", "原始响应：" + "、".join(links)])
         lines.append("")
 
@@ -935,6 +1060,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--raw-dir", type=Path, default=None)
+    parser.add_argument(
+        "--preview-dir",
+        type=Path,
+        default=None,
+        help="Optional directory used to retain result ZIPs and extracted Markdown previews",
+    )
+    parser.add_argument(
+        "--save-result-images",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include extracted images in preview result ZIPs (default: enabled)",
+    )
     parser.add_argument("--curl-bin", default="curl")
     parser.add_argument("--skip-health-check", action="store_true")
     parser.add_argument(
@@ -967,16 +1104,9 @@ def parse_args() -> argparse.Namespace:
 def build_config(args: argparse.Namespace) -> RunConfig:
     input_dir = args.input_dir.expanduser().resolve()
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    output_path = (
-        args.output.expanduser().resolve()
-        if args.output
-        else input_dir / f"mineru-router-diagnostic-{timestamp}.md"
-    )
-    raw_dir = (
-        args.raw_dir.expanduser().resolve()
-        if args.raw_dir
-        else output_path.parent / f"{output_path.stem}-raw"
-    )
+    output_path = args.output.expanduser().resolve() if args.output else input_dir / f"mineru-router-diagnostic-{timestamp}.md"
+    raw_dir = args.raw_dir.expanduser().resolve() if args.raw_dir else output_path.parent / f"{output_path.stem}-raw"
+    preview_dir = args.preview_dir.expanduser().resolve() if args.preview_dir else None
     vlm_metrics_url = args.vlm_metrics_url
     if not vlm_metrics_url and args.server_url:
         server_root = args.server_url.rstrip("/")
@@ -1004,6 +1134,8 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         curl_bin=args.curl_bin,
         output_path=output_path,
         raw_dir=raw_dir,
+        preview_dir=preview_dir,
+        save_result_images=args.save_result_images,
         collect_diagnostics=args.collect_diagnostics,
         router_container=args.router_container,
         api_container=args.api_container,
@@ -1069,8 +1201,7 @@ def main() -> int:
     try:
         for index, pdf_path in enumerate(pdf_paths, start=1):
             print(
-                f"[{index}/{len(pdf_paths)}] {pdf_path.relative_to(config.input_dir)} "
-                f"({format_size(pdf_path.stat().st_size)})",
+                f"[{index}/{len(pdf_paths)}] {pdf_path.relative_to(config.input_dir)} ({format_size(pdf_path.stat().st_size)})",
                 flush=True,
             )
             result = diagnose_pdf(config, pdf_path, index)
@@ -1089,15 +1220,8 @@ def main() -> int:
         write_report(config, len(pdf_paths), results, health_payload, run_started_at)
         return 130
 
-    counts = {
-        key: sum(item["classification"] == key for item in results)
-        for key in ("success", "partial", "failed")
-    }
-    print(
-        "Completed: "
-        f"success={counts['success']}, partial={counts['partial']}, "
-        f"failed={counts['failed']}"
-    )
+    counts = {key: sum(item["classification"] == key for item in results) for key in ("success", "partial", "failed")}
+    print(f"Completed: success={counts['success']}, partial={counts['partial']}, failed={counts['failed']}")
     print(f"Markdown report: {config.output_path}")
     print(f"Raw responses: {config.raw_dir}")
     return 1 if counts["failed"] else 0

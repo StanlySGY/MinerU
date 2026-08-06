@@ -97,24 +97,20 @@
       <section id="view-batch" class="view">
         <section class="form-band">
           <form id="batch-form">
-            <div class="upload-source-grid">
-              <label class="upload-source">
-                <span>上传 PDF 文件</span>
-                <input id="batch-files" type="file" accept=".pdf,application/pdf" multiple>
-                <small>可一次选择多个 PDF</small>
-              </label>
-              <label class="upload-source">
-                <span>上传文件夹</span>
-                <input id="batch-folder" type="file" accept=".pdf,application/pdf" webkitdirectory directory multiple>
-                <small>保留文件夹内的相对路径</small>
-              </label>
-              <label class="upload-source">
-                <span>服务器测试目录</span>
-                <input name="input_path" value=".">
-                <small>未从浏览器选择文件时使用</small>
-              </label>
+            <div id="upload-drop-zone" class="upload-drop-zone" tabindex="0">
+              <strong>拖拽 PDF 文件或文件夹到这里</strong>
+              <span>也可以使用下方按钮选择；一次选择会作为一个批量任务</span>
+              <div class="actions">
+                <button id="choose-files" type="button" class="secondary-button">选择 PDF 文件</button>
+                <button id="choose-folder" type="button" class="secondary-button">选择文件夹</button>
+                <button id="clear-upload" type="button" class="text-button hidden">清空选择</button>
+              </div>
+              <input id="batch-files" class="hidden" type="file" accept=".pdf,application/pdf" multiple>
+              <input id="batch-folder" class="hidden" type="file" accept=".pdf,application/pdf" webkitdirectory directory multiple>
+              <div id="upload-file-list" class="upload-file-list"></div>
             </div>
             <div id="upload-summary" class="upload-summary muted">当前使用服务器测试目录</div>
+            <label class="server-directory"><span>服务器测试目录</span><input name="input_path" value="."><small>没有上传浏览器文件时使用</small></label>
             <label><span>后端</span>
               <select name="backend">
                 <option value="vlm-http-client">vlm-http-client</option>
@@ -129,7 +125,7 @@
             <button id="batch-submit" type="submit" class="primary-button">开始测试</button>
           </form>
         </section>
-        <div class="section-heading"><h2>测试记录</h2><span>默认串行提交 PDF</span></div>
+        <div class="section-heading"><h2>测试记录</h2><span id="batch-storage">默认串行提交 PDF</span></div>
         <div id="batch-table" class="table-wrap panel"></div>
       </section>
 
@@ -143,6 +139,43 @@
       </section>
     </main>
   </div>
+
+  <dialog id="batch-detail-dialog" class="batch-dialog">
+    <header class="dialog-header">
+      <div><h2 id="batch-detail-title">批量任务详情</h2><p id="batch-detail-meta" class="muted"></p></div>
+      <button id="close-batch-detail" type="button" class="secondary-button">关闭</button>
+    </header>
+    <div class="dialog-actions actions">
+      <button type="button" class="secondary-button" data-dialog-export="markdown">诊断报告 Markdown</button>
+      <button type="button" class="secondary-button" data-dialog-export="process_markdown">过程日志 Markdown</button>
+      <button type="button" class="secondary-button" data-dialog-export="zip">完整诊断 ZIP</button>
+    </div>
+    <div class="batch-preview-layout">
+      <aside>
+        <h3>任务文件</h3>
+        <div id="batch-detail-files" class="batch-file-list"></div>
+      </aside>
+      <section class="batch-preview-content">
+        <div id="batch-file-status" class="batch-file-status muted">请选择一个文件</div>
+        <div class="preview-grid">
+          <section class="preview-pane">
+            <div class="preview-heading"><h3>原始 PDF</h3><button id="download-original" type="button" class="text-button hidden">下载</button></div>
+            <iframe id="original-preview" title="原始 PDF 预览"></iframe>
+            <div id="original-preview-empty" class="empty-state">当前任务没有可预览的原始 PDF</div>
+          </section>
+          <section class="preview-pane">
+            <div class="preview-heading"><h3>提取结果</h3><button id="download-result" type="button" class="text-button hidden">下载结果 ZIP</button></div>
+            <div id="result-preview" class="markdown-preview"><div class="empty-state">提取结果尚未生成</div></div>
+            <div id="result-images" class="result-images"></div>
+          </section>
+        </div>
+        <details class="process-log-panel">
+          <summary>查看本次任务过程日志</summary>
+          <pre id="batch-process-log" class="log-output">展开后读取过程日志。</pre>
+        </details>
+      </section>
+    </div>
+  </dialog>
   <script src="/assets/ops.js"></script>
 </body>
 </html>
