@@ -76,12 +76,15 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "/" in paths
     dashboard_html = (static_dir / "index.html").read_text(encoding="utf-8")
     dashboard_js = (static_dir / "ops.js").read_text(encoding="utf-8")
+    dashboard_css = (static_dir / "ops.css").read_text(encoding="utf-8")
     assert "MinerU 运维控制台" in dashboard_html
     assert "拖拽 PDF 文件或文件夹到这里" in dashboard_html
     assert "batch-detail-dialog" in dashboard_html
     assert "log-live" in dashboard_html
     assert "log-follow" in dashboard_html
     assert "markdown-table-wrap" in dashboard_js
+    assert "sanitizeMarkdownHtmlTable" in dashboard_js
+    assert "width: calc(100vw - 24px)" in dashboard_css
 
 
 @pytest.mark.parametrize(

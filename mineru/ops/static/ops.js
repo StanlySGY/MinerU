@@ -525,8 +525,55 @@ function splitMarkdownTableRow(line) {
   return line.trim().replace(/^\|/, "").replace(/\|$/, "").replaceAll("\\|", "\u0000").split("|").map(cell => cell.trim().replaceAll("\u0000", "|"));
 }
 
+function sanitizeMarkdownHtmlTable(value) {
+  const documentRoot = new DOMParser().parseFromString(String(value || ""), "text/html");
+  const allowedTags = new Set([
+    "table", "caption", "colgroup", "col", "thead", "tbody", "tfoot",
+    "tr", "th", "td", "br", "p", "span", "strong", "b", "em", "i",
+    "u", "del", "sup", "sub", "code", "ul", "ol", "li",
+  ]);
+  const renderNode = node => {
+    if (node.nodeType === 3) return esc(node.nodeValue || "");
+    if (node.nodeType !== 1) return "";
+    const tag = String(node.localName || "").toLowerCase();
+    const children = Array.from(node.childNodes || []).map(renderNode).join("");
+    if (!allowedTags.has(tag)) return children;
+    const attributes = [];
+    if (["td", "th"].includes(tag)) {
+      for (const name of ["colspan", "rowspan"]) {
+        const raw = node.getAttribute(name);
+        const numeric = Number(raw);
+        if (Number.isInteger(numeric) && numeric >= 1 && numeric <= 100) attributes.push(`${name}="${numeric}"`);
+      }
+      const align = String(node.getAttribute("align") || "").toLowerCase();
+      if (["left", "center", "right"].includes(align)) attributes.push(`align="${align}"`);
+    }
+    if (tag === "col") {
+      const span = Number(node.getAttribute("span"));
+      if (Number.isInteger(span) && span >= 1 && span <= 100) attributes.push(`span="${span}"`);
+    }
+    const suffix = attributes.length ? ` ${attributes.join(" ")}` : "";
+    if (["br", "col"].includes(tag)) return `<${tag}${suffix}>`;
+    return `<${tag}${suffix}>${children}</${tag}>`;
+  };
+  const table = documentRoot.body.querySelector("table");
+  if (!table) return `<pre><code>${esc(value)}</code></pre>`;
+  return `<div class="markdown-table-wrap markdown-html-table">${renderNode(table)}</div>`;
+}
+
+function extractMarkdownHtmlTables(value) {
+  const blocks = [];
+  const markdown = String(value || "").replace(/<table\b[\s\S]*?<\/table>/gi, table => {
+    const token = `MINERUHTMLTABLEBLOCK${blocks.length}`;
+    blocks.push(sanitizeMarkdownHtmlTable(table));
+    return `\n${token}\n`;
+  });
+  return {markdown, blocks};
+}
+
 function renderMarkdown(value) {
-  const lines = String(value || "").replaceAll("\r\n", "\n").replaceAll("\r", "\n").split("\n");
+  const extracted = extractMarkdownHtmlTables(value);
+  const lines = extracted.markdown.replaceAll("\r\n", "\n").replaceAll("\r", "\n").split("\n");
   const output = [];
   let codeLines = [];
   let inCode = false;
@@ -574,6 +621,13 @@ function renderMarkdown(value) {
       continue;
     }
     if (inCode) { codeLines.push(line); continue; }
+
+    const htmlTableBlock = line.trim().match(/^MINERUHTMLTABLEBLOCK(\d+)$/);
+    if (htmlTableBlock) {
+      flushTextBlocks();
+      output.push(extracted.blocks[Number(htmlTableBlock[1])] || "");
+      continue;
+    }
 
     const nextLine = lines[index + 1] || "";
     if (line.includes("|") && /^\s*\|?\s*:?-{3,}/.test(nextLine) && nextLine.includes("|")) {

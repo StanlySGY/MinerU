@@ -122,12 +122,13 @@ tbody tr:hover { background: #f7f9f9; }
 .form-band .check-label { display: flex; align-items: center; gap: 7px; min-height: 36px; }
 .check-label input { min-height: auto; }
 .primary-button:disabled { cursor: wait; opacity: .7; }
-.batch-dialog { width: min(1500px, 96vw); height: min(920px, 92vh); padding: 0; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--text); }
+.batch-dialog { width: calc(100vw - 24px); max-width: none; height: calc(100vh - 24px); max-height: none; margin: auto; padding: 0; border: 1px solid var(--line); border-radius: 5px; background: var(--surface); color: var(--text); }
+.batch-dialog[open] { display: flex; flex-direction: column; overflow: hidden; }
 .batch-dialog::backdrop { background: rgba(16, 23, 25, .58); }
 .dialog-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 15px 18px; border-bottom: 1px solid var(--line); }
 .dialog-header p { margin-top: 5px; }
 .dialog-actions { padding: 10px 18px; border-bottom: 1px solid var(--line); }
-.batch-preview-layout { height: calc(100% - 116px); display: grid; grid-template-columns: 280px minmax(0, 1fr); }
+.batch-preview-layout { flex: 1; min-height: 0; display: grid; grid-template-columns: 320px minmax(0, 1fr); }
 .batch-preview-layout > aside { min-width: 0; overflow: auto; padding: 14px; border-right: 1px solid var(--line); background: #fafbfb; }
 .batch-preview-layout > aside h3 { margin-bottom: 10px; }
 .batch-file-list { display: grid; gap: 4px; }
@@ -137,11 +138,11 @@ tbody tr:hover { background: #f7f9f9; }
 .batch-file-button small { color: var(--muted); margin-top: 4px; }
 .batch-preview-content { min-width: 0; overflow: auto; padding: 14px; }
 .batch-file-status { min-height: 32px; padding-bottom: 10px; }
-.preview-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.preview-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); gap: 14px; }
 .preview-pane { min-width: 0; border: 1px solid var(--line); }
 .preview-heading { min-height: 42px; padding: 8px 10px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); background: #fafbfb; }
-#original-preview { width: 100%; height: 560px; border: 0; display: none; background: var(--surface-alt); }
-.markdown-preview { height: 560px; overflow: auto; padding: 24px 28px; line-height: 1.7; background: #fff; color: #24292f; overflow-wrap: anywhere; }
+#original-preview { width: 100%; height: calc(100vh - 260px); min-height: 640px; border: 0; display: none; background: var(--surface-alt); }
+.markdown-preview { height: calc(100vh - 260px); min-height: 640px; overflow: auto; padding: 30px 34px; line-height: 1.75; background: #fff; color: #24292f; overflow-wrap: anywhere; }
 .markdown-preview > :first-child { margin-top: 0 !important; }
 .markdown-preview > :last-child { margin-bottom: 0 !important; }
 .markdown-preview h1, .markdown-preview h2, .markdown-preview h3, .markdown-preview h4, .markdown-preview h5, .markdown-preview h6 { color: #1f2328; font-weight: 650; line-height: 1.3; }
@@ -161,10 +162,13 @@ tbody tr:hover { background: #f7f9f9; }
 .markdown-preview a:hover { text-decoration: underline; }
 .markdown-preview hr { height: 1px; margin: 24px 0; border: 0; background: #d8dee4; }
 .markdown-table-wrap { max-width: 100%; margin: 0 0 18px; overflow-x: auto; }
-.markdown-preview table { width: max-content; min-width: 100%; border-collapse: collapse; font-size: 13px; }
+.markdown-preview table { width: max-content; min-width: 100%; border-collapse: collapse; font-size: 13px; background: #fff; }
 .markdown-preview th, .markdown-preview td { padding: 8px 11px; border: 1px solid #d0d7de; vertical-align: top; }
 .markdown-preview th { background: #f6f8fa; font-weight: 650; color: #24292f; }
 .markdown-preview tr:nth-child(even) td { background: #fbfcfd; }
+.markdown-html-table { padding: 2px 0 4px; }
+.markdown-html-table table { table-layout: auto; }
+.markdown-html-table td:empty::after, .markdown-html-table th:empty::after { content: "\00a0"; }
 .markdown-task-marker { display: inline-block; width: 18px; color: var(--accent); font-weight: 700; }
 .markdown-image-ref { display: inline-flex; align-items: center; gap: 5px; padding: 3px 7px; border: 1px solid #d0d7de; border-radius: 4px; color: #59636e; background: #f6f8fa; font-size: 12px; }
 .result-images { max-height: 100px; display: flex; gap: 6px; overflow-x: auto; padding: 6px 10px 10px; }
