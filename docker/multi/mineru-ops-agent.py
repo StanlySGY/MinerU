@@ -22,6 +22,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def unlink_if_exists(path: Path) -> None:
+    """Remove a runtime socket without requiring Python 3.8's missing_ok flag."""
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
 def run_command(command: list[str], cwd: Path, timeout: int = 180) -> dict[str, Any]:
     try:
         completed = subprocess.run(
@@ -240,7 +248,7 @@ def main() -> int:
     args = parse_args()
     socket_path = args.socket.resolve()
     socket_path.parent.mkdir(parents=True, exist_ok=True)
-    socket_path.unlink(missing_ok=True)
+    unlink_if_exists(socket_path)
     agent = Agent(args.project_dir, args.env_file, args.compose_file)
     server = ThreadingUnixServer(str(socket_path), AgentRequestHandler)
     server.agent = agent  # type: ignore[attr-defined]
@@ -249,7 +257,7 @@ def main() -> int:
         server.serve_forever(poll_interval=0.5)
     finally:
         server.server_close()
-        socket_path.unlink(missing_ok=True)
+        unlink_if_exists(socket_path)
     return 0
 
 
