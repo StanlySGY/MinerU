@@ -7,20 +7,21 @@ import asyncio
 import json
 import os
 import secrets
+import shutil
 import signal
 import sqlite3
 import uuid
 import zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import click
 import httpx
 import uvicorn
 import yaml
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import File, Form, FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -272,6 +273,10 @@ class OpsRuntime:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.report_dir = self.data_dir / "reports"
         self.report_dir.mkdir(parents=True, exist_ok=True)
+        self.upload_dir = self.data_dir / "uploads"
+        self.upload_dir.mkdir(parents=True, exist_ok=True)
+        self.temp_dir = self.data_dir / "tmp"
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.store = OpsStore(self.data_dir / "ops.db")
         self.compose_config_path = Path(os.getenv("MINERU_OPS_COMPOSE_CONFIG", "/config/compose-config.yaml"))
         self.test_root = Path(os.getenv("MINERU_OPS_TEST_ROOT", DEFAULT_TEST_ROOT)).resolve()
@@ -289,6 +294,14 @@ class OpsRuntime:
         self.smoke_timeout = max(
             60,
             int(os.getenv("MINERU_OPS_SMOKE_TIMEOUT_SECONDS", "900")),
+        )
+        self.max_upload_bytes = (
+            max(
+                1,
+                int(os.getenv("MINERU_OPS_MAX_UPLOAD_MB", "2048")),
+            )
+            * 1024
+            * 1024
         )
         self.http_client = httpx.AsyncClient(timeout=15.0, follow_redirects=True)
 
@@ -400,6 +413,18 @@ class OpsRuntime:
         if not self.batch_script.is_file():
             raise HTTPException(status_code=503, detail="batch diagnosis script is unavailable")
         input_path = self.resolve_input_path(request.input_path)
+        return await self.start_batch_path(input_path, request, request.input_path)
+
+    async def start_batch_path(
+        self,
+        input_path: Path,
+        request: BatchRunRequest,
+        display_path: str,
+        *,
+        cleanup_input_path: bool = False,
+    ) -> dict[str, Any]:
+        if not self.batch_script.is_file():
+            raise HTTPException(status_code=503, detail="batch diagnosis script is unavailable")
         pdf_count = sum(1 for path in input_path.rglob("*") if path.is_file() and path.suffix.lower() == ".pdf")
         if pdf_count == 0:
             raise HTTPException(status_code=400, detail="no PDF files found in the selected directory")
@@ -411,6 +436,7 @@ class OpsRuntime:
         raw_dir = run_dir / "raw"
         log_path = run_dir / "batch.log"
         settings = request.model_dump()
+        settings["input_path"] = display_path
         settings["pdf_count"] = pdf_count
         record = self.store.create_batch_run(
             run_id,
@@ -421,10 +447,62 @@ class OpsRuntime:
             log_path,
         )
         asyncio.create_task(
-            self._run_batch_process(run_id, input_path, request, report_path, raw_dir, log_path),
+            self._run_batch_process(
+                run_id,
+                input_path,
+                request,
+                report_path,
+                raw_dir,
+                log_path,
+                cleanup_input_path=cleanup_input_path,
+            ),
             name=f"mineru-ops-batch-{run_id}",
         )
         return record
+
+    @staticmethod
+    def normalize_upload_name(filename: str | None) -> Path:
+        raw_name = (filename or "").replace("\\", "/")
+        path = PurePosixPath(raw_name)
+        if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+            raise HTTPException(status_code=400, detail="uploaded file name contains an invalid path")
+        relative = Path(*path.parts)
+        if relative.suffix.lower() != ".pdf":
+            raise HTTPException(status_code=400, detail=f"only PDF files are supported: {filename}")
+        return relative
+
+    async def save_uploaded_files(self, files: list[UploadFile], destination: Path) -> int:
+        if not files:
+            raise HTTPException(status_code=400, detail="no files were uploaded")
+        destination.mkdir(parents=True, exist_ok=False)
+        total_bytes = 0
+        saved_count = 0
+        try:
+            for upload in files:
+                relative_path = self.normalize_upload_name(upload.filename)
+                target = destination / relative_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.exists():
+                    target = target.with_name(f"{target.stem}-{saved_count + 1}{target.suffix}")
+                with target.open("wb") as output:
+                    while True:
+                        chunk = await upload.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        total_bytes += len(chunk)
+                        if total_bytes > self.max_upload_bytes:
+                            raise HTTPException(
+                                status_code=413,
+                                detail=f"uploaded files exceed {self.max_upload_bytes // 1024 // 1024} MB",
+                            )
+                        output.write(chunk)
+                saved_count += 1
+            if saved_count == 0:
+                raise HTTPException(status_code=400, detail="no PDF files were uploaded")
+            return saved_count
+        except Exception:
+            shutil.rmtree(destination, ignore_errors=True)
+            raise
 
     async def run_smoke_test(self) -> dict[str, Any]:
         form = {
@@ -488,6 +566,8 @@ class OpsRuntime:
         report_path: Path,
         raw_dir: Path,
         log_path: Path,
+        *,
+        cleanup_input_path: bool = False,
     ) -> None:
         command = [
             "python",
@@ -559,6 +639,8 @@ class OpsRuntime:
             )
         finally:
             self.batch_processes.pop(run_id, None)
+            if cleanup_input_path:
+                shutil.rmtree(input_path, ignore_errors=True)
 
     async def _collect_batch_diagnostics(self, run_dir: Path, report_path: Path) -> None:
         diagnostics = await self.agent_call(
@@ -861,6 +943,49 @@ def create_app() -> FastAPI:
         runtime.store.audit("batch_start", result.get("run_id", "unknown"), True, payload.model_dump_json())
         return result
 
+    @app.post("/api/batch-runs/upload", status_code=202)
+    async def upload_batch_run(
+        request: Request,
+        files: list[UploadFile] = File(...),
+        backend: str = Form("vlm-http-client"),
+        lang: str = Form("ch"),
+        task_timeout: int = Form(7200),
+        server_url: str | None = Form(None),
+        recursive: bool = Form(True),
+    ):
+        authorize(request, write=True)
+        upload_id = str(uuid.uuid4())
+        upload_path = runtime.upload_dir / upload_id
+        try:
+            uploaded_count = await runtime.save_uploaded_files(files, upload_path)
+            payload = BatchRunRequest(
+                input_path=f"browser-upload/{upload_id}",
+                backend=backend,
+                lang=lang,
+                task_timeout=task_timeout,
+                server_url=server_url or None,
+                recursive=recursive,
+            )
+            display_path = f"浏览器上传（{uploaded_count} 个 PDF）"
+            result = await runtime.start_batch_path(
+                upload_path,
+                payload,
+                display_path,
+                cleanup_input_path=True,
+            )
+        except Exception:
+            shutil.rmtree(upload_path, ignore_errors=True)
+            raise
+        audit_payload = payload.model_dump()
+        audit_payload["uploaded_files"] = uploaded_count
+        runtime.store.audit(
+            "batch_upload_start",
+            result.get("run_id", "unknown"),
+            True,
+            json.dumps(audit_payload, ensure_ascii=False),
+        )
+        return result
+
     @app.get("/api/batch-runs/{run_id}")
     async def batch_run(run_id: str, request: Request):
         authorize(request)
@@ -892,6 +1017,16 @@ def create_app() -> FastAPI:
             process.send_signal(signal.SIGCONT)
             runtime.store.update_batch_run(run_id, status="running")
         elif action == "retry":
+            stored_input_path = Path(record["input_path"])
+            try:
+                stored_input_path.relative_to(runtime.upload_dir)
+            except ValueError:
+                pass
+            else:
+                raise HTTPException(
+                    status_code=409,
+                    detail="browser-uploaded files are removed after a run; upload them again to retry",
+                )
             retry_payload = BatchRunRequest(**record["settings"])
             return await runtime.start_batch(retry_payload)
         else:

@@ -108,9 +108,15 @@ tbody tr:hover { background: #f7f9f9; }
 .form-band { background: var(--surface); border-top: 3px solid var(--accent); border-bottom: 1px solid var(--line); padding: 16px; }
 .form-band form { display: grid; grid-template-columns: 1.2fr 1fr .6fr .8fr; gap: 12px; align-items: end; }
 .form-band label { display: grid; gap: 5px; color: var(--muted); font-size: 11px; }
-.form-band .wide { grid-column: span 3; }
+.upload-source-grid { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.upload-source { min-width: 0; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+.upload-source input { width: 100%; min-width: 0; }
+.upload-source small { min-height: 16px; color: var(--muted); font-size: 11px; }
+.upload-summary { grid-column: 1 / -1; min-height: 20px; font-size: 12px; }
+.form-band .server-url { grid-column: span 2; }
 .form-band .check-label { display: flex; align-items: center; gap: 7px; min-height: 36px; }
 .check-label input { min-height: auto; }
+.primary-button:disabled { cursor: wait; opacity: .7; }
 .log-output { min-height: 560px; max-height: calc(100vh - 180px); overflow: auto; margin: 0; padding: 16px; border-radius: 6px; background: #101719; color: #dbe5e7; font: 12px/1.6 "SFMono-Regular", Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 .muted { color: var(--muted); }
 .mono { font-family: "SFMono-Regular", Consolas, monospace; font-size: 12px; }
@@ -121,7 +127,8 @@ tbody tr:hover { background: #f7f9f9; }
   .two-column, .split-view { grid-template-columns: 1fr; }
   .detail-panel { position: static; max-height: none; }
   .form-band form { grid-template-columns: repeat(2, 1fr); }
-  .form-band .wide { grid-column: span 2; }
+  .upload-source-grid { grid-template-columns: 1fr; }
+  .form-band .server-url { grid-column: span 2; }
 }
 
 @media (max-width: 720px) {
@@ -138,5 +145,5 @@ tbody tr:hover { background: #f7f9f9; }
   .summary-item { border-bottom: 1px solid var(--line); }
   .summary-item:nth-child(even) { border-right: 0; }
   .form-band form { grid-template-columns: 1fr; }
-  .form-band .wide { grid-column: span 1; }
+  .form-band .server-url { grid-column: span 1; }
 }

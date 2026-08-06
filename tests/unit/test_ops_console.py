@@ -1,7 +1,10 @@
 import asyncio
 from pathlib import Path
+from tempfile import SpooledTemporaryFile
 
+import pytest
 import yaml
+from fastapi import HTTPException, UploadFile
 
 from mineru.cli.ops import OpsRuntime, OpsStore, create_app
 
@@ -68,5 +71,43 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "/api/services" in paths
     assert "/api/tasks" in paths
     assert "/api/batch-runs" in paths
+    assert "/api/batch-runs/upload" in paths
     assert "/" in paths
     assert "MinerU 运维控制台" in (static_dir / "index.html").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected"),
+    [
+        ("a.pdf", Path("a.pdf")),
+        ("folder/sub/a.PDF", Path("folder/sub/a.PDF")),
+        (r"folder\a.pdf", Path("folder/a.pdf")),
+    ],
+)
+def test_normalize_upload_name_preserves_safe_relative_paths(filename: str, expected: Path) -> None:
+    assert OpsRuntime.normalize_upload_name(filename) == expected
+
+
+@pytest.mark.parametrize("filename", ["../a.pdf", "/a.pdf", "folder/a.txt", "folder/../a.pdf"])
+def test_normalize_upload_name_rejects_unsafe_or_non_pdf_paths(filename: str) -> None:
+    with pytest.raises(HTTPException):
+        OpsRuntime.normalize_upload_name(filename)
+
+
+def test_save_uploaded_files_streams_pdf_tree(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
+    runtime = OpsRuntime()
+    uploads = []
+    for filename, content in [("folder/a.pdf", b"%PDF-a"), ("folder/b.pdf", b"%PDF-b")]:
+        temporary_file = SpooledTemporaryFile(max_size=1024)
+        temporary_file.write(content)
+        temporary_file.seek(0)
+        uploads.append(UploadFile(filename=filename, file=temporary_file))
+
+    saved_count = asyncio.run(runtime.save_uploaded_files(uploads, tmp_path / "uploaded"))
+
+    assert saved_count == 2
+    assert (tmp_path / "uploaded/folder/a.pdf").read_bytes() == b"%PDF-a"
+    assert (tmp_path / "uploaded/folder/b.pdf").read_bytes() == b"%PDF-b"
+    asyncio.run(runtime.close())

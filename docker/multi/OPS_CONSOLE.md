@@ -14,10 +14,12 @@ MINERU_OPS_DATA_VOLUME=mineru-ops-data-multi
 MINERU_OPS_AUTH_TOKEN=replace-with-a-long-random-token
 MINERU_OPS_SMOKE_BACKEND=vlm-http-client
 MINERU_OPS_SMOKE_TIMEOUT_SECONDS=900
+MINERU_OPS_MAX_UPLOAD_MB=2048
 ```
 
 - `MINERU_OPS_TEST_HOST_PATH` 是批量测试允许读取的唯一宿主机根目录。
 - `MINERU_OPS_AUTH_TOKEN` 留空时，状态、任务和日志保持只读，禁止服务控制和批量测试。
+- `MINERU_OPS_MAX_UPLOAD_MB` 限制一次浏览器上传的 PDF 总大小，默认 2048 MB。
 - “全链路测试”自动生成一页 PDF，并使用 `MINERU_OPS_SMOKE_BACKEND` 经过 Router、API 和 VLM。
 - 控制台历史、报告和审计日志保存在 `MINERU_OPS_DATA_VOLUME`，不会随容器重建删除。
 
@@ -68,11 +70,13 @@ page_failed
 
 ## 批量测试
 
-1. 把待测 PDF 放入 `MINERU_OPS_TEST_HOST_PATH`。
-2. 打开“批量测试”，填写相对于该根目录的子目录。
+1. 打开“批量测试”，从浏览器选择多个 PDF、选择整个文件夹，或填写服务器测试目录。
+2. 浏览器选择文件夹时会保留相对目录结构，非 PDF 文件不会提交。
 3. 选择后端并开始测试。
 4. 页面默认一次提交一个 PDF，避免与 `MINERU_PROCESSING_WINDOW_SIZE` 和页面并发叠加。
 5. 完成后导出 Markdown 或 ZIP。
+
+浏览器上传内容临时保存在 `MINERU_OPS_DATA_VOLUME`。批量任务结束或取消后自动删除原始 PDF，任务记录、日志和诊断报告继续保留。使用服务器目录时，控制台仍然只允许读取 `MINERU_OPS_TEST_HOST_PATH` 下的内容。
 
 ZIP 包含：
 

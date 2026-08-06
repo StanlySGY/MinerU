@@ -97,7 +97,24 @@
       <section id="view-batch" class="view">
         <section class="form-band">
           <form id="batch-form">
-            <label><span>测试目录</span><input name="input_path" value="." required></label>
+            <div class="upload-source-grid">
+              <label class="upload-source">
+                <span>上传 PDF 文件</span>
+                <input id="batch-files" type="file" accept=".pdf,application/pdf" multiple>
+                <small>可一次选择多个 PDF</small>
+              </label>
+              <label class="upload-source">
+                <span>上传文件夹</span>
+                <input id="batch-folder" type="file" accept=".pdf,application/pdf" webkitdirectory directory multiple>
+                <small>保留文件夹内的相对路径</small>
+              </label>
+              <label class="upload-source">
+                <span>服务器测试目录</span>
+                <input name="input_path" value=".">
+                <small>未从浏览器选择文件时使用</small>
+              </label>
+            </div>
+            <div id="upload-summary" class="upload-summary muted">当前使用服务器测试目录</div>
             <label><span>后端</span>
               <select name="backend">
                 <option value="vlm-http-client">vlm-http-client</option>
@@ -107,9 +124,9 @@
             </label>
             <label><span>语言</span><input name="lang" value="ch"></label>
             <label><span>单文件超时（秒）</span><input name="task_timeout" type="number" value="7200" min="60"></label>
-            <label class="wide"><span>VLM Server URL</span><input name="server_url" placeholder="可选，例如 http://10.0.0.8:30000"></label>
+            <label class="server-url"><span>VLM Server URL</span><input name="server_url" placeholder="可选，例如 http://10.0.0.8:30000"></label>
             <label class="check-label"><input name="recursive" type="checkbox" checked><span>包含子目录</span></label>
-            <button type="submit" class="primary-button">开始测试</button>
+            <button id="batch-submit" type="submit" class="primary-button">开始测试</button>
           </form>
         </section>
         <div class="section-heading"><h2>测试记录</h2><span>默认串行提交 PDF</span></div>

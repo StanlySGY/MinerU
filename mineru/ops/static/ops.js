@@ -46,6 +46,29 @@ async function api(path, options = {}) {
   return payload;
 }
 
+function uploadForm(path, formData, onProgress) {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open("POST", path);
+    request.responseType = "json";
+    if (state.token) request.setRequestHeader("X-MinerU-Ops-Token", state.token);
+    request.upload.addEventListener("progress", event => {
+      if (event.lengthComputable) onProgress(Math.round(event.loaded * 100 / event.total));
+    });
+    request.addEventListener("load", () => {
+      let payload = request.response;
+      if (!payload) {
+        try { payload = JSON.parse(request.responseText); } catch { payload = {detail: request.responseText}; }
+      }
+      if (request.status >= 200 && request.status < 300) resolve(payload);
+      else reject(new Error(payload?.detail || `HTTP ${request.status}`));
+    });
+    request.addEventListener("error", () => reject(new Error("上传连接失败")));
+    request.addEventListener("abort", () => reject(new Error("上传已取消")));
+    request.send(formData);
+  });
+}
+
 function notice(message, bad = true) {
   const element = document.getElementById("notice");
   if (!message) { element.classList.add("hidden"); return; }
@@ -227,19 +250,89 @@ async function loadBatches() {
   document.getElementById("batch-table").innerHTML = compactBatchRows(state.batches);
 }
 
+const batchFilesInput = document.getElementById("batch-files");
+const batchFolderInput = document.getElementById("batch-folder");
+const uploadSummary = document.getElementById("upload-summary");
+
+function pdfFiles(input) {
+  return Array.from(input.files || []).filter(file => file.name.toLowerCase().endsWith(".pdf"));
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function updateUploadSummary() {
+  const directFiles = pdfFiles(batchFilesInput);
+  const folderFiles = pdfFiles(batchFolderInput);
+  const files = directFiles.length ? directFiles : folderFiles;
+  if (!files.length) {
+    uploadSummary.textContent = "当前使用服务器测试目录";
+    return;
+  }
+  const source = directFiles.length ? "浏览器文件" : "浏览器文件夹";
+  const ignored = (directFiles.length ? batchFilesInput.files.length : batchFolderInput.files.length) - files.length;
+  const totalBytes = files.reduce((total, file) => total + file.size, 0);
+  uploadSummary.textContent = `${source}：${files.length} 个 PDF，${formatBytes(totalBytes)}${ignored ? `；忽略 ${ignored} 个非 PDF 文件` : ""}`;
+}
+
+batchFilesInput.addEventListener("change", () => {
+  if (batchFilesInput.files.length) batchFolderInput.value = "";
+  updateUploadSummary();
+});
+
+batchFolderInput.addEventListener("change", () => {
+  if (batchFolderInput.files.length) batchFilesInput.value = "";
+  updateUploadSummary();
+});
+
 document.getElementById("batch-form").addEventListener("submit", async event => {
   event.preventDefault();
   const form = new FormData(event.target);
+  const directFiles = pdfFiles(batchFilesInput);
+  const folderFiles = pdfFiles(batchFolderInput);
+  const submitButton = document.getElementById("batch-submit");
+  if (directFiles.length && folderFiles.length) {
+    notice("文件和文件夹不能同时上传，请保留一种选择");
+    return;
+  }
   const payload = {
     input_path: form.get("input_path"), backend: form.get("backend"), lang: form.get("lang"),
     task_timeout: Number(form.get("task_timeout")), server_url: form.get("server_url") || null,
     recursive: form.get("recursive") === "on", effort: "medium", parse_method: "auto", pause_seconds: 2
   };
+  const browserFiles = directFiles.length ? directFiles : folderFiles;
   try {
-    await api("/api/batch-runs", {method: "POST", body: JSON.stringify(payload)});
+    submitButton.disabled = true;
+    if (browserFiles.length) {
+      const upload = new FormData();
+      for (const file of browserFiles) upload.append("files", file, file.webkitRelativePath || file.name);
+      upload.append("backend", payload.backend);
+      upload.append("lang", payload.lang);
+      upload.append("task_timeout", String(payload.task_timeout));
+      upload.append("server_url", payload.server_url || "");
+      upload.append("recursive", String(payload.recursive || folderFiles.length > 0));
+      submitButton.textContent = `正在上传 0%`;
+      await uploadForm("/api/batch-runs/upload", upload, percent => {
+        submitButton.textContent = percent < 100 ? `正在上传 ${percent}%` : "正在启动测试";
+      });
+      batchFilesInput.value = "";
+      batchFolderInput.value = "";
+      updateUploadSummary();
+    } else {
+      if (!String(payload.input_path || "").trim()) throw new Error("请上传 PDF，或填写服务器测试目录");
+      submitButton.textContent = "正在启动测试";
+      await api("/api/batch-runs", {method: "POST", body: JSON.stringify(payload)});
+    }
     notice("批量测试已开始", false);
     await loadBatches();
-  } catch (error) { notice(error.message); }
+  } catch (error) {
+    notice(error.message);
+  } finally {
+    submitButton.disabled = false;
+    submitButton.textContent = "开始测试";
+  }
 });
 
 document.getElementById("batch-table").addEventListener("click", async event => {

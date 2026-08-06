@@ -182,6 +182,8 @@ services:
       MINERU_OPS_AUTH_TOKEN: ${MINERU_OPS_AUTH_TOKEN:-}
       MINERU_OPS_SMOKE_BACKEND: ${MINERU_OPS_SMOKE_BACKEND:-vlm-http-client}
       MINERU_OPS_SMOKE_TIMEOUT_SECONDS: ${MINERU_OPS_SMOKE_TIMEOUT_SECONDS:-900}
+      MINERU_OPS_MAX_UPLOAD_MB: ${MINERU_OPS_MAX_UPLOAD_MB:-2048}
+      TMPDIR: /var/lib/mineru-ops/tmp
     volumes:
       - mineru-code:/app:ro
       - ./.mineru-ops/compose-config.yaml:/config/compose-config.yaml:ro
