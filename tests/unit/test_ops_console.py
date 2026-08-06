@@ -84,6 +84,9 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "log-follow" in dashboard_html
     assert "markdown-table-wrap" in dashboard_js
     assert "sanitizeMarkdownHtmlTable" in dashboard_js
+    assert "当前处理位置" in dashboard_js
+    assert "page-legend" in dashboard_js
+    assert "loadTaskDetail(state.activeTaskId" in dashboard_js
     assert "width: calc(100vw - 24px)" in dashboard_css
 
 

@@ -2,6 +2,8 @@ const state = {
   view: "overview",
   services: [],
   tasks: [],
+  activeTaskId: null,
+  taskDetailRequestId: 0,
   batches: [],
   uploadItems: [],
   activeBatchId: null,
@@ -18,7 +20,7 @@ const state = {
 
 const titles = {overview: "总览", services: "服务", tasks: "任务", batch: "批量测试", logs: "日志"};
 const statusText = {
-  pending: "等待中", processing: "处理中", completed: "已完成", failed: "失败",
+  pending: "等待中", queued: "等待处理", processing: "处理中", completed: "已完成", failed: "失败",
   partial_success: "部分成功", running: "运行中", paused: "已暂停", cancelled: "已取消",
   completed_with_failures: "完成（存在失败）", interrupted: "已中断", unhealthy: "异常",
   healthy: "健康", unavailable: "不可用", unknown: "未知", success: "成功", partial: "部分成功",
@@ -256,7 +258,7 @@ function renderTasks() {
   const tasks = state.tasks.filter(task => !query || String(task.task_id).toLowerCase().includes(query) || (task.file_names || []).join(" ").toLowerCase().includes(query));
   document.getElementById("tasks-table").innerHTML = `<table><thead><tr><th>文件</th><th>状态</th><th>后端</th><th>成功/总页数</th><th>跳过</th><th>开始时间</th></tr></thead><tbody>${tasks.map(task => {
     const p = task.progress || {};
-    return `<tr data-task="${esc(task.task_id)}"><td><strong>${esc((task.file_names || []).join(", "))}</strong><div class="mono muted">${esc(task.task_id)}</div></td><td>${badge(task.partial_success ? "partial_success" : task.status)}</td><td>${esc(task.backend)}</td><td>${p.completed_pages || 0}/${p.total_pages || "-"}</td><td>${p.skipped_pages || 0}</td><td>${esc(formatDate(task.started_at || task.created_at))}</td></tr>`;
+    return `<tr data-task="${esc(task.task_id)}" class="${task.task_id === state.activeTaskId ? "selected" : ""}"><td><strong>${esc((task.file_names || []).join(", "))}</strong><div class="mono muted">${esc(task.task_id)}</div></td><td>${badge(task.partial_success ? "partial_success" : task.status)}</td><td>${esc(task.backend)}</td><td>${p.completed_pages || 0}/${p.total_pages || "-"}</td><td>${p.skipped_pages || 0}</td><td>${esc(formatDate(task.started_at || task.created_at))}</td></tr>`;
   }).join("")}</tbody></table>`;
 }
 
@@ -271,15 +273,61 @@ document.getElementById("overview-tasks").addEventListener("click", event => {
   if (row) { switchView("tasks"); setTimeout(() => loadTaskDetail(row.dataset.task), 0); }
 });
 
-async function loadTaskDetail(taskId) {
+const phaseText = {
+  queued: "任务排队中",
+  vlm_queue: "页面正在等待 VLM",
+  vlm_inference: "VLM 正在识别页面",
+  completed: "处理完成",
+  failed: "处理失败",
+  unknown: "等待进度信息",
+};
+
+function pageLegend() {
+  return `<div class="page-legend" aria-label="页面状态图例"><span><i class="legend-dot queued"></i>等待处理</span><span><i class="legend-dot processing"></i>正在处理</span><span><i class="legend-dot completed"></i>处理完成</span><span><i class="legend-dot skipped"></i>超时跳过</span><span><i class="legend-dot failed"></i>处理失败</span></div>`;
+}
+
+function pageTitle(page, fileName) {
+  const parts = [`${fileName} 第 ${page.page_number} 页`, statusText[page.status] || page.status || "未知"];
+  if (page.attempts) parts.push(`尝试 ${page.attempts} 次`);
+  if (page.queue_seconds != null) parts.push(`排队 ${page.queue_seconds} 秒`);
+  if (page.inference_seconds != null) parts.push(`处理 ${page.inference_seconds} 秒`);
+  if (page.error) parts.push(page.error);
+  return parts.join(" · ");
+}
+
+function currentTaskPosition(task, progress, pages) {
+  const processing = pages.filter(page => page.status === "processing");
+  if (processing.length) {
+    const locations = processing.map(page => `${page.file_name} 第 ${page.page_number} 页`).join("；");
+    return {kind: "processing", title: "正在处理", detail: locations};
+  }
+  if ((progress.inflight_page_numbers || []).length) {
+    return {kind: "processing", title: "正在处理", detail: `第 ${progress.inflight_page_numbers.join("、")} 页`};
+  }
+  if (["completed", "partial_success", "completed_with_failures"].includes(task.status)) return {kind: "completed", title: "任务已完成", detail: `已处理 ${progress.completed_pages || 0} 页，跳过 ${progress.skipped_pages || 0} 页`};
+  if (task.status === "failed") return {kind: "failed", title: "任务失败", detail: task.error || "查看下方错误信息"};
+  if ((progress.queued_pages || 0) > 0) return {kind: "queued", title: "等待处理", detail: `还有 ${progress.queued_pages} 页在队列中`};
+  return {kind: "queued", title: phaseText[progress.phase] || progress.phase || "等待进度", detail: "正在等待新的页面状态"};
+}
+
+async function loadTaskDetail(taskId, {silent = false} = {}) {
+  const requestId = ++state.taskDetailRequestId;
+  state.activeTaskId = taskId;
+  renderTasks();
   try {
     const task = await api(`/api/tasks/${encodeURIComponent(taskId)}`);
+    if (requestId !== state.taskDetailRequestId || state.activeTaskId !== taskId) return;
     const p = task.progress || {};
     const done = (p.completed_pages || 0) + (p.skipped_pages || 0) + (p.failed_pages || 0);
     const percent = p.total_pages ? Math.min(100, Math.round(done * 100 / p.total_pages)) : 0;
     const pages = (p.files || []).flatMap(file => (file.pages || []).map(page => ({...page, file_name: file.file_name})));
-    document.getElementById("task-detail").innerHTML = `<div class="section-heading"><h2>${esc((task.file_names || []).join(", "))}</h2>${badge(task.partial_success ? "partial_success" : task.status)}</div><div class="progress"><span style="width:${percent}%"></span></div><dl class="detail-grid"><dt>Task ID</dt><dd class="mono">${esc(task.task_id)}</dd><dt>阶段</dt><dd>${esc(p.phase || "-")}</dd><dt>页数</dt><dd>${done}/${p.total_pages || "-"}，进行中 ${p.processing_pages || 0}</dd><dt>跳过页</dt><dd>${esc((p.skipped_page_numbers || []).join(", ") || "-")}</dd><dt>失败页</dt><dd>${esc((p.failed_page_numbers || []).join(", ") || "-")}</dd><dt>错误</dt><dd>${esc(task.error || "-")}</dd></dl><div class="section-heading"><h3>页面状态</h3><span>${pages.length} 页</span></div><div class="page-list">${pages.map(page => `<span class="page-chip ${esc(page.status)}" title="${esc(page.file_name)} ${esc(page.error || "")}">${page.page_number}</span>`).join("") || `<span class="muted">尚无页面事件</span>`}</div>${pages.filter(page => page.status === "skipped" || page.status === "failed").map(page => `<dl class="detail-grid"><dt>第 ${page.page_number} 页</dt><dd>${badge(page.status)} ${esc(page.error_type || "")} ${esc(page.error || "")}</dd></dl>`).join("")}`;
-  } catch (error) { notice(error.message); }
+    const current = currentTaskPosition(task, p, pages);
+    const fileSections = (p.files || []).map(file => `<section class="task-file-pages"><div class="task-file-heading"><strong>${esc(file.file_name)}</strong><span>${(file.pages || []).length} 页</span></div><div class="page-list">${(file.pages || []).map(page => `<span class="page-chip ${esc(page.status || "queued")}" title="${esc(pageTitle(page, file.file_name))}">${page.page_number}</span>`).join("")}</div></section>`).join("");
+    const problemPages = pages.filter(page => page.status === "skipped" || page.status === "failed");
+    document.getElementById("task-detail").innerHTML = `<div class="task-detail-header"><div><h2>${esc((task.file_names || []).join(", "))}</h2><div class="mono muted">${esc(task.task_id)}</div></div>${badge(task.partial_success ? "partial_success" : task.status)}</div><div class="task-live-position ${current.kind}"><span class="live-indicator"></span><div><small>当前处理位置</small><strong>${esc(current.title)}</strong><p>${esc(current.detail)}</p></div><time>${esc(formatDate(p.updated_at))}</time></div><div class="task-progress-row"><div class="progress"><span style="width:${percent}%"></span></div><strong>${percent}%</strong></div><div class="task-stat-grid"><div><span>总页数</span><strong>${p.total_pages || 0}</strong></div><div><span>已完成</span><strong>${p.completed_pages || 0}</strong></div><div><span>处理中</span><strong>${p.processing_pages || 0}</strong></div><div><span>等待中</span><strong>${p.queued_pages || 0}</strong></div><div><span>已跳过</span><strong>${p.skipped_pages || 0}</strong></div><div><span>失败</span><strong>${p.failed_pages || 0}</strong></div></div><div class="task-meta-line"><span>阶段：<strong>${esc(phaseText[p.phase] || p.phase || "-")}</strong></span><span>后端：<strong>${esc(task.backend || "-")}</strong></span>${task.error ? `<span class="bad-text">任务错误：${esc(task.error)}</span>` : ""}</div><div class="task-pages-heading"><h3>页面状态</h3><span>${pages.length} 个页面事件</span></div>${pageLegend()}<div class="task-file-page-list">${fileSections || `<div class="empty-state">尚未收到页级进度，任务启动后会自动显示</div>`}</div>${problemPages.length ? `<div class="task-problem-list"><h3>跳过和失败页面</h3>${problemPages.map(page => `<div class="task-problem-row"><strong>${esc(page.file_name)} 第 ${page.page_number} 页</strong>${badge(page.status)}<span>${esc(page.error_type || "")}</span><p>${esc(page.error || "未返回错误详情")}</p></div>`).join("")}</div>` : ""}`;
+  } catch (error) {
+    if (!silent) notice(error.message);
+  }
 }
 
 function compactBatchRows(items, limit = 100) {
@@ -991,5 +1039,8 @@ setInterval(() => {
 }, 5000);
 setInterval(() => {
   if (state.view === "logs" && document.getElementById("log-live").checked) loadSelectedServiceLogs();
+}, 2000);
+setInterval(() => {
+  if (state.view === "tasks" && state.activeTaskId) loadTaskDetail(state.activeTaskId, {silent: true});
 }, 2000);
 refreshCurrent();
