@@ -94,6 +94,6 @@ cp env.multi.example env.multi
 
 `stop` 只停止 Router/API，保留控制台用于检查和恢复；`stop-all` 才会停止全部容器和宿主机控制代理。
 
-`check` 会检查镜像、模型目录、JSON 和容器挂载；`MINERU_DEVICE_MODE=npu` 时还会检查 NPU 设备节点和 `torch_npu`；只有填写了 `VLM_1_IP` 才检查外部 VLM 连通性。`test` 会测试 `pipeline`，填写了 `VLM_1_IP` 时再测试 `hybrid-http-client`。
+`check` 会检查镜像、模型目录、JSON 和容器挂载；CPU 模式会实际导入 `torch`，防止误用依赖 Ascend 驱动的 NPU 镜像；`MINERU_DEVICE_MODE=npu` 时还会检查 NPU 设备节点和 `torch_npu`。只有填写了 `VLM_1_IP` 才检查外部 VLM 连通性。`test` 会测试 `pipeline`，填写了 `VLM_1_IP` 时再测试 `hybrid-http-client`。
 
 只部署 Router + API 的纯 CPU 主机（x86_64 或 ARM64），在 `env.multi` 中设置 `MINERU_DEVICE_MODE=cpu`、把 `MINERU_ENV_IMAGE` 换成同架构的 CPU 版镜像、`VLM_1_IP` 留空即可，不需要 `/dev/davinci*`。

@@ -298,6 +298,25 @@ check_npu_image() {
         'import torch, torch_npu; assert torch_npu.npu.is_available(), "torch_npu 已安装，但 NPU 不可用"; assert torch_npu.npu.device_count() == 1, f"期望只看见 1 张 NPU，实际为 {torch_npu.npu.device_count()}"; value=torch.empty(1).npu(); print("torch:", torch.__version__); print("torch_npu:", torch_npu.__version__); print("device:", value.device)'
 }
 
+check_cpu_image() {
+    if [ "$MINERU_DEVICE_MODE" != "cpu" ]; then
+        return
+    fi
+
+    echo "从临时容器检查 CPU 环境镜像能否导入 torch..."
+    if ! docker run --rm --entrypoint python \
+        -e MINERU_DEVICE_MODE=cpu \
+        "$MINERU_ENV_IMAGE" -c \
+        'import torch; print("torch:", torch.__version__); print("device: cpu")'
+    then
+        echo "错误：MINERU_DEVICE_MODE=cpu，但环境镜像无法在无 NPU 驱动的主机上导入 torch。" >&2
+        echo "当前镜像：$MINERU_ENV_IMAGE" >&2
+        echo "如果该镜像包含 torch_npu，请在 env.multi 中改用 CPU 环境镜像，例如：" >&2
+        echo "  MINERU_ENV_IMAGE=mineru-env:v1.0" >&2
+        exit 1
+    fi
+}
+
 check() {
     load_env
     echo "设备模式：$MINERU_DEVICE_MODE；Compose 文件：${COMPOSE_FILES[*]}"
@@ -335,6 +354,7 @@ check() {
         echo "错误：本地没有 $MINERU_CODE_IMAGE，请先导入 mineru-code-*.tar.gz，或修改 env.multi 标签。" >&2
         exit 1
     }
+    check_cpu_image
     check_npu_image
     pipeline_model_abs=$(absolute_existing_path "$PIPELINE_MODEL_HOST_PATH")
     pipeline_config_abs=$(absolute_existing_path "$PIPELINE_CONFIG_HOST_PATH")
