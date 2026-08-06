@@ -11,6 +11,7 @@ import secrets
 import shutil
 import signal
 import sqlite3
+import struct
 import uuid
 import zipfile
 from contextlib import asynccontextmanager
@@ -584,6 +585,116 @@ class OpsRuntime:
             "storage_bytes": self.directory_size(input_root) + self.directory_size(results_root),
             "retention_days": self.artifact_retention_days,
         }
+
+    def task_preview_artifacts(self, task_id: str) -> dict[str, Any]:
+        for record in self.store.list_batch_runs(limit=10000):
+            artifacts = self.batch_artifacts(record)
+            preview = next(
+                (
+                    item
+                    for item in artifacts["previews"]
+                    if str(item.get("task_id") or "") == task_id
+                ),
+                None,
+            )
+            if preview is None:
+                continue
+            relative_path = str(preview.get("relative_path") or preview.get("file_name") or "")
+            original = next(
+                (
+                    item
+                    for item in artifacts["originals"]
+                    if str(item.get("path") or "") == relative_path
+                ),
+                None,
+            )
+            if original is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="the task result exists, but its original PDF is unavailable",
+                )
+            original_path = self.resolve_artifact(
+                record,
+                str(original.get("kind") or "input"),
+                str(original["path"]),
+            )
+            return {
+                "task_id": task_id,
+                "run_id": record["run_id"],
+                "file_name": preview.get("file_name") or original.get("name"),
+                "relative_path": relative_path,
+                "classification": preview.get("classification"),
+                "failed_pages": preview.get("failed_pages") or [],
+                "original": {
+                    **original,
+                    "page_count": self.pdf_page_count(original_path),
+                },
+                "preview": preview.get("preview") or {},
+            }
+        raise HTTPException(
+            status_code=404,
+            detail="preview is only available for completed tasks with retained batch artifacts",
+        )
+
+    @staticmethod
+    def pdf_page_count(path: Path) -> int:
+        import pypdfium2 as pdfium
+
+        document = pdfium.PdfDocument(str(path))
+        try:
+            return len(document)
+        finally:
+            document.close()
+
+    @staticmethod
+    def render_pdf_page(path: Path, page_number: int) -> bytes:
+        import pypdfium2 as pdfium
+
+        document = pdfium.PdfDocument(str(path))
+        try:
+            if page_number < 1 or page_number > len(document):
+                raise HTTPException(status_code=404, detail="PDF page not found")
+            page = document[page_number - 1]
+            try:
+                bitmap = page.render(scale=1.5)
+                try:
+                    if bitmap.mode not in {"BGR", "BGRA", "BGRX"}:
+                        raise HTTPException(
+                            status_code=500,
+                            detail=f"unsupported PDF bitmap mode: {bitmap.mode}",
+                        )
+                    bits_per_pixel = bitmap.n_channels * 8
+                    image_size = bitmap.stride * bitmap.height
+                    pixel_offset = 14 + 40
+                    file_header = struct.pack(
+                        "<2sIHHI",
+                        b"BM",
+                        pixel_offset + image_size,
+                        0,
+                        0,
+                        pixel_offset,
+                    )
+                    dib_header = struct.pack(
+                        "<IiiHHIIiiII",
+                        40,
+                        bitmap.width,
+                        -bitmap.height,
+                        1,
+                        bits_per_pixel,
+                        0,
+                        image_size,
+                        2835,
+                        2835,
+                        0,
+                        0,
+                    )
+                    return file_header + dib_header + bytes(bitmap.buffer)
+                finally:
+                    bitmap.close()
+            finally:
+                page.close()
+        finally:
+            document.close()
 
     def resolve_artifact(self, record: dict[str, Any], kind: str, artifact_path: str) -> Path:
         run_dir = self.run_dir_for_record(record)
@@ -1176,6 +1287,31 @@ def create_app() -> FastAPI:
             cached["source"] = "cache"
             cached["cache_error"] = str(exc)
             return cached
+
+    @app.get("/api/tasks/{task_id}/preview")
+    async def task_preview(task_id: str, request: Request):
+        authorize(request)
+        return runtime.task_preview_artifacts(task_id)
+
+    @app.get("/api/tasks/{task_id}/preview/pages/{page_number}")
+    async def task_preview_page(
+        task_id: str,
+        page_number: int,
+        request: Request,
+    ):
+        authorize(request)
+        preview = runtime.task_preview_artifacts(task_id)
+        record = runtime.store.get_batch_run(str(preview["run_id"]))
+        if record is None:
+            raise HTTPException(status_code=404, detail="batch run not found")
+        original = preview["original"]
+        path = runtime.resolve_artifact(
+            record,
+            str(original.get("kind") or "input"),
+            str(original["path"]),
+        )
+        content = await asyncio.to_thread(runtime.render_pdf_page, path, page_number)
+        return Response(content=content, media_type="image/bmp")
 
     @app.get("/api/tasks/{task_id}/events")
     async def task_events(task_id: str, request: Request):

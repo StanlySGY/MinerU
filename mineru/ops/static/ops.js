@@ -4,13 +4,15 @@ const state = {
   tasks: [],
   activeTaskId: null,
   taskDetailRequestId: 0,
+  taskRefreshLoading: false,
   batches: [],
   uploadItems: [],
   activeBatchId: null,
   activeBatchDetail: null,
-  activeBatchFilePath: null,
-  activeBatchPreviewSignature: null,
-  batchPreviewRequestId: 0,
+  activeBatchDocument: null,
+  activeTaskPreviewId: null,
+  activeTaskPreview: null,
+  taskPreviewObserver: null,
   previewObjectUrls: [],
   serviceFilter: "all",
   logRequestId: 0,
@@ -156,6 +158,27 @@ function formatDate(value) {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", {hour12: false});
 }
 
+function formatElapsed(startValue, endValue = null) {
+  if (!startValue) return "-";
+  const start = new Date(startValue).getTime();
+  const end = endValue ? new Date(endValue).getTime() : Date.now();
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return "-";
+  const totalSeconds = Math.floor((end - start) / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours) return `${hours}小时 ${minutes}分 ${seconds}秒`;
+  if (minutes) return `${minutes}分 ${seconds}秒`;
+  return `${seconds}秒`;
+}
+
+function taskPreviewReady(task) {
+  return Boolean(
+    task.partial_success
+    || ["completed", "completed_with_failures", "partial_success"].includes(task.status),
+  );
+}
+
 function compactTaskRows(tasks, limit = 6) {
   if (!tasks.length) return `<div class="empty-state">暂无任务</div>`;
   return `<table><thead><tr><th>文件</th><th>状态</th><th>页进度</th><th>更新时间</th></tr></thead><tbody>${tasks.slice(0, limit).map(task => {
@@ -256,9 +279,9 @@ async function loadTasks() {
 function renderTasks() {
   const query = document.getElementById("task-search").value.trim().toLowerCase();
   const tasks = state.tasks.filter(task => !query || String(task.task_id).toLowerCase().includes(query) || (task.file_names || []).join(" ").toLowerCase().includes(query));
-  document.getElementById("tasks-table").innerHTML = `<table><thead><tr><th>文件</th><th>状态</th><th>后端</th><th>成功/总页数</th><th>跳过</th><th>开始时间</th></tr></thead><tbody>${tasks.map(task => {
+  document.getElementById("tasks-table").innerHTML = `<table><thead><tr><th>文件</th><th>状态</th><th>后端</th><th>成功/总页数</th><th>跳过</th><th>耗时</th><th>开始时间</th></tr></thead><tbody>${tasks.map(task => {
     const p = task.progress || {};
-    return `<tr data-task="${esc(task.task_id)}" class="${task.task_id === state.activeTaskId ? "selected" : ""}"><td><strong>${esc((task.file_names || []).join(", "))}</strong><div class="mono muted">${esc(task.task_id)}</div></td><td>${badge(task.partial_success ? "partial_success" : task.status)}</td><td>${esc(task.backend)}</td><td>${p.completed_pages || 0}/${p.total_pages || "-"}</td><td>${p.skipped_pages || 0}</td><td>${esc(formatDate(task.started_at || task.created_at))}</td></tr>`;
+    return `<tr data-task="${esc(task.task_id)}" class="${task.task_id === state.activeTaskId ? "selected" : ""}"><td><strong>${esc((task.file_names || []).join(", "))}</strong><div class="mono muted">${esc(task.task_id)}</div></td><td>${badge(task.partial_success ? "partial_success" : task.status)}</td><td>${esc(task.backend)}</td><td>${p.completed_pages || 0}/${p.total_pages || "-"}</td><td>${p.skipped_pages || 0}</td><td class="task-elapsed">${esc(formatElapsed(task.started_at || task.created_at, task.completed_at))}</td><td>${esc(formatDate(task.started_at || task.created_at))}</td></tr>`;
   }).join("")}</tbody></table>`;
 }
 
@@ -322,20 +345,42 @@ async function loadTaskDetail(taskId, {silent = false} = {}) {
     const percent = p.total_pages ? Math.min(100, Math.round(done * 100 / p.total_pages)) : 0;
     const pages = (p.files || []).flatMap(file => (file.pages || []).map(page => ({...page, file_name: file.file_name})));
     const current = currentTaskPosition(task, p, pages);
+    const previewReady = taskPreviewReady(task);
+    const elapsed = formatElapsed(task.started_at || task.created_at, task.completed_at);
     const fileSections = (p.files || []).map(file => `<section class="task-file-pages"><div class="task-file-heading"><strong>${esc(file.file_name)}</strong><span>${(file.pages || []).length} 页</span></div><div class="page-list">${(file.pages || []).map(page => `<span class="page-chip ${esc(page.status || "queued")}" title="${esc(pageTitle(page, file.file_name))}">${page.page_number}</span>`).join("")}</div></section>`).join("");
     const problemPages = pages.filter(page => page.status === "skipped" || page.status === "failed");
-    document.getElementById("task-detail").innerHTML = `<div class="task-detail-header"><div><h2>${esc((task.file_names || []).join(", "))}</h2><div class="mono muted">${esc(task.task_id)}</div></div>${badge(task.partial_success ? "partial_success" : task.status)}</div><div class="task-live-position ${current.kind}"><span class="live-indicator"></span><div><small>当前处理位置</small><strong>${esc(current.title)}</strong><p>${esc(current.detail)}</p></div><time>${esc(formatDate(p.updated_at))}</time></div><div class="task-progress-row"><div class="progress"><span style="width:${percent}%"></span></div><strong>${percent}%</strong></div><div class="task-stat-grid"><div><span>总页数</span><strong>${p.total_pages || 0}</strong></div><div><span>已完成</span><strong>${p.completed_pages || 0}</strong></div><div><span>处理中</span><strong>${p.processing_pages || 0}</strong></div><div><span>等待中</span><strong>${p.queued_pages || 0}</strong></div><div><span>已跳过</span><strong>${p.skipped_pages || 0}</strong></div><div><span>失败</span><strong>${p.failed_pages || 0}</strong></div></div><div class="task-meta-line"><span>阶段：<strong>${esc(phaseText[p.phase] || p.phase || "-")}</strong></span><span>后端：<strong>${esc(task.backend || "-")}</strong></span>${task.error ? `<span class="bad-text">任务错误：${esc(task.error)}</span>` : ""}</div><div class="task-pages-heading"><h3>页面状态</h3><span>${pages.length} 个页面事件</span></div>${pageLegend()}<div class="task-file-page-list">${fileSections || `<div class="empty-state">尚未收到页级进度，任务启动后会自动显示</div>`}</div>${problemPages.length ? `<div class="task-problem-list"><h3>跳过和失败页面</h3>${problemPages.map(page => `<div class="task-problem-row"><strong>${esc(page.file_name)} 第 ${page.page_number} 页</strong>${badge(page.status)}<span>${esc(page.error_type || "")}</span><p>${esc(page.error || "未返回错误详情")}</p></div>`).join("")}</div>` : ""}`;
+    document.getElementById("task-detail").innerHTML = `<div class="task-detail-header"><div><h2>${esc((task.file_names || []).join(", "))}</h2><div class="mono muted">${esc(task.task_id)}</div></div><div class="task-detail-actions">${badge(task.partial_success ? "partial_success" : task.status)}${previewReady ? `<button type="button" class="primary-button" data-task-preview="${esc(task.task_id)}">预览结果</button>` : ""}</div></div><div class="task-live-position ${current.kind}"><span class="live-indicator"></span><div><small>当前处理位置</small><strong>${esc(current.title)}</strong><p>${esc(current.detail)}</p></div><time>${esc(formatDate(p.updated_at))}</time></div><div class="task-progress-row"><div class="progress"><span style="width:${percent}%"></span></div><strong>${percent}%</strong></div><div class="task-stat-grid"><div><span>总页数</span><strong>${p.total_pages || 0}</strong></div><div><span>已完成</span><strong>${p.completed_pages || 0}</strong></div><div><span>处理中</span><strong>${p.processing_pages || 0}</strong></div><div><span>等待中</span><strong>${p.queued_pages || 0}</strong></div><div><span>已跳过</span><strong>${p.skipped_pages || 0}</strong></div><div><span>失败</span><strong>${p.failed_pages || 0}</strong></div></div><div class="task-meta-line"><span>阶段：<strong>${esc(phaseText[p.phase] || p.phase || "-")}</strong></span><span>后端：<strong>${esc(task.backend || "-")}</strong></span><span>耗时：<strong class="task-elapsed">${esc(elapsed)}</strong></span>${task.error ? `<span class="bad-text">任务错误：${esc(task.error)}</span>` : ""}</div><div class="task-pages-heading"><h3>页面状态</h3><span>${pages.length} 个页面事件</span></div>${pageLegend()}<div class="task-file-page-list">${fileSections || `<div class="empty-state">尚未收到页级进度，任务启动后会自动显示</div>`}</div>${problemPages.length ? `<div class="task-problem-list"><h3>跳过和失败页面</h3>${problemPages.map(page => `<div class="task-problem-row"><strong>${esc(page.file_name)} 第 ${page.page_number} 页</strong>${badge(page.status)}<span>${esc(page.error_type || "")}</span><p>${esc(page.error || "未返回错误详情")}</p></div>`).join("")}</div>` : ""}`;
   } catch (error) {
     if (!silent) notice(error.message);
   }
 }
 
+document.getElementById("task-detail").addEventListener("click", event => {
+  const button = event.target.closest("[data-task-preview]");
+  if (button) openTaskPreview(button.dataset.taskPreview);
+});
+
+async function refreshTasksView() {
+  if (state.taskRefreshLoading) return;
+  state.taskRefreshLoading = true;
+  try {
+    await loadTasks();
+    if (state.activeTaskId) await loadTaskDetail(state.activeTaskId, {silent: true});
+    setConnection(true, "控制台已连接");
+  } catch (error) {
+    setConnection(false, "连接异常");
+    notice(error.message);
+  } finally {
+    state.taskRefreshLoading = false;
+  }
+}
+
 function compactBatchRows(items, limit = 100) {
   if (!items.length) return `<div class="empty-state">暂无批量测试</div>`;
-  return `<table><thead><tr><th>目录</th><th>状态</th><th>PDF</th><th>开始时间</th><th>报告</th><th>操作</th></tr></thead><tbody>${items.slice(0, limit).map(run => {
+  return `<table><thead><tr><th>目录</th><th>状态</th><th>PDF</th><th>开始时间</th><th>记录</th><th>操作</th></tr></thead><tbody>${items.slice(0, limit).map(run => {
     const active = ["pending", "running", "paused", "cancelling"].includes(run.status);
     const previewText = run.input_preview_ready || run.result_preview_ready ? "可预览" : "";
-    return `<tr><td><strong>${esc(run.settings?.input_path || run.input_path)}</strong><div class="mono muted">${esc(run.run_id)}</div></td><td>${badge(run.status)}${previewText ? `<div class="muted">${previewText}</div>` : ""}</td><td>${run.settings?.pdf_count || "-"}</td><td>${esc(formatDate(run.started_at || run.created_at))}</td><td><button class="text-button" data-batch-detail="${run.run_id}">详情/预览</button> · <button class="text-button" data-export="process_markdown" data-batch="${run.run_id}">过程日志</button>${run.report_ready ? ` · <button class="text-button" data-export="markdown" data-batch="${run.run_id}">报告</button> · <button class="text-button" data-export="zip" data-batch="${run.run_id}">ZIP</button>` : ""}</td><td><div class="actions">${active ? `<button class="action-button" data-batch="${run.run_id}" data-batch-action="${run.status === "paused" ? "resume" : "pause"}">${run.status === "paused" ? "继续" : "暂停"}</button><button class="action-button danger" data-batch="${run.run_id}" data-batch-action="cancel">取消</button>` : `<button class="action-button" data-batch="${run.run_id}" data-batch-action="retry">重试</button><button class="action-button danger" data-batch="${run.run_id}" data-batch-action="delete">删除</button>`}</div></td></tr>`;
+    return `<tr><td><strong>${esc(run.settings?.input_path || run.input_path)}</strong><div class="mono muted">${esc(run.run_id)}</div></td><td>${badge(run.status)}${previewText ? `<div class="muted">${previewText}</div>` : ""}</td><td>${run.settings?.pdf_count || "-"}</td><td>${esc(formatDate(run.started_at || run.created_at))}</td><td><button class="text-button" data-batch-detail="${run.run_id}">查看记录</button></td><td><div class="actions">${active ? `<button class="action-button" data-batch="${run.run_id}" data-batch-action="${run.status === "paused" ? "resume" : "pause"}">${run.status === "paused" ? "继续" : "暂停"}</button><button class="action-button danger" data-batch="${run.run_id}" data-batch-action="cancel">取消</button>` : `<button class="action-button" data-batch="${run.run_id}" data-batch-action="retry">重试</button><button class="action-button danger" data-batch="${run.run_id}" data-batch-action="delete">删除</button>`}</div></td></tr>`;
   }).join("")}</tbody></table>`;
 }
 
@@ -521,13 +566,6 @@ async function handleBatchTableClick(event) {
   const detailButton = event.target.closest("[data-batch-detail]");
   if (detailButton) {
     await loadBatchDetail(detailButton.dataset.batchDetail);
-    return;
-  }
-  const exportButton = event.target.closest("[data-export]");
-  if (exportButton) {
-    try {
-      await exportBatch(exportButton.dataset.batch, exportButton.dataset.export);
-    } catch (error) { notice(error.message); }
     return;
   }
   const button = event.target.closest("[data-batch-action]");
@@ -734,144 +772,24 @@ function renderMarkdown(value) {
   return output.join("") || `<div class="empty-state">提取结果为空</div>`;
 }
 
-function batchFiles(detail) {
-  const items = new Map();
-  for (const original of detail.artifacts?.originals || []) {
-    items.set(original.path, {path: original.path, name: original.name, original});
-  }
-  for (const preview of detail.artifacts?.previews || []) {
-    const path = preview.relative_path || preview.file_name;
-    const current = items.get(path) || {path, name: preview.file_name || path};
-    current.preview = preview;
-    items.set(path, current);
-  }
-  return [...items.values()];
-}
-
-function batchPreviewSignature(item) {
-  const preview = item?.preview || {};
-  return JSON.stringify([
-    item?.original?.path || null,
-    item?.original?.kind || null,
-    preview.task_status || null,
-    preview.classification || null,
-    preview.error || null,
-    preview.preview?.markdown_path || null,
-    preview.preview?.archive_path || null,
-    (preview.failed_pages || []).length,
-  ]);
-}
-
-function renderBatchFileList(detail, preferredPath = null) {
-  const files = batchFiles(detail);
-  const active = ["pending", "running", "paused", "cancelling"].includes(detail.status);
-  document.getElementById("batch-detail-files").innerHTML = files.length ? files.map(item => {
-    const originalStatus = item.original ? "有原始 PDF" : "无原始 PDF";
-    const resultStatus = item.preview?.preview?.markdown_path ? "有 Markdown" : (active ? "等待结果" : "无 Markdown");
-    return `<button type="button" class="batch-file-button ${item.path === preferredPath ? "active" : ""}" data-file-path="${esc(item.path)}"><strong>${esc(item.name || item.path)}</strong><small>${esc(item.path)} · ${statusText[item.preview?.classification] || item.preview?.classification || "处理中"}</small><small>${originalStatus} · ${resultStatus}</small></button>`;
-  }).join("") : `<div class="empty-state">${active ? "任务正在运行，文件和结果产物生成后会自动出现" : "该任务没有发现可预览的文件产物"}</div>`;
-  const selected = files.find(item => item.path === preferredPath) || files[0] || null;
-  return {files, selected};
-}
-
 async function fetchArtifactBlob(runId, kind, path) {
   const response = await authorizedFetch(artifactUrl(runId, kind, path));
   return response.blob();
 }
 
-async function selectBatchFile(detail, item) {
-  const requestId = ++state.batchPreviewRequestId;
-  state.activeBatchFilePath = item.path;
-  state.activeBatchPreviewSignature = batchPreviewSignature(item);
-  clearPreviewObjectUrls();
-  document.querySelectorAll(".batch-file-button").forEach(button => button.classList.toggle("active", button.dataset.filePath === item.path));
-  const originalFrame = document.getElementById("original-preview");
-  const originalEmpty = document.getElementById("original-preview-empty");
-  const resultPreview = document.getElementById("result-preview");
-  const resultImages = document.getElementById("result-images");
-  const downloadOriginal = document.getElementById("download-original");
-  const downloadResult = document.getElementById("download-result");
-  originalFrame.removeAttribute("src");
-  originalFrame.style.display = "none";
-  originalEmpty.classList.remove("hidden");
-  originalEmpty.textContent = item.original ? "正在读取原始 PDF..." : "当前文件没有可访问的原始 PDF";
-  downloadOriginal.classList.add("hidden");
-  downloadResult.classList.add("hidden");
-  resultPreview.innerHTML = `<div class="empty-state">${item.preview?.preview?.markdown_path ? "正在读取并渲染 Markdown..." : "提取结果尚未生成，任务运行时会自动刷新"}</div>`;
-  resultImages.innerHTML = "";
-
-  const preview = item.preview;
-  const failedPages = preview?.failed_pages || [];
-  document.getElementById("batch-file-status").innerHTML = `${badge(preview?.classification || preview?.task_status || "unknown")} <strong>${esc(item.path)}</strong>${preview?.task_id ? ` <span class="mono">${esc(preview.task_id)}</span>` : ""}${failedPages.length ? `<div>跳过/失败页：${esc(failedPages.map(page => page.page_number || Number(page.page_idx) + 1).join(", "))}</div>` : ""}${preview?.error ? `<div class="bad-text">${esc(preview.error)}</div>` : ""}`;
-
-  const originalPromise = (async () => {
-    if (item.original) {
-      try {
-        const blob = await fetchArtifactBlob(detail.run_id, item.original.kind || "input", item.original.path);
-        if (requestId !== state.batchPreviewRequestId) return;
-        const url = URL.createObjectURL(blob);
-        state.previewObjectUrls.push(url);
-        originalFrame.src = url;
-        originalFrame.style.display = "block";
-        originalEmpty.classList.add("hidden");
-        downloadOriginal.classList.remove("hidden");
-        downloadOriginal.dataset.path = item.original.path;
-        downloadOriginal.dataset.kind = item.original.kind || "input";
-        downloadOriginal.dataset.filename = item.original.name;
-      } catch (error) {
-        if (requestId === state.batchPreviewRequestId) originalEmpty.textContent = `原始 PDF 读取失败：${error.message}`;
-      }
-    } else {
-      originalEmpty.textContent = detail.settings?.source_type === "server_directory" ? "服务器目录中的源 PDF 当前不可访问或已被移动" : "原始 PDF 已超过保留期或已被清理";
-    }
-  })();
-
-  const previewFiles = preview?.preview || {};
-  const resultPromise = (async () => {
-    if (previewFiles.markdown_path) {
-      try {
-        const response = await authorizedFetch(artifactUrl(detail.run_id, "results", previewFiles.markdown_path));
-        const markdown = await response.text();
-        if (requestId !== state.batchPreviewRequestId) return;
-        resultPreview.innerHTML = renderMarkdown(markdown);
-      } catch (error) {
-        if (requestId === state.batchPreviewRequestId) resultPreview.innerHTML = `<div class="empty-state">提取结果读取失败：${esc(error.message)}</div>`;
-      }
-    } else {
-      resultPreview.innerHTML = `<div class="empty-state">${["pending", "running", "paused", "cancelling"].includes(detail.status) ? "该文件仍在处理，Markdown 生成后会自动显示" : "该文件没有生成 Markdown 提取结果"}</div>`;
-    }
-    if (previewFiles.archive_path && requestId === state.batchPreviewRequestId) {
-      downloadResult.classList.remove("hidden");
-      downloadResult.dataset.path = previewFiles.archive_path;
-      downloadResult.dataset.filename = `${item.name || "result"}-result.zip`;
-    }
-    const imagePaths = (previewFiles.image_paths || []).slice(0, 30);
-    const loadedImages = await Promise.all(imagePaths.map(async path => {
-      try {
-        const blob = await fetchArtifactBlob(detail.run_id, "results", path);
-        if (requestId !== state.batchPreviewRequestId) return null;
-        const url = URL.createObjectURL(blob);
-        state.previewObjectUrls.push(url);
-        return {url, path};
-      } catch { return null; }
-    }));
-    if (requestId === state.batchPreviewRequestId) resultImages.innerHTML = loadedImages.filter(Boolean).map(image => `<img src="${image.url}" alt="${esc(image.path)}" title="${esc(image.path)}">`).join("");
-  })();
-
-  await Promise.allSettled([originalPromise, resultPromise]);
-}
-
-async function loadBatchProcessLog(runId, {preserveScroll = false} = {}) {
-  const output = document.getElementById("batch-process-log");
-  const nearBottom = output.scrollHeight - output.scrollTop - output.clientHeight < 48;
+async function showBatchDocument(format, {preserveScroll = false} = {}) {
+  if (!state.activeBatchId) return;
+  const preview = document.getElementById("batch-document-preview");
+  const previousRatio = preserveScroll && preview.scrollHeight > preview.clientHeight ? preview.scrollTop / (preview.scrollHeight - preview.clientHeight) : 0;
+  state.activeBatchDocument = format;
+  document.querySelectorAll("[data-batch-document]").forEach(button => button.classList.toggle("active", button.dataset.batchDocument === format));
+  preview.innerHTML = `<div class="empty-state">正在读取...</div>`;
   try {
-    const response = await authorizedFetch(`/api/batch-runs/${encodeURIComponent(runId)}/export?format=process_markdown`);
-    const content = await response.text();
-    if (state.activeBatchId !== runId) return;
-    output.textContent = content;
-    if (!preserveScroll || nearBottom) output.scrollTop = output.scrollHeight;
+    const response = await authorizedFetch(`/api/batch-runs/${encodeURIComponent(state.activeBatchId)}/export?format=${encodeURIComponent(format)}`);
+    preview.innerHTML = renderMarkdown(await response.text());
+    if (preserveScroll) preview.scrollTop = previousRatio * Math.max(0, preview.scrollHeight - preview.clientHeight);
   } catch (error) {
-    if (state.activeBatchId === runId) output.textContent = `过程日志读取失败：${error.message}`;
+    preview.innerHTML = `<div class="empty-state">读取失败：${esc(error.message)}</div>`;
   }
 }
 
@@ -883,34 +801,25 @@ async function loadBatchDetail(runId) {
     state.activeBatchDetail = detail;
     document.getElementById("batch-detail-title").textContent = detail.settings?.input_path || "批量任务详情";
     document.getElementById("batch-detail-meta").textContent = `${runId} · ${statusText[detail.status] || detail.status} · ${detail.settings?.pdf_count || 0} 个 PDF · 产物 ${formatBytes(detail.artifacts?.storage_bytes || 0)} · 保留 ${detail.artifacts?.retention_days ?? "-"} 天`;
-    const {selected} = renderBatchFileList(detail);
-    document.getElementById("batch-process-log").textContent = "正在读取过程日志...";
+    const reportButton = document.querySelector('[data-batch-document="markdown"]');
+    reportButton.disabled = !detail.report_ready;
     if (!dialog.open) dialog.showModal();
-    const previewPromise = selected ? selectBatchFile(detail, selected) : Promise.resolve();
-    await Promise.allSettled([previewPromise, loadBatchProcessLog(runId)]);
+    await showBatchDocument(detail.report_ready ? "markdown" : "process_markdown");
   } catch (error) { notice(error.message); }
 }
 
-document.getElementById("batch-detail-files").addEventListener("click", async event => {
-  const button = event.target.closest("[data-file-path]");
-  if (!button || !state.activeBatchDetail) return;
-  const item = batchFiles(state.activeBatchDetail).find(candidate => candidate.path === button.dataset.filePath);
-  if (item) await selectBatchFile(state.activeBatchDetail, item);
+document.getElementById("batch-document-tabs").addEventListener("click", event => {
+  const button = event.target.closest("[data-batch-document]");
+  if (button && !button.disabled) showBatchDocument(button.dataset.batchDocument);
 });
 
-document.getElementById("download-original").addEventListener("click", async event => {
+document.getElementById("export-current-batch-document").addEventListener("click", async () => {
   if (!state.activeBatchId) return;
-  try { await downloadPath(artifactUrl(state.activeBatchId, event.currentTarget.dataset.kind || "input", event.currentTarget.dataset.path), event.currentTarget.dataset.filename); }
+  try { await exportBatch(state.activeBatchId, state.activeBatchDocument || "process_markdown"); }
   catch (error) { notice(error.message); }
 });
 
-document.getElementById("download-result").addEventListener("click", async event => {
-  if (!state.activeBatchId) return;
-  try { await downloadPath(artifactUrl(state.activeBatchId, "results", event.currentTarget.dataset.path), event.currentTarget.dataset.filename); }
-  catch (error) { notice(error.message); }
-});
-
-document.querySelector(".dialog-actions").addEventListener("click", async event => {
+document.querySelector("#batch-detail-dialog .dialog-actions").addEventListener("click", async event => {
   const button = event.target.closest("[data-dialog-export]");
   if (!button || !state.activeBatchId) return;
   try { await exportBatch(state.activeBatchId, button.dataset.dialogExport); }
@@ -922,9 +831,7 @@ function closeBatchDetail() {
   clearPreviewObjectUrls();
   state.activeBatchId = null;
   state.activeBatchDetail = null;
-  state.activeBatchFilePath = null;
-  state.activeBatchPreviewSignature = null;
-  state.batchPreviewRequestId += 1;
+  state.activeBatchDocument = null;
   if (dialog.open) dialog.close();
 }
 
@@ -933,12 +840,10 @@ document.getElementById("batch-detail-dialog").addEventListener("close", () => {
   clearPreviewObjectUrls();
   state.activeBatchId = null;
   state.activeBatchDetail = null;
-  state.activeBatchFilePath = null;
-  state.activeBatchPreviewSignature = null;
-  state.batchPreviewRequestId += 1;
+  state.activeBatchDocument = null;
 });
 
-async function refreshActiveBatchLog() {
+async function refreshActiveBatchDocument() {
   const runId = state.activeBatchId;
   if (!runId) return;
   try {
@@ -946,13 +851,104 @@ async function refreshActiveBatchLog() {
     if (state.activeBatchId !== runId) return;
     state.activeBatchDetail = detail;
     document.getElementById("batch-detail-meta").textContent = `${detail.run_id} · ${statusText[detail.status] || detail.status} · ${detail.settings?.pdf_count || 0} 个 PDF · 产物 ${formatBytes(detail.artifacts?.storage_bytes || 0)} · 保留 ${detail.artifacts?.retention_days ?? "-"} 天`;
-    const {selected} = renderBatchFileList(detail, state.activeBatchFilePath);
-    if (selected && (selected.path !== state.activeBatchFilePath || batchPreviewSignature(selected) !== state.activeBatchPreviewSignature)) {
-      await selectBatchFile(detail, selected);
-    }
-    await loadBatchProcessLog(runId, {preserveScroll: true});
+    const reportButton = document.querySelector('[data-batch-document="markdown"]');
+    reportButton.disabled = !detail.report_ready;
+    if (state.activeBatchDocument === "process_markdown") await showBatchDocument("process_markdown", {preserveScroll: true});
   } catch {}
 }
+
+async function loadTaskPdfPage(taskId, pageElement) {
+  if (pageElement.dataset.loaded === "true" || pageElement.dataset.loading === "true") return;
+  pageElement.dataset.loading = "true";
+  const pageNumber = Number(pageElement.dataset.pageNumber);
+  try {
+    const response = await authorizedFetch(`/api/tasks/${encodeURIComponent(taskId)}/preview/pages/${pageNumber}`);
+    const blob = await response.blob();
+    if (state.activeTaskPreviewId !== taskId) return;
+    const url = URL.createObjectURL(blob);
+    state.previewObjectUrls.push(url);
+    pageElement.innerHTML = `<img src="${url}" alt="第 ${pageNumber} 页"><span>第 ${pageNumber} 页</span>`;
+    pageElement.dataset.loaded = "true";
+  } catch (error) {
+    pageElement.innerHTML = `<div class="empty-state">第 ${pageNumber} 页读取失败：${esc(error.message)}</div>`;
+  } finally {
+    pageElement.dataset.loading = "false";
+  }
+}
+
+async function openTaskPreview(taskId) {
+  const dialog = document.getElementById("task-preview-dialog");
+  try {
+    const detail = await api(`/api/tasks/${encodeURIComponent(taskId)}/preview`);
+    state.activeTaskPreviewId = taskId;
+    state.activeTaskPreview = detail;
+    clearPreviewObjectUrls();
+    document.getElementById("task-preview-title").textContent = detail.file_name || "任务结果预览";
+    document.getElementById("task-preview-meta").textContent = `${taskId} · ${statusText[detail.classification] || detail.classification || "已完成"}`;
+    document.getElementById("task-pdf-page-count").textContent = `${detail.original.page_count} 页`;
+    document.getElementById("task-preview-status").textContent = detail.failed_pages?.length ? `跳过/失败 ${detail.failed_pages.length} 页` : "完整结果";
+    const pageRoot = document.getElementById("task-original-pages");
+    pageRoot.innerHTML = Array.from({length: detail.original.page_count}, (_, index) => `<div class="task-pdf-page" data-page-number="${index + 1}"><div class="empty-state">第 ${index + 1} 页加载中...</div></div>`).join("");
+    const resultPreview = document.getElementById("task-result-preview");
+    resultPreview.innerHTML = `<div class="empty-state">正在读取 Markdown...</div>`;
+    const resultButton = document.getElementById("download-task-result");
+    resultButton.disabled = !detail.preview.archive_path;
+    if (!dialog.open) dialog.showModal();
+
+    state.taskPreviewObserver?.disconnect();
+    state.taskPreviewObserver = new IntersectionObserver(entries => {
+      for (const entry of entries) if (entry.isIntersecting) loadTaskPdfPage(taskId, entry.target);
+    }, {root: pageRoot, rootMargin: "900px 0px"});
+    pageRoot.querySelectorAll("[data-page-number]").forEach(element => state.taskPreviewObserver.observe(element));
+
+    if (detail.preview.markdown_path) {
+      const response = await authorizedFetch(artifactUrl(detail.run_id, "results", detail.preview.markdown_path));
+      if (state.activeTaskPreviewId === taskId) resultPreview.innerHTML = renderMarkdown(await response.text());
+    } else {
+      resultPreview.innerHTML = `<div class="empty-state">该任务没有生成 Markdown 结果</div>`;
+    }
+  } catch (error) { notice(error.message); }
+}
+
+function closeTaskPreview() {
+  const dialog = document.getElementById("task-preview-dialog");
+  state.taskPreviewObserver?.disconnect();
+  state.taskPreviewObserver = null;
+  state.activeTaskPreviewId = null;
+  state.activeTaskPreview = null;
+  clearPreviewObjectUrls();
+  if (dialog.open) dialog.close();
+}
+
+document.getElementById("close-task-preview").addEventListener("click", closeTaskPreview);
+document.getElementById("task-preview-dialog").addEventListener("close", closeTaskPreview);
+document.getElementById("download-task-original").addEventListener("click", async () => {
+  const detail = state.activeTaskPreview;
+  if (!detail) return;
+  try { await downloadPath(artifactUrl(detail.run_id, detail.original.kind || "input", detail.original.path), detail.original.name); }
+  catch (error) { notice(error.message); }
+});
+document.getElementById("download-task-result").addEventListener("click", async () => {
+  const detail = state.activeTaskPreview;
+  if (!detail?.preview?.archive_path) return;
+  try { await downloadPath(artifactUrl(detail.run_id, "results", detail.preview.archive_path), `${detail.file_name || "result"}-result.zip`); }
+  catch (error) { notice(error.message); }
+});
+
+let taskPreviewSyncFrame = false;
+function syncTaskPreviewScroll(source, target) {
+  if (!document.getElementById("task-preview-sync").checked || taskPreviewSyncFrame) return;
+  const sourceRange = source.scrollHeight - source.clientHeight;
+  const targetRange = target.scrollHeight - target.clientHeight;
+  if (sourceRange <= 0 || targetRange <= 0) return;
+  taskPreviewSyncFrame = true;
+  target.scrollTop = (source.scrollTop / sourceRange) * targetRange;
+  requestAnimationFrame(() => { taskPreviewSyncFrame = false; });
+}
+const taskPdfScroll = document.getElementById("task-original-pages");
+const taskMarkdownScroll = document.getElementById("task-result-preview");
+taskPdfScroll.addEventListener("scroll", () => syncTaskPreviewScroll(taskPdfScroll, taskMarkdownScroll));
+taskMarkdownScroll.addEventListener("scroll", () => syncTaskPreviewScroll(taskMarkdownScroll, taskPdfScroll));
 
 function updateLogServices() {
   const select = document.getElementById("log-service");
@@ -1019,7 +1015,7 @@ async function refreshCurrent() {
   try {
     if (state.view === "overview") await loadOverview();
     else if (state.view === "services") await loadServices();
-    else if (state.view === "tasks") await loadTasks();
+    else if (state.view === "tasks") await refreshTasksView();
     else if (state.view === "batch") await loadBatches();
     else if (state.view === "logs") {
       if (!state.services.length) await loadServices();
@@ -1034,13 +1030,13 @@ async function refreshCurrent() {
 }
 
 setInterval(() => {
-  if (["overview", "tasks", "batch"].includes(state.view)) refreshCurrent();
-  if (state.activeBatchId) refreshActiveBatchLog();
+  if (["overview", "services", "batch"].includes(state.view)) refreshCurrent();
+  if (state.activeBatchId) refreshActiveBatchDocument();
 }, 5000);
 setInterval(() => {
   if (state.view === "logs" && document.getElementById("log-live").checked) loadSelectedServiceLogs();
 }, 2000);
 setInterval(() => {
-  if (state.view === "tasks" && state.activeTaskId) loadTaskDetail(state.activeTaskId, {silent: true});
+  if (state.view === "tasks") refreshTasksView();
 }, 2000);
 refreshCurrent();

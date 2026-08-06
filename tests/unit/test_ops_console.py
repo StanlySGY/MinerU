@@ -6,7 +6,14 @@ import pytest
 import yaml
 from fastapi import HTTPException, UploadFile
 
-from mineru.cli.ops import BatchRunRequest, OpsRuntime, OpsStore, apply_service_runtime_health, create_app
+from mineru.cli.ops import (
+    BatchRunRequest,
+    OpsRuntime,
+    OpsStore,
+    apply_service_runtime_health,
+    build_smoke_test_pdf,
+    create_app,
+)
 
 
 def test_ops_store_persists_task_snapshots(tmp_path: Path):
@@ -70,6 +77,8 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "/api/health" in paths
     assert "/api/services" in paths
     assert "/api/tasks" in paths
+    assert "/api/tasks/{task_id}/preview" in paths
+    assert "/api/tasks/{task_id}/preview/pages/{page_number}" in paths
     assert "/api/batch-runs" in paths
     assert "/api/batch-runs/upload" in paths
     assert "/api/batch-runs/{run_id}/artifacts/{kind}/{artifact_path:path}" in paths
@@ -80,6 +89,9 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "MinerU 运维控制台" in dashboard_html
     assert "拖拽 PDF 文件或文件夹到这里" in dashboard_html
     assert "batch-detail-dialog" in dashboard_html
+    assert "task-preview-dialog" in dashboard_html
+    assert "同步滚动" in dashboard_html
+    assert "导出当前内容" in dashboard_html
     assert "log-live" in dashboard_html
     assert "log-follow" in dashboard_html
     assert "markdown-table-wrap" in dashboard_js
@@ -87,6 +99,8 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "当前处理位置" in dashboard_js
     assert "page-legend" in dashboard_js
     assert "loadTaskDetail(state.activeTaskId" in dashboard_js
+    assert "data-task-preview" in dashboard_js
+    assert "refreshTasksView" in dashboard_js
     assert "width: calc(100vw - 24px)" in dashboard_css
 
 
@@ -146,21 +160,24 @@ def test_batch_artifacts_list_originals_and_result_previews(tmp_path: Path, monk
     run_dir = runtime.report_dir / "run-1"
     input_pdf = run_dir / "input/folder/a.pdf"
     input_pdf.parent.mkdir(parents=True)
-    input_pdf.write_bytes(b"%PDF-preview")
+    input_pdf.write_bytes(build_smoke_test_pdf())
     result_dir = run_dir / "results/0001-a"
     result_dir.mkdir(parents=True)
     markdown_path = result_dir / "result.md"
     markdown_path.write_text("# result", encoding="utf-8")
     (result_dir / "preview.json").write_text(
-        '{"file_name":"a.pdf","relative_path":"folder/a.pdf","preview":{"markdown_path":"0001-a/result.md"}}',
+        '{"task_id":"task-preview","file_name":"a.pdf","relative_path":"folder/a.pdf",'
+        '"classification":"success","preview":{"markdown_path":"0001-a/result.md"}}',
         encoding="utf-8",
     )
-    record = {
-        "run_id": "run-1",
-        "report_path": str(run_dir / "BATCH_DIAGNOSIS.md"),
-        "log_path": str(run_dir / "batch.log"),
-        "settings": {"input_path": "browser upload", "pdf_count": 1},
-    }
+    record = runtime.store.create_batch_run(
+        "run-1",
+        run_dir / "input",
+        {"input_path": "browser upload", "pdf_count": 1},
+        run_dir / "BATCH_DIAGNOSIS.md",
+        run_dir / "raw",
+        run_dir / "batch.log",
+    )
 
     artifacts = runtime.batch_artifacts(record)
 
@@ -169,8 +186,14 @@ def test_batch_artifacts_list_originals_and_result_previews(tmp_path: Path, monk
     assert artifacts["previews"][0]["preview"]["markdown_path"] == "0001-a/result.md"
     assert runtime.resolve_artifact(record, "input", "folder/a.pdf") == input_pdf
     assert runtime.resolve_artifact(record, "results", "0001-a/result.md") == markdown_path
+    task_preview = runtime.task_preview_artifacts("task-preview")
+    assert task_preview["original"]["page_count"] == 1
+    assert task_preview["preview"]["markdown_path"] == "0001-a/result.md"
+    assert runtime.render_pdf_page(input_pdf, 1).startswith(b"BM")
     with pytest.raises(HTTPException):
         runtime.resolve_artifact(record, "input", "../outside.pdf")
+    with pytest.raises(HTTPException):
+        runtime.render_pdf_page(input_pdf, 2)
     asyncio.run(runtime.close())
 
 

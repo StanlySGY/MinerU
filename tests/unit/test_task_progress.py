@@ -35,6 +35,22 @@ def test_task_progress_tracks_concurrent_page_outcomes():
     assert snapshot["events"][-1]["type"] == "page_skipped"
 
 
+def test_task_progress_registers_total_pages_before_window_processing():
+    registry = TaskProgressRegistry()
+    registry.initialize("task-total", ["sample.pdf"])
+    registry.register_file_pages("task-total", "sample.pdf", 20)
+
+    initial = registry.snapshot("task-total")
+    registry.queue_pages("task-total", "sample.pdf", 0, 8)
+    first_window = registry.snapshot("task-total")
+
+    assert initial["total_pages"] == 20
+    assert initial["queued_pages"] == 20
+    assert first_window["total_pages"] == 20
+    assert first_window["queued_pages"] == 20
+    assert first_window["files"][0]["total_pages"] == 20
+
+
 def test_task_progress_is_best_effort_for_unknown_tasks():
     registry = TaskProgressRegistry()
 

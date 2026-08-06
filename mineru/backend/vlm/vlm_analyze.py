@@ -39,6 +39,7 @@ from ...utils.pdfium_guard import (
     get_pdfium_document_page_count,
     open_pdfium_document,
 )
+from ...utils.task_progress import task_progress_registry
 from ...utils.models_download_utils import auto_download_and_get_model_root_path
 
 from mineru_vl_utils import MinerUClient
@@ -561,6 +562,15 @@ async def aio_doc_analyze(
             f'VLM processing-window run. page_count={page_count}, '
             f'window_size={configured_window_size}, total_windows={total_windows}'
         )
+        if (
+            backend == "http-client"
+            and get_vlm_failure_policy(default="fail_fast") == "skip_page"
+        ):
+            task_progress_registry.register_file_pages(
+                task_id,
+                source_file_name,
+                page_count,
+            )
 
         infer_start = time.time()
         progress_bar = None

@@ -48,6 +48,46 @@ class TaskProgressRegistry:
             task["phase"] = phase
             self._append_event_locked(task_id, "task_phase_changed", phase=phase, **details)
 
+    def register_file_pages(
+        self,
+        task_id: str | None,
+        file_name: str | None,
+        page_count: int,
+    ) -> None:
+        if not task_id or page_count <= 0:
+            return
+        normalized_file_name = file_name or "unknown"
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return
+            file_state = task["files"].setdefault(
+                normalized_file_name,
+                {"file_name": normalized_file_name, "pages": {}},
+            )
+            file_state["total_pages"] = page_count
+            queued_at = _utc_now_iso()
+            queued_monotonic = time.monotonic()
+            for page_index in range(page_count):
+                page_number = page_index + 1
+                file_state["pages"].setdefault(
+                    str(page_number),
+                    {
+                        "page_idx": page_index,
+                        "page_number": page_number,
+                        "status": "queued",
+                        "queued_at": queued_at,
+                        "_queued_monotonic": queued_monotonic,
+                    },
+                )
+            task["phase"] = "vlm_queue"
+            self._append_event_locked(
+                task_id,
+                "file_pages_registered",
+                file_name=normalized_file_name,
+                page_count=page_count,
+            )
+
     def queue_pages(
         self,
         task_id: str | None,
@@ -73,20 +113,21 @@ class TaskProgressRegistry:
                     str(page_number),
                     {"page_idx": page_index, "page_number": page_number},
                 )
-                page.update(
-                    {
-                        "status": "queued",
-                        "queued_at": _utc_now_iso(),
-                        "_queued_monotonic": time.monotonic(),
-                    }
-                )
-                self._append_event_locked(
-                    task_id,
-                    "page_queued",
-                    file_name=normalized_file_name,
-                    page_idx=page_index,
-                    page_number=page_number,
-                )
+                if "status" not in page:
+                    page.update(
+                        {
+                            "status": "queued",
+                            "queued_at": _utc_now_iso(),
+                            "_queued_monotonic": time.monotonic(),
+                        }
+                    )
+                    self._append_event_locked(
+                        task_id,
+                        "page_queued",
+                        file_name=normalized_file_name,
+                        page_idx=page_index,
+                        page_number=page_number,
+                    )
             task["phase"] = "vlm_queue"
 
     def page_started(
@@ -182,7 +223,13 @@ class TaskProgressRegistry:
                     if status in totals:
                         totals[status] += 1
                 pages.sort(key=lambda item: int(item.get("page_number", 0)))
-                files.append({"file_name": file_state["file_name"], "pages": pages})
+                files.append(
+                    {
+                        "file_name": file_state["file_name"],
+                        "total_pages": int(file_state.get("total_pages", len(pages))),
+                        "pages": pages,
+                    }
+                )
             files.sort(key=lambda item: item["file_name"])
             total_pages = sum(totals.values())
             return {

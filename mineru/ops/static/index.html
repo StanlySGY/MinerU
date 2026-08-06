@@ -148,34 +148,39 @@
       <div><h2 id="batch-detail-title">批量任务详情</h2><p id="batch-detail-meta" class="muted"></p></div>
       <button id="close-batch-detail" type="button" class="secondary-button">关闭</button>
     </header>
-    <div class="dialog-actions actions">
-      <button type="button" class="secondary-button" data-dialog-export="markdown">诊断报告 Markdown</button>
-      <button type="button" class="secondary-button" data-dialog-export="process_markdown">过程日志 Markdown</button>
-      <button type="button" class="secondary-button" data-dialog-export="zip">完整诊断 ZIP</button>
+    <div class="dialog-actions document-toolbar">
+      <div class="segmented" id="batch-document-tabs">
+        <button type="button" data-batch-document="markdown">诊断报告</button>
+        <button type="button" data-batch-document="process_markdown">过程日志</button>
+      </div>
+      <div class="actions">
+        <button id="export-current-batch-document" type="button" class="secondary-button">导出当前内容</button>
+        <button type="button" class="secondary-button" data-dialog-export="zip">导出完整 ZIP</button>
+      </div>
     </div>
-    <div class="batch-preview-layout">
-      <aside>
-        <h3>任务文件</h3>
-        <div id="batch-detail-files" class="batch-file-list"></div>
-      </aside>
-      <section class="batch-preview-content">
-        <div id="batch-file-status" class="batch-file-status muted">请选择一个文件</div>
-        <div class="preview-grid">
-          <section class="preview-pane">
-            <div class="preview-heading"><h3>原始 PDF</h3><button id="download-original" type="button" class="text-button hidden">下载</button></div>
-            <iframe id="original-preview" title="原始 PDF 预览"></iframe>
-            <div id="original-preview-empty" class="empty-state">请选择左侧任务文件</div>
-          </section>
-          <section class="preview-pane">
-            <div class="preview-heading"><h3>提取结果</h3><button id="download-result" type="button" class="text-button hidden">下载结果 ZIP</button></div>
-            <div id="result-preview" class="markdown-preview"><div class="empty-state">请选择左侧任务文件</div></div>
-            <div id="result-images" class="result-images"></div>
-          </section>
-        </div>
-        <details class="process-log-panel">
-          <summary>查看本次任务过程日志</summary>
-          <pre id="batch-process-log" class="log-output">展开后读取过程日志。</pre>
-        </details>
+    <article id="batch-document-preview" class="markdown-preview batch-document-preview"><div class="empty-state">正在读取...</div></article>
+  </dialog>
+
+  <dialog id="task-preview-dialog" class="batch-dialog task-preview-dialog">
+    <header class="dialog-header">
+      <div><h2 id="task-preview-title">任务结果预览</h2><p id="task-preview-meta" class="muted"></p></div>
+      <button id="close-task-preview" type="button" class="secondary-button">关闭</button>
+    </header>
+    <div class="dialog-actions document-toolbar">
+      <label class="inline-check"><input id="task-preview-sync" type="checkbox" checked><span>同步滚动</span></label>
+      <div class="actions">
+        <button id="download-task-original" type="button" class="secondary-button">下载原始 PDF</button>
+        <button id="download-task-result" type="button" class="secondary-button">下载结果 ZIP</button>
+      </div>
+    </div>
+    <div class="task-compare-grid">
+      <section class="task-compare-pane">
+        <div class="preview-heading"><h3>原始 PDF</h3><span id="task-pdf-page-count" class="muted"></span></div>
+        <div id="task-original-pages" class="task-synced-scroll task-pdf-pages"></div>
+      </section>
+      <section class="task-compare-pane">
+        <div class="preview-heading"><h3>Markdown 提取结果</h3><span id="task-preview-status" class="muted"></span></div>
+        <article id="task-result-preview" class="markdown-preview task-synced-scroll"><div class="empty-state">正在读取...</div></article>
       </section>
     </div>
   </dialog>
