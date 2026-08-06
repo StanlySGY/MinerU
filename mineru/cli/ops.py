@@ -546,14 +546,26 @@ class OpsRuntime:
         run_dir = self.run_dir_for_record(record)
         originals = []
         input_root = run_dir / "input"
-        if input_root.is_dir():
-            for path in sorted(input_root.rglob("*")):
+        original_kind = "input"
+        original_root: Path | None = input_root if input_root.is_dir() else None
+        if original_root is None:
+            source_root: Path | None = Path(str(record.get("input_path") or "")).resolve()
+            try:
+                source_root.relative_to(self.test_root)
+            except ValueError:
+                source_root = None
+            if source_root is not None and source_root.is_dir():
+                original_root = source_root
+                original_kind = "source"
+        if original_root is not None:
+            for path in sorted(original_root.rglob("*")):
                 if path.is_file() and path.suffix.lower() == ".pdf":
                     originals.append(
                         {
-                            "path": path.relative_to(input_root).as_posix(),
+                            "path": path.relative_to(original_root).as_posix(),
                             "name": path.name,
                             "size_bytes": path.stat().st_size,
+                            "kind": original_kind,
                         }
                     )
         previews = []
@@ -576,6 +588,13 @@ class OpsRuntime:
     def resolve_artifact(self, record: dict[str, Any], kind: str, artifact_path: str) -> Path:
         run_dir = self.run_dir_for_record(record)
         roots = {"input": run_dir / "input", "results": run_dir / "results"}
+        if kind == "source":
+            source_root = Path(str(record.get("input_path") or "")).resolve()
+            try:
+                source_root.relative_to(self.test_root)
+            except ValueError as exc:
+                raise HTTPException(status_code=403, detail="source artifact path is outside the test root") from exc
+            roots["source"] = source_root
         root = roots.get(kind)
         if root is None:
             raise HTTPException(status_code=400, detail="unsupported artifact kind")
@@ -589,6 +608,7 @@ class OpsRuntime:
             raise HTTPException(status_code=404, detail="artifact not found")
         allowed_suffixes = {
             "input": {".pdf"},
+            "source": {".pdf"},
             "results": {".md", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".json", ".zip"},
         }
         if target.suffix.lower() not in allowed_suffixes[kind]:

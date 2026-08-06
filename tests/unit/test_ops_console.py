@@ -75,9 +75,13 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "/api/batch-runs/{run_id}/artifacts/{kind}/{artifact_path:path}" in paths
     assert "/" in paths
     dashboard_html = (static_dir / "index.html").read_text(encoding="utf-8")
+    dashboard_js = (static_dir / "ops.js").read_text(encoding="utf-8")
     assert "MinerU 运维控制台" in dashboard_html
     assert "拖拽 PDF 文件或文件夹到这里" in dashboard_html
     assert "batch-detail-dialog" in dashboard_html
+    assert "log-live" in dashboard_html
+    assert "log-follow" in dashboard_html
+    assert "markdown-table-wrap" in dashboard_js
 
 
 @pytest.mark.parametrize(
@@ -155,11 +159,44 @@ def test_batch_artifacts_list_originals_and_result_previews(tmp_path: Path, monk
     artifacts = runtime.batch_artifacts(record)
 
     assert artifacts["originals"][0]["path"] == "folder/a.pdf"
+    assert artifacts["originals"][0]["kind"] == "input"
     assert artifacts["previews"][0]["preview"]["markdown_path"] == "0001-a/result.md"
     assert runtime.resolve_artifact(record, "input", "folder/a.pdf") == input_pdf
     assert runtime.resolve_artifact(record, "results", "0001-a/result.md") == markdown_path
     with pytest.raises(HTTPException):
         runtime.resolve_artifact(record, "input", "../outside.pdf")
+    asyncio.run(runtime.close())
+
+
+def test_batch_artifacts_preview_server_directory_source_pdf(tmp_path: Path, monkeypatch) -> None:
+    test_root = tmp_path / "test-pdfs"
+    source_pdf = test_root / "folder/a.pdf"
+    source_pdf.parent.mkdir(parents=True)
+    source_pdf.write_bytes(b"%PDF-source-preview")
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(test_root))
+    runtime = OpsRuntime()
+    run_dir = runtime.report_dir / "run-source"
+    run_dir.mkdir(parents=True)
+    record = {
+        "run_id": "run-source",
+        "input_path": str(test_root),
+        "report_path": str(run_dir / "BATCH_DIAGNOSIS.md"),
+        "log_path": str(run_dir / "batch.log"),
+        "settings": {"input_path": ".", "source_type": "server_directory", "pdf_count": 1},
+    }
+
+    artifacts = runtime.batch_artifacts(record)
+
+    assert artifacts["originals"] == [
+        {
+            "path": "folder/a.pdf",
+            "name": "a.pdf",
+            "size_bytes": len(b"%PDF-source-preview"),
+            "kind": "source",
+        }
+    ]
+    assert runtime.resolve_artifact(record, "source", "folder/a.pdf") == source_pdf
     asyncio.run(runtime.close())
 
 

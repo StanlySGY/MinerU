@@ -130,12 +130,15 @@
       </section>
 
       <section id="view-logs" class="view">
-        <div class="toolbar">
+        <div class="toolbar log-toolbar">
           <select id="log-service"></select>
-          <select id="log-tail"><option value="200">200 行</option><option value="500">500 行</option><option value="1000">1000 行</option></select>
-          <button id="load-logs" class="secondary-button">读取日志</button>
+          <select id="log-tail"><option value="200">最近 200 行</option><option value="500">最近 500 行</option><option value="1000">最近 1000 行</option><option value="2000">最近 2000 行</option></select>
+          <label class="inline-check"><input id="log-live" type="checkbox" checked><span>动态刷新</span></label>
+          <label class="inline-check"><input id="log-follow" type="checkbox" checked><span>跟随最新</span></label>
+          <button id="load-logs" class="secondary-button">立即刷新</button>
+          <span id="log-status" class="log-status muted">请选择服务</span>
         </div>
-        <pre id="log-output" class="log-output">请选择服务。</pre>
+        <pre id="log-output" class="log-output service-log-output" tabindex="0">请选择服务。</pre>
       </section>
     </main>
   </div>
@@ -161,11 +164,11 @@
           <section class="preview-pane">
             <div class="preview-heading"><h3>原始 PDF</h3><button id="download-original" type="button" class="text-button hidden">下载</button></div>
             <iframe id="original-preview" title="原始 PDF 预览"></iframe>
-            <div id="original-preview-empty" class="empty-state">当前任务没有可预览的原始 PDF</div>
+            <div id="original-preview-empty" class="empty-state">请选择左侧任务文件</div>
           </section>
           <section class="preview-pane">
             <div class="preview-heading"><h3>提取结果</h3><button id="download-result" type="button" class="text-button hidden">下载结果 ZIP</button></div>
-            <div id="result-preview" class="markdown-preview"><div class="empty-state">提取结果尚未生成</div></div>
+            <div id="result-preview" class="markdown-preview"><div class="empty-state">请选择左侧任务文件</div></div>
             <div id="result-images" class="result-images"></div>
           </section>
         </div>

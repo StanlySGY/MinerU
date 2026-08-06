@@ -197,7 +197,14 @@ class Agent:
         if service not in self.configured_services():
             return {"ok": False, "error": "service is not part of the configured Compose project"}
         result = run_command(
-            self.compose_command("logs", "--no-color", "--tail", str(max(20, min(tail, 2000))), service),
+            self.compose_command(
+                "logs",
+                "--no-color",
+                "--timestamps",
+                "--tail",
+                str(max(20, min(tail, 2000))),
+                service,
+            ),
             self.project_dir,
             timeout=30,
         )
