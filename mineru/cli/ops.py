@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import io
 import json
 import os
 import re
@@ -15,6 +17,7 @@ import struct
 import time
 import uuid
 import zipfile
+import zlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
@@ -328,6 +331,8 @@ class OpsRuntime:
         self.upload_dir.mkdir(parents=True, exist_ok=True)
         self.temp_dir = self.data_dir / "tmp"
         self.temp_dir.mkdir(parents=True, exist_ok=True)
+        self.preview_cache_dir = self.data_dir / "preview-cache"
+        self.preview_cache_dir.mkdir(parents=True, exist_ok=True)
         self.store = OpsStore(self.data_dir / "ops.db")
         self.compose_config_path = Path(os.getenv("MINERU_OPS_COMPOSE_CONFIG", "/config/compose-config.yaml"))
         self.test_root = Path(os.getenv("MINERU_OPS_TEST_ROOT", DEFAULT_TEST_ROOT)).resolve()
@@ -343,6 +348,7 @@ class OpsRuntime:
         self.batch_processes: dict[str, asyncio.subprocess.Process] = {}
         self.batch_task_sync_lock = asyncio.Lock()
         self.last_batch_task_sync_monotonic = 0.0
+        self.retained_preview_task_ids: set[str] = set()
         self.smoke_backend = os.getenv("MINERU_OPS_SMOKE_BACKEND", "vlm-http-client")
         self.smoke_timeout = max(
             60,
@@ -487,7 +493,7 @@ class OpsRuntime:
         return total
 
     def artifact_storage_bytes(self) -> int:
-        total = self.directory_size(self.upload_dir)
+        total = self.directory_size(self.upload_dir) + self.directory_size(self.preview_cache_dir)
         for run_dir in self.report_dir.iterdir():
             if not run_dir.is_dir():
                 continue
@@ -514,6 +520,14 @@ class OpsRuntime:
                 continue
             if age_seconds > 86400:
                 shutil.rmtree(upload_path, ignore_errors=True)
+        cache_retention_seconds = max(86400, self.artifact_retention_days * 86400)
+        for cache_path in self.preview_cache_dir.iterdir():
+            try:
+                age_seconds = now.timestamp() - cache_path.stat().st_mtime
+            except OSError:
+                continue
+            if age_seconds > cache_retention_seconds:
+                shutil.rmtree(cache_path, ignore_errors=True)
         if self.artifact_retention_days <= 0:
             return
         retention_seconds = self.artifact_retention_days * 86400
@@ -621,6 +635,13 @@ class OpsRuntime:
                 str(original.get("kind") or "input"),
                 str(original["path"]),
             )
+            try:
+                page_count = self.pdf_page_count(original_path)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"原始 PDF 无法读取，不能生成预览：{type(exc).__name__}: {exc}",
+                ) from exc
             return {
                 "task_id": task_id,
                 "run_id": record["run_id"],
@@ -630,7 +651,7 @@ class OpsRuntime:
                 "failed_pages": preview.get("failed_pages") or [],
                 "original": {
                     **original,
-                    "page_count": self.pdf_page_count(original_path),
+                    "page_count": page_count,
                 },
                 "preview": preview.get("preview") or {},
             }
@@ -764,6 +785,7 @@ class OpsRuntime:
             if item.get("task_id")
         }
         snapshots = []
+        retained_preview_task_ids: set[str] = set()
         terminal_statuses = {"completed", "failed", "cancelled", "client_error"}
         for record in self.store.list_batch_runs(limit=10000):
             artifacts = self.batch_artifacts(record)
@@ -771,6 +793,7 @@ class OpsRuntime:
                 task_id = str(preview.get("task_id") or "")
                 if not task_id:
                     continue
+                retained_preview_task_ids.add(task_id)
                 cached = cached_by_id.get(task_id)
                 if cached and str(cached.get("status")) in terminal_statuses:
                     continue
@@ -808,9 +831,11 @@ class OpsRuntime:
                     "progress": progress,
                     "source_batch_run_id": record.get("run_id"),
                     "source": "batch_history",
+                    "preview_available": True,
                 }
                 snapshots.append(snapshot)
                 cached_by_id[task_id] = snapshot
+        self.retained_preview_task_ids = retained_preview_task_ids
         return snapshots
 
     async def sync_batch_task_snapshots(self, *, force: bool = False) -> None:
@@ -834,7 +859,84 @@ class OpsRuntime:
             document.close()
 
     @staticmethod
-    def render_pdf_page(path: Path, page_number: int) -> bytes:
+    def _bitmap_to_bmp(bitmap: Any) -> bytes:
+        if bitmap.mode not in {"BGR", "BGRA", "BGRX"}:
+            raise HTTPException(
+                status_code=500,
+                detail=f"unsupported PDF bitmap mode: {bitmap.mode}",
+            )
+        bits_per_pixel = bitmap.n_channels * 8
+        source = bytes(bitmap.buffer)
+        source_row_bytes = bitmap.width * bitmap.n_channels
+        target_stride = (source_row_bytes + 3) & ~3
+        if bitmap.stride == target_stride:
+            pixels = source
+        else:
+            padding = b"\0" * (target_stride - source_row_bytes)
+            pixels = b"".join(
+                source[row * bitmap.stride : row * bitmap.stride + source_row_bytes] + padding
+                for row in range(bitmap.height)
+            )
+        image_size = target_stride * bitmap.height
+        pixel_offset = 14 + 40
+        file_header = struct.pack(
+            "<2sIHHI",
+            b"BM",
+            pixel_offset + image_size,
+            0,
+            0,
+            pixel_offset,
+        )
+        dib_header = struct.pack(
+            "<IiiHHIIiiII",
+            40,
+            bitmap.width,
+            -bitmap.height,
+            1,
+            bits_per_pixel,
+            0,
+            image_size,
+            2835,
+            2835,
+            0,
+            0,
+        )
+        return file_header + dib_header + pixels
+
+    @staticmethod
+    def _png_chunk(chunk_type: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload))
+            + chunk_type
+            + payload
+            + struct.pack(">I", zlib.crc32(chunk_type + payload) & 0xFFFFFFFF)
+        )
+
+    @classmethod
+    def _bitmap_to_png(cls, bitmap: Any) -> bytes:
+        pixels = bitmap.to_numpy()
+        if bitmap.mode == "BGR":
+            pixels = pixels[:, :, [2, 1, 0]]
+            color_type = 2
+        elif bitmap.mode == "BGRA":
+            pixels = pixels[:, :, [2, 1, 0, 3]]
+            color_type = 6
+        elif bitmap.mode == "BGRX":
+            pixels = pixels[:, :, [2, 1, 0]]
+            color_type = 2
+        else:
+            raise ValueError(f"unsupported PDF bitmap mode: {bitmap.mode}")
+        scanlines = b"".join(b"\0" + row.tobytes() for row in pixels)
+        header = struct.pack(">IIBBBBB", bitmap.width, bitmap.height, 8, color_type, 0, 0, 0)
+        return (
+            b"\x89PNG\r\n\x1a\n"
+            + cls._png_chunk(b"IHDR", header)
+            + cls._png_chunk(b"IDAT", zlib.compress(scanlines, level=4))
+            + cls._png_chunk(b"IEND", b"")
+        )
+
+    @classmethod
+    def render_pdf_page(cls, path: Path, page_number: int) -> tuple[bytes, str, str]:
         import pypdfium2 as pdfium
 
         document = pdfium.PdfDocument(str(path))
@@ -843,45 +945,60 @@ class OpsRuntime:
                 raise HTTPException(status_code=404, detail="PDF page not found")
             page = document[page_number - 1]
             try:
-                bitmap = page.render(scale=1.5)
+                bitmap = page.render(scale=1.25)
                 try:
-                    if bitmap.mode not in {"BGR", "BGRA", "BGRX"}:
-                        raise HTTPException(
-                            status_code=500,
-                            detail=f"unsupported PDF bitmap mode: {bitmap.mode}",
+                    try:
+                        image = bitmap.to_pil()
+                    except (ImportError, ModuleNotFoundError):
+                        try:
+                            return cls._bitmap_to_png(bitmap), "image/png", ".png"
+                        except (ImportError, ModuleNotFoundError):
+                            return cls._bitmap_to_bmp(bitmap), "image/bmp", ".bmp"
+                    output = io.BytesIO()
+                    rgb_image = image.convert("RGB")
+                    try:
+                        rgb_image.save(
+                            output,
+                            format="JPEG",
+                            quality=82,
+                            progressive=True,
                         )
-                    bits_per_pixel = bitmap.n_channels * 8
-                    image_size = bitmap.stride * bitmap.height
-                    pixel_offset = 14 + 40
-                    file_header = struct.pack(
-                        "<2sIHHI",
-                        b"BM",
-                        pixel_offset + image_size,
-                        0,
-                        0,
-                        pixel_offset,
-                    )
-                    dib_header = struct.pack(
-                        "<IiiHHIIiiII",
-                        40,
-                        bitmap.width,
-                        -bitmap.height,
-                        1,
-                        bits_per_pixel,
-                        0,
-                        image_size,
-                        2835,
-                        2835,
-                        0,
-                        0,
-                    )
-                    return file_header + dib_header + bytes(bitmap.buffer)
+                    finally:
+                        if rgb_image is not image:
+                            rgb_image.close()
+                        image.close()
+                    return output.getvalue(), "image/jpeg", ".jpg"
                 finally:
                     bitmap.close()
             finally:
                 page.close()
         finally:
             document.close()
+
+    def render_pdf_page_cached(self, path: Path, page_number: int) -> tuple[bytes, str]:
+        try:
+            stat = path.stat()
+        except OSError as exc:
+            raise HTTPException(status_code=404, detail="original PDF is unavailable") from exc
+        cache_key = hashlib.sha256(
+            (
+                f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:preview-v3"
+            ).encode("utf-8")
+        ).hexdigest()
+        cache_dir = self.preview_cache_dir / cache_key
+        media_types = {".jpg": "image/jpeg", ".png": "image/png", ".bmp": "image/bmp"}
+        for suffix, media_type in media_types.items():
+            cache_path = cache_dir / f"page-{page_number:05d}{suffix}"
+            if cache_path.is_file():
+                return cache_path.read_bytes(), media_type
+
+        content, media_type, suffix = self.render_pdf_page(path, page_number)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = cache_dir / f"page-{page_number:05d}{suffix}"
+        temporary_path = cache_path.with_suffix(f"{suffix}.tmp")
+        temporary_path.write_bytes(content)
+        temporary_path.replace(cache_path)
+        return content, media_type
 
     def resolve_artifact(self, record: dict[str, Any], kind: str, artifact_path: str) -> Path:
         run_dir = self.run_dir_for_record(record)
@@ -1433,7 +1550,11 @@ def create_app() -> FastAPI:
         authorize(request)
         normalized_limit = min(max(limit, 1), 500)
         normalized_offset = max(offset, 0)
-        await runtime.sync_batch_task_snapshots()
+        try:
+            await runtime.sync_batch_task_snapshots()
+        except Exception:
+            # Historical task recovery is best-effort; live Router tasks must remain visible.
+            pass
         live_items: list[dict[str, Any]] = []
         live_error: Exception | None = None
         try:
@@ -1462,6 +1583,10 @@ def create_app() -> FastAPI:
         for item in live_items:
             merged[str(item["task_id"])] = item
         items = list(merged.values())
+        for item in items:
+            item["preview_available"] = (
+                str(item.get("task_id") or "") in runtime.retained_preview_task_ids
+            )
         if status:
             items = [item for item in items if str(item.get("status")) == status]
         items.sort(
@@ -1494,6 +1619,7 @@ def create_app() -> FastAPI:
             "failed",
         }:
             cached["source"] = "batch_history"
+            cached["preview_available"] = task_id in runtime.retained_preview_task_ids
             return cached
         try:
             response = await runtime.http_client.get(f"{runtime.router_url}/tasks/{task_id}")
@@ -1503,22 +1629,35 @@ def create_app() -> FastAPI:
                 raise ValueError("router task payload is not an object")
             runtime.store.upsert_tasks([payload])
             payload["source"] = "live"
+            payload["preview_available"] = task_id in runtime.retained_preview_task_ids
             return payload
         except Exception as exc:
             cached = runtime.store.cached_task(task_id)
             if cached is None:
-                await runtime.sync_batch_task_snapshots(force=True)
+                try:
+                    await runtime.sync_batch_task_snapshots(force=True)
+                except Exception:
+                    pass
                 cached = runtime.store.cached_task(task_id)
             if cached is None:
                 raise HTTPException(status_code=404, detail=f"task unavailable: {exc}") from exc
             cached["source"] = "cache"
             cached["cache_error"] = str(exc)
+            cached["preview_available"] = task_id in runtime.retained_preview_task_ids
             return cached
 
     @app.get("/api/tasks/{task_id}/preview")
     async def task_preview(task_id: str, request: Request):
         authorize(request)
-        return runtime.task_preview_artifacts(task_id)
+        try:
+            return runtime.task_preview_artifacts(task_id)
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                raise HTTPException(
+                    status_code=404,
+                    detail="该任务没有保留原始 PDF 或提取产物，无法进行对照预览",
+                ) from exc
+            raise
 
     @app.get("/api/tasks/{task_id}/preview/pages/{page_number}")
     async def task_preview_page(
@@ -1537,8 +1676,12 @@ def create_app() -> FastAPI:
             str(original.get("kind") or "input"),
             str(original["path"]),
         )
-        content = await asyncio.to_thread(runtime.render_pdf_page, path, page_number)
-        return Response(content=content, media_type="image/bmp")
+        content, media_type = runtime.render_pdf_page_cached(path, page_number)
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={"Cache-Control": "private, max-age=86400"},
+        )
 
     @app.get("/api/tasks/{task_id}/events")
     async def task_events(task_id: str, request: Request):

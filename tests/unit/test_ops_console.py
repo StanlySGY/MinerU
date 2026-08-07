@@ -1,4 +1,5 @@
 import asyncio
+import struct
 from pathlib import Path
 from tempfile import SpooledTemporaryFile
 
@@ -100,6 +101,7 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "page-legend" in dashboard_js
     assert "loadTaskDetail(state.activeTaskId" in dashboard_js
     assert "data-task-preview" in dashboard_js
+    assert "task.preview_available" in dashboard_js
     assert "refreshTasksView" in dashboard_js
     assert "width: calc(100vw - 24px)" in dashboard_css
 
@@ -190,7 +192,13 @@ def test_batch_artifacts_list_originals_and_result_previews(tmp_path: Path, monk
     task_preview = runtime.task_preview_artifacts("task-preview")
     assert task_preview["original"]["page_count"] == 1
     assert task_preview["preview"]["markdown_path"] == "0001-a/result.md"
-    assert runtime.render_pdf_page(input_pdf, 1).startswith(b"BM")
+    page_content, page_media_type, page_suffix = runtime.render_pdf_page(input_pdf, 1)
+    assert page_media_type in {"image/jpeg", "image/png", "image/bmp"}
+    assert page_suffix in {".jpg", ".png", ".bmp"}
+    assert page_content.startswith((b"\xff\xd8", b"\x89PNG\r\n\x1a\n", b"BM"))
+    cached_content, cached_media_type = runtime.render_pdf_page_cached(input_pdf, 1)
+    assert cached_content == page_content
+    assert cached_media_type == page_media_type
     asyncio.run(runtime.sync_batch_task_snapshots(force=True))
     task_snapshot = runtime.store.cached_task("task-preview")
     assert task_snapshot is not None
@@ -199,11 +207,30 @@ def test_batch_artifacts_list_originals_and_result_previews(tmp_path: Path, monk
     assert task_snapshot["progress"]["total_pages"] == 1
     assert task_snapshot["progress"]["completed_pages"] == 1
     assert task_snapshot["source_batch_run_id"] == "run-1"
+    assert task_snapshot["preview_available"] is True
     with pytest.raises(HTTPException):
         runtime.resolve_artifact(record, "input", "../outside.pdf")
     with pytest.raises(HTTPException):
         runtime.render_pdf_page(input_pdf, 2)
     asyncio.run(runtime.close())
+
+
+def test_pdf_preview_bmp_fallback_pads_each_scanline() -> None:
+    class Bitmap:
+        mode = "BGR"
+        width = 3
+        height = 2
+        n_channels = 3
+        stride = 9
+        buffer = bytes(range(18))
+
+    content = OpsRuntime._bitmap_to_bmp(Bitmap())
+
+    assert content.startswith(b"BM")
+    assert len(content) == 54 + 24
+    assert struct.unpack_from("<i", content, 22)[0] == -2
+    assert content[54 + 9 : 54 + 12] == b"\0\0\0"
+    assert content[54 + 21 : 54 + 24] == b"\0\0\0"
 
 
 def test_batch_artifacts_preview_server_directory_source_pdf(tmp_path: Path, monkeypatch) -> None:

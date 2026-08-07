@@ -13,6 +13,9 @@ const state = {
   activeTaskPreviewId: null,
   activeTaskPreview: null,
   taskPreviewObserver: null,
+  taskPreviewGeneration: 0,
+  taskPreviewPageQueue: [],
+  taskPreviewPageActive: 0,
   previewObjectUrls: [],
   serviceFilter: "all",
   logRequestId: 0,
@@ -174,8 +177,11 @@ function formatElapsed(startValue, endValue = null) {
 
 function taskPreviewReady(task) {
   return Boolean(
-    task.partial_success
-    || ["completed", "completed_with_failures", "partial_success"].includes(task.status),
+    task.preview_available
+    && (
+      task.partial_success
+      || ["completed", "completed_with_failures", "partial_success"].includes(task.status)
+    ),
   );
 }
 
@@ -346,10 +352,14 @@ async function loadTaskDetail(taskId, {silent = false} = {}) {
     const pages = (p.files || []).flatMap(file => (file.pages || []).map(page => ({...page, file_name: file.file_name})));
     const current = currentTaskPosition(task, p, pages);
     const previewReady = taskPreviewReady(task);
+    const taskFinished = task.partial_success || ["completed", "completed_with_failures", "partial_success"].includes(task.status);
+    const previewAction = previewReady
+      ? `<button type="button" class="primary-button" data-task-preview="${esc(task.task_id)}">预览结果</button>`
+      : (taskFinished ? `<span class="task-preview-unavailable" title="该任务没有保留原始 PDF 或提取产物">未保留预览产物</span>` : "");
     const elapsed = formatElapsed(task.started_at || task.created_at, task.completed_at);
     const fileSections = (p.files || []).map(file => `<section class="task-file-pages"><div class="task-file-heading"><strong>${esc(file.file_name)}</strong><span>${(file.pages || []).length} 页</span></div><div class="page-list">${(file.pages || []).map(page => `<span class="page-chip ${esc(page.status || "queued")}" title="${esc(pageTitle(page, file.file_name))}">${page.page_number}</span>`).join("")}</div></section>`).join("");
     const problemPages = pages.filter(page => page.status === "skipped" || page.status === "failed");
-    document.getElementById("task-detail").innerHTML = `<div class="task-detail-header"><div><h2>${esc((task.file_names || []).join(", "))}</h2><div class="mono muted">${esc(task.task_id)}</div></div><div class="task-detail-actions">${badge(task.partial_success ? "partial_success" : task.status)}${previewReady ? `<button type="button" class="primary-button" data-task-preview="${esc(task.task_id)}">预览结果</button>` : ""}</div></div><div class="task-live-position ${current.kind}"><span class="live-indicator"></span><div><small>当前处理位置</small><strong>${esc(current.title)}</strong><p>${esc(current.detail)}</p></div><time>${esc(formatDate(p.updated_at))}</time></div><div class="task-progress-row"><div class="progress"><span style="width:${percent}%"></span></div><strong>${percent}%</strong></div><div class="task-stat-grid"><div><span>总页数</span><strong>${p.total_pages || 0}</strong></div><div><span>已完成</span><strong>${p.completed_pages || 0}</strong></div><div><span>处理中</span><strong>${p.processing_pages || 0}</strong></div><div><span>等待中</span><strong>${p.queued_pages || 0}</strong></div><div><span>已跳过</span><strong>${p.skipped_pages || 0}</strong></div><div><span>失败</span><strong>${p.failed_pages || 0}</strong></div></div><div class="task-meta-line"><span>阶段：<strong>${esc(phaseText[p.phase] || p.phase || "-")}</strong></span><span>后端：<strong>${esc(task.backend || "-")}</strong></span><span>耗时：<strong class="task-elapsed">${esc(elapsed)}</strong></span>${task.error ? `<span class="bad-text">任务错误：${esc(task.error)}</span>` : ""}</div><div class="task-pages-heading"><h3>页面状态</h3><span>${pages.length} 个页面事件</span></div>${pageLegend()}<div class="task-file-page-list">${fileSections || `<div class="empty-state">尚未收到页级进度，任务启动后会自动显示</div>`}</div>${problemPages.length ? `<div class="task-problem-list"><h3>跳过和失败页面</h3>${problemPages.map(page => `<div class="task-problem-row"><strong>${esc(page.file_name)} 第 ${page.page_number} 页</strong>${badge(page.status)}<span>${esc(page.error_type || "")}</span><p>${esc(page.error || "未返回错误详情")}</p></div>`).join("")}</div>` : ""}`;
+    document.getElementById("task-detail").innerHTML = `<div class="task-detail-header"><div><h2>${esc((task.file_names || []).join(", "))}</h2><div class="mono muted">${esc(task.task_id)}</div></div><div class="task-detail-actions">${badge(task.partial_success ? "partial_success" : task.status)}${previewAction}</div></div><div class="task-live-position ${current.kind}"><span class="live-indicator"></span><div><small>当前处理位置</small><strong>${esc(current.title)}</strong><p>${esc(current.detail)}</p></div><time>${esc(formatDate(p.updated_at))}</time></div><div class="task-progress-row"><div class="progress"><span style="width:${percent}%"></span></div><strong>${percent}%</strong></div><div class="task-stat-grid"><div><span>总页数</span><strong>${p.total_pages || 0}</strong></div><div><span>已完成</span><strong>${p.completed_pages || 0}</strong></div><div><span>处理中</span><strong>${p.processing_pages || 0}</strong></div><div><span>等待中</span><strong>${p.queued_pages || 0}</strong></div><div><span>已跳过</span><strong>${p.skipped_pages || 0}</strong></div><div><span>失败</span><strong>${p.failed_pages || 0}</strong></div></div><div class="task-meta-line"><span>阶段：<strong>${esc(phaseText[p.phase] || p.phase || "-")}</strong></span><span>后端：<strong>${esc(task.backend || "-")}</strong></span><span>耗时：<strong class="task-elapsed">${esc(elapsed)}</strong></span>${task.error ? `<span class="bad-text">任务错误：${esc(task.error)}</span>` : ""}</div><div class="task-pages-heading"><h3>页面状态</h3><span>${pages.length} 个页面事件</span></div>${pageLegend()}<div class="task-file-page-list">${fileSections || `<div class="empty-state">尚未收到页级进度，任务启动后会自动显示</div>`}</div>${problemPages.length ? `<div class="task-problem-list"><h3>跳过和失败页面</h3>${problemPages.map(page => `<div class="task-problem-row"><strong>${esc(page.file_name)} 第 ${page.page_number} 页</strong>${badge(page.status)}<span>${esc(page.error_type || "")}</span><p>${esc(page.error || "未返回错误详情")}</p></div>`).join("")}</div>` : ""}`;
   } catch (error) {
     if (!silent) notice(error.message);
   }
@@ -857,14 +867,14 @@ async function refreshActiveBatchDocument() {
   } catch {}
 }
 
-async function loadTaskPdfPage(taskId, pageElement) {
+async function loadTaskPdfPage(taskId, pageElement, generation) {
   if (pageElement.dataset.loaded === "true" || pageElement.dataset.loading === "true") return;
   pageElement.dataset.loading = "true";
   const pageNumber = Number(pageElement.dataset.pageNumber);
   try {
     const response = await authorizedFetch(`/api/tasks/${encodeURIComponent(taskId)}/preview/pages/${pageNumber}`);
     const blob = await response.blob();
-    if (state.activeTaskPreviewId !== taskId) return;
+    if (state.activeTaskPreviewId !== taskId || state.taskPreviewGeneration !== generation) return;
     const url = URL.createObjectURL(blob);
     state.previewObjectUrls.push(url);
     pageElement.innerHTML = `<img src="${url}" alt="第 ${pageNumber} 页"><span>第 ${pageNumber} 页</span>`;
@@ -876,10 +886,38 @@ async function loadTaskPdfPage(taskId, pageElement) {
   }
 }
 
+function drainTaskPdfPageQueue() {
+  while (state.taskPreviewPageActive < 2 && state.taskPreviewPageQueue.length) {
+    const item = state.taskPreviewPageQueue.shift();
+    item.pageElement.dataset.queued = "false";
+    if (
+      item.generation !== state.taskPreviewGeneration
+      || item.taskId !== state.activeTaskPreviewId
+    ) continue;
+    state.taskPreviewPageActive += 1;
+    loadTaskPdfPage(item.taskId, item.pageElement, item.generation).finally(() => {
+      state.taskPreviewPageActive -= 1;
+      drainTaskPdfPageQueue();
+    });
+  }
+}
+
+function queueTaskPdfPage(taskId, pageElement, generation) {
+  if (
+    pageElement.dataset.loaded === "true"
+    || pageElement.dataset.loading === "true"
+    || pageElement.dataset.queued === "true"
+  ) return;
+  pageElement.dataset.queued = "true";
+  state.taskPreviewPageQueue.push({taskId, pageElement, generation});
+  drainTaskPdfPageQueue();
+}
+
 async function openTaskPreview(taskId) {
   const dialog = document.getElementById("task-preview-dialog");
   try {
     const detail = await api(`/api/tasks/${encodeURIComponent(taskId)}/preview`);
+    const generation = ++state.taskPreviewGeneration;
     state.activeTaskPreviewId = taskId;
     state.activeTaskPreview = detail;
     clearPreviewObjectUrls();
@@ -897,8 +935,8 @@ async function openTaskPreview(taskId) {
 
     state.taskPreviewObserver?.disconnect();
     state.taskPreviewObserver = new IntersectionObserver(entries => {
-      for (const entry of entries) if (entry.isIntersecting) loadTaskPdfPage(taskId, entry.target);
-    }, {root: pageRoot, rootMargin: "900px 0px"});
+      for (const entry of entries) if (entry.isIntersecting) queueTaskPdfPage(taskId, entry.target, generation);
+    }, {root: pageRoot, rootMargin: "300px 0px"});
     pageRoot.querySelectorAll("[data-page-number]").forEach(element => state.taskPreviewObserver.observe(element));
 
     if (detail.preview.markdown_path) {
@@ -914,6 +952,8 @@ function closeTaskPreview() {
   const dialog = document.getElementById("task-preview-dialog");
   state.taskPreviewObserver?.disconnect();
   state.taskPreviewObserver = null;
+  state.taskPreviewGeneration += 1;
+  state.taskPreviewPageQueue = [];
   state.activeTaskPreviewId = null;
   state.activeTaskPreview = null;
   clearPreviewObjectUrls();

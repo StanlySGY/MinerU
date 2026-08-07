@@ -113,6 +113,7 @@ tbody tr[data-task].selected { background: #edf7f3; box-shadow: inset 3px 0 0 va
 .task-detail-header .mono { margin-top: 6px; }
 .task-detail-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
 .task-detail-actions .primary-button { white-space: nowrap; }
+.task-preview-unavailable { max-width: 150px; color: var(--muted); font-size: 12px; line-height: 1.35; text-align: right; }
 .task-elapsed { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .task-live-position { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 11px; align-items: center; margin: 14px 0; padding: 13px 14px; border: 1px solid var(--line); border-left: 4px solid #7b858a; background: #f8fafa; }
 .task-live-position.processing { border-left-color: #1673a3; background: #f0f8fc; }
