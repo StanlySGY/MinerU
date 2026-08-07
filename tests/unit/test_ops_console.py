@@ -167,7 +167,8 @@ def test_batch_artifacts_list_originals_and_result_previews(tmp_path: Path, monk
     markdown_path.write_text("# result", encoding="utf-8")
     (result_dir / "preview.json").write_text(
         '{"task_id":"task-preview","file_name":"a.pdf","relative_path":"folder/a.pdf",'
-        '"classification":"success","preview":{"markdown_path":"0001-a/result.md"}}',
+        '"task_status":"completed","classification":"success","elapsed_seconds":12.5,'
+        '"preview":{"markdown_path":"0001-a/result.md"}}',
         encoding="utf-8",
     )
     record = runtime.store.create_batch_run(
@@ -190,6 +191,14 @@ def test_batch_artifacts_list_originals_and_result_previews(tmp_path: Path, monk
     assert task_preview["original"]["page_count"] == 1
     assert task_preview["preview"]["markdown_path"] == "0001-a/result.md"
     assert runtime.render_pdf_page(input_pdf, 1).startswith(b"BM")
+    asyncio.run(runtime.sync_batch_task_snapshots(force=True))
+    task_snapshot = runtime.store.cached_task("task-preview")
+    assert task_snapshot is not None
+    assert task_snapshot["status"] == "completed"
+    assert task_snapshot["file_names"] == ["a.pdf"]
+    assert task_snapshot["progress"]["total_pages"] == 1
+    assert task_snapshot["progress"]["completed_pages"] == 1
+    assert task_snapshot["source_batch_run_id"] == "run-1"
     with pytest.raises(HTTPException):
         runtime.resolve_artifact(record, "input", "../outside.pdf")
     with pytest.raises(HTTPException):

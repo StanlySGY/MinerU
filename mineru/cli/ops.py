@@ -12,10 +12,11 @@ import shutil
 import signal
 import sqlite3
 import struct
+import time
 import uuid
 import zipfile
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -340,6 +341,8 @@ class OpsRuntime:
             )
         )
         self.batch_processes: dict[str, asyncio.subprocess.Process] = {}
+        self.batch_task_sync_lock = asyncio.Lock()
+        self.last_batch_task_sync_monotonic = 0.0
         self.smoke_backend = os.getenv("MINERU_OPS_SMOKE_BACKEND", "vlm-http-client")
         self.smoke_timeout = max(
             60,
@@ -635,6 +638,190 @@ class OpsRuntime:
             status_code=404,
             detail="preview is only available for completed tasks with retained batch artifacts",
         )
+
+    @staticmethod
+    def _task_timestamp_from_elapsed(
+        completed_at: str | None,
+        elapsed_seconds: Any,
+    ) -> str | None:
+        if not completed_at:
+            return None
+        try:
+            elapsed = max(0.0, float(elapsed_seconds))
+            completed = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        return (completed - timedelta(seconds=elapsed)).isoformat()
+
+    @staticmethod
+    def _failed_page_number(page: dict[str, Any]) -> int | None:
+        raw_page_number = page.get("page_number")
+        if raw_page_number is None and page.get("page_idx") is not None:
+            try:
+                raw_page_number = int(page["page_idx"]) + 1
+            except (TypeError, ValueError):
+                return None
+        try:
+            page_number = int(raw_page_number)
+        except (TypeError, ValueError):
+            return None
+        return page_number if page_number > 0 else None
+
+    def _fallback_batch_progress(
+        self,
+        record: dict[str, Any],
+        preview: dict[str, Any],
+        artifacts: dict[str, Any],
+    ) -> dict[str, Any]:
+        relative_path = str(preview.get("relative_path") or preview.get("file_name") or "")
+        original = next(
+            (
+                item
+                for item in artifacts["originals"]
+                if str(item.get("path") or "") == relative_path
+            ),
+            None,
+        )
+        page_count = 0
+        if original is not None:
+            try:
+                original_path = self.resolve_artifact(
+                    record,
+                    str(original.get("kind") or "input"),
+                    str(original["path"]),
+                )
+                page_count = self.pdf_page_count(original_path)
+            except Exception:
+                page_count = 0
+
+        failed_by_number: dict[int, dict[str, Any]] = {}
+        for page in preview.get("failed_pages") or []:
+            if not isinstance(page, dict):
+                continue
+            page_number = self._failed_page_number(page)
+            if page_number is not None:
+                failed_by_number[page_number] = page
+        if failed_by_number:
+            page_count = max(page_count, max(failed_by_number))
+
+        task_status = str(preview.get("task_status") or "unknown")
+        pages = []
+        totals = {"completed": 0, "skipped": 0, "failed": 0}
+        for page_number in range(1, page_count + 1):
+            failure = failed_by_number.get(page_number)
+            if failure is not None:
+                raw_status = str(failure.get("status") or "skipped")
+                status = raw_status if raw_status in {"skipped", "failed"} else "skipped"
+                page = {
+                    **failure,
+                    "page_idx": page_number - 1,
+                    "page_number": page_number,
+                    "status": status,
+                }
+            elif task_status == "completed":
+                status = "completed"
+                page = {
+                    "page_idx": page_number - 1,
+                    "page_number": page_number,
+                    "status": status,
+                }
+            else:
+                status = "failed"
+                page = {
+                    "page_idx": page_number - 1,
+                    "page_number": page_number,
+                    "status": status,
+                    "error": preview.get("error") or "任务未完成",
+                }
+            totals[status] += 1
+            pages.append(page)
+
+        updated_at = preview.get("completed_at") or record.get("completed_at")
+        file_name = str(preview.get("file_name") or relative_path or "unknown")
+        return {
+            "phase": "completed" if task_status == "completed" else "failed",
+            "version": 1,
+            "total_pages": page_count,
+            "completed_pages": totals["completed"],
+            "processing_pages": 0,
+            "queued_pages": 0,
+            "skipped_pages": totals["skipped"],
+            "failed_pages": totals["failed"],
+            "updated_at": updated_at,
+            "files": [
+                {
+                    "file_name": file_name,
+                    "total_pages": page_count,
+                    "pages": pages,
+                }
+            ],
+        }
+
+    def collect_batch_task_snapshots(self) -> list[dict[str, Any]]:
+        cached_by_id = {
+            str(item.get("task_id")): item
+            for item in self.store.cached_tasks(limit=10000)
+            if item.get("task_id")
+        }
+        snapshots = []
+        terminal_statuses = {"completed", "failed", "cancelled", "client_error"}
+        for record in self.store.list_batch_runs(limit=10000):
+            artifacts = self.batch_artifacts(record)
+            for preview in artifacts["previews"]:
+                task_id = str(preview.get("task_id") or "")
+                if not task_id:
+                    continue
+                cached = cached_by_id.get(task_id)
+                if cached and str(cached.get("status")) in terminal_statuses:
+                    continue
+                raw_progress = preview.get("progress")
+                try:
+                    has_registered_pages = int((raw_progress or {}).get("total_pages", 0)) > 0
+                except (TypeError, ValueError):
+                    has_registered_pages = False
+                progress = (
+                    raw_progress
+                    if isinstance(raw_progress, dict) and has_registered_pages
+                    else self._fallback_batch_progress(record, preview, artifacts)
+                )
+                completed_at = str(preview.get("completed_at") or record.get("completed_at") or "") or None
+                started_at = str(preview.get("started_at") or "") or self._task_timestamp_from_elapsed(
+                    completed_at,
+                    preview.get("elapsed_seconds"),
+                )
+                raw_task_status = str(preview.get("task_status") or "unknown")
+                task_status = (
+                    raw_task_status
+                    if raw_task_status in {"pending", "processing", "completed", "failed"}
+                    else "failed"
+                )
+                snapshot = {
+                    "task_id": task_id,
+                    "status": task_status,
+                    "file_names": [str(preview.get("file_name") or "unknown")],
+                    "backend": (record.get("settings") or {}).get("backend", "vlm-http-client"),
+                    "partial_success": bool(preview.get("partial_success")),
+                    "created_at": started_at or record.get("created_at"),
+                    "started_at": started_at or record.get("started_at"),
+                    "completed_at": completed_at,
+                    "error": preview.get("error"),
+                    "progress": progress,
+                    "source_batch_run_id": record.get("run_id"),
+                    "source": "batch_history",
+                }
+                snapshots.append(snapshot)
+                cached_by_id[task_id] = snapshot
+        return snapshots
+
+    async def sync_batch_task_snapshots(self, *, force: bool = False) -> None:
+        async with self.batch_task_sync_lock:
+            now = time.monotonic()
+            if not force and now - self.last_batch_task_sync_monotonic < 5.0:
+                return
+            snapshots = self.collect_batch_task_snapshots()
+            if snapshots:
+                self.store.upsert_tasks(snapshots)
+            self.last_batch_task_sync_monotonic = now
 
     @staticmethod
     def pdf_page_count(path: Path) -> int:
@@ -1244,33 +1431,70 @@ def create_app() -> FastAPI:
         status: str | None = None,
     ):
         authorize(request)
-        params: dict[str, Any] = {"limit": min(max(limit, 1), 500), "offset": max(offset, 0)}
-        if status:
-            params["status"] = status
+        normalized_limit = min(max(limit, 1), 500)
+        normalized_offset = max(offset, 0)
+        await runtime.sync_batch_task_snapshots()
+        live_items: list[dict[str, Any]] = []
+        live_error: Exception | None = None
         try:
-            response = await runtime.http_client.get(f"{runtime.router_url}/tasks", params=params)
+            response = await runtime.http_client.get(
+                f"{runtime.router_url}/tasks",
+                params={"limit": 500, "offset": 0},
+            )
             response.raise_for_status()
             payload = response.json()
             if not isinstance(payload, dict):
                 raise ValueError("router task list is not an object")
-            items = payload.get("items") if isinstance(payload.get("items"), list) else []
-            runtime.store.upsert_tasks([item for item in items if isinstance(item, dict)])
-            payload["source"] = "live"
-            return payload
+            live_items = [
+                item
+                for item in payload.get("items", [])
+                if isinstance(item, dict) and item.get("task_id")
+            ]
+            runtime.store.upsert_tasks(live_items)
         except Exception as exc:
-            cached = runtime.store.cached_tasks(limit=params["limit"])
-            return {
-                "items": cached,
-                "total": len(cached),
-                "limit": params["limit"],
-                "offset": 0,
-                "source": "cache",
-                "error": str(exc),
-            }
+            live_error = exc
+
+        merged = {
+            str(item.get("task_id")): item
+            for item in runtime.store.cached_tasks(limit=10000)
+            if item.get("task_id")
+        }
+        for item in live_items:
+            merged[str(item["task_id"])] = item
+        items = list(merged.values())
+        if status:
+            items = [item for item in items if str(item.get("status")) == status]
+        items.sort(
+            key=lambda item: str(
+                item.get("started_at")
+                or item.get("created_at")
+                or item.get("completed_at")
+                or ""
+            ),
+            reverse=True,
+        )
+        selected = items[normalized_offset : normalized_offset + normalized_limit]
+        result = {
+            "items": selected,
+            "total": len(items),
+            "limit": normalized_limit,
+            "offset": normalized_offset,
+            "source": "cache" if live_error is not None else "live",
+        }
+        if live_error is not None:
+            result["error"] = str(live_error)
+        return result
 
     @app.get("/api/tasks/{task_id}")
     async def task_detail(task_id: str, request: Request):
         authorize(request)
+        cached = runtime.store.cached_task(task_id)
+        if cached and cached.get("source_batch_run_id") and str(cached.get("status")) in {
+            "completed",
+            "failed",
+        }:
+            cached["source"] = "batch_history"
+            return cached
         try:
             response = await runtime.http_client.get(f"{runtime.router_url}/tasks/{task_id}")
             response.raise_for_status()
@@ -1282,6 +1506,9 @@ def create_app() -> FastAPI:
             return payload
         except Exception as exc:
             cached = runtime.store.cached_task(task_id)
+            if cached is None:
+                await runtime.sync_batch_task_snapshots(force=True)
+                cached = runtime.store.cached_task(task_id)
             if cached is None:
                 raise HTTPException(status_code=404, detail=f"task unavailable: {exc}") from exc
             cached["source"] = "cache"

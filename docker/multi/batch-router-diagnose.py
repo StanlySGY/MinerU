@@ -361,7 +361,10 @@ def write_preview_metadata(config: RunConfig, result: dict[str, Any]) -> None:
         "partial_success": result.get("partial_success", False),
         "failed_pages": result.get("failed_pages") or [],
         "error": result.get("error"),
+        "started_at": result.get("started_at"),
+        "completed_at": result.get("completed_at"),
         "elapsed_seconds": result.get("elapsed_seconds"),
+        "progress": result.get("progress") or {},
         "preview": result.get("preview") or {},
     }
     (preview_root / "preview.json").write_text(
@@ -742,6 +745,7 @@ def diagnose_pdf(config: RunConfig, pdf_path: Path, index: int) -> dict[str, Any
             "task_status": task_status,
             "classification": classification,
             "partial_success": partial_success,
+            "progress": status_payload.get("progress") or {},
             "file_results": file_results,
             "failed_pages": failed_pages,
             "error": error,
@@ -762,6 +766,7 @@ def diagnose_pdf(config: RunConfig, pdf_path: Path, index: int) -> dict[str, Any
             "task_status": "client_error",
             "classification": "failed",
             "partial_success": False,
+            "progress": {},
             "file_results": [],
             "failed_pages": [],
             "error": f"{type(exc).__name__}: {exc}",
