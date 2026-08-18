@@ -8,7 +8,6 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-
 MAX_EVENTS_PER_TASK = 500
 
 
@@ -143,13 +142,21 @@ class TaskProgressRegistry:
         with self._lock:
             started_monotonic = time.monotonic()
             queued_monotonic = page.get("_queued_monotonic", started_monotonic)
+            if "_started_monotonic" not in page:
+                page.update(
+                    {
+                        "started_at": _utc_now_iso(),
+                        "queue_seconds": round(
+                            started_monotonic - queued_monotonic,
+                            2,
+                        ),
+                        "_started_monotonic": started_monotonic,
+                    }
+                )
             page.update(
                 {
                     "status": "processing",
-                    "started_at": _utc_now_iso(),
                     "attempts": attempt,
-                    "queue_seconds": round(started_monotonic - queued_monotonic, 2),
-                    "_started_monotonic": started_monotonic,
                 }
             )
             self._tasks[task_id]["phase"] = "vlm_inference"
@@ -169,22 +176,34 @@ class TaskProgressRegistry:
         file_name: str | None,
         page_index: int,
         attempt: int,
-    ) -> None:
-        self._finish_page(task_id, file_name, page_index, "completed", attempt=attempt)
+        **timing: Any,
+    ) -> dict[str, Any] | None:
+        return self._finish_page(
+            task_id,
+            file_name,
+            page_index,
+            "completed",
+            attempts=attempt,
+            **timing,
+        )
 
     def page_skipped(
         self,
         task_id: str | None,
         file_name: str | None,
         failure: dict[str, Any],
-    ) -> None:
+    ) -> dict[str, Any] | None:
         page_index = int(failure.get("page_idx", 0))
-        self._finish_page(
+        return self._finish_page(
             task_id,
             file_name,
             page_index,
             "skipped",
-            **{key: value for key, value in failure.items() if key not in {"status", "page_idx", "page_number"}},
+            **{
+                key: value
+                for key, value in failure.items()
+                if key not in {"status", "page_idx", "page_number"}
+            },
         )
 
     def page_failed(
@@ -194,8 +213,9 @@ class TaskProgressRegistry:
         page_index: int,
         exc: BaseException,
         attempt: int,
-    ) -> None:
-        self._finish_page(
+        **timing: Any,
+    ) -> dict[str, Any] | None:
+        return self._finish_page(
             task_id,
             file_name,
             page_index,
@@ -203,6 +223,7 @@ class TaskProgressRegistry:
             error_type=type(exc).__name__,
             error=str(exc) or repr(exc),
             attempts=attempt,
+            **timing,
         )
 
     def snapshot(self, task_id: str | None) -> dict[str, Any]:
@@ -304,29 +325,70 @@ class TaskProgressRegistry:
         page_index: int,
         status: str,
         **details: Any,
-    ) -> None:
+    ) -> dict[str, Any] | None:
         page = self._get_page(task_id, file_name, page_index)
         if page is None or not task_id:
-            return
+            return None
         with self._lock:
             now_monotonic = time.monotonic()
-            started_monotonic = page.get("_started_monotonic", page.get("_queued_monotonic", now_monotonic))
+            queued_monotonic = page.get("_queued_monotonic", now_monotonic)
+            started_monotonic = page.get("_started_monotonic", queued_monotonic)
+            completed_at = _utc_now_iso()
+            vlm_request_seconds = round(
+                float(
+                    details.pop(
+                        "vlm_request_seconds",
+                        now_monotonic - started_monotonic,
+                    )
+                ),
+                2,
+            )
+            retry_wait_seconds = round(
+                float(details.pop("retry_wait_seconds", 0.0)),
+                2,
+            )
+            elapsed_seconds = round(
+                float(
+                    details.pop(
+                        "elapsed_seconds",
+                        now_monotonic - started_monotonic,
+                    )
+                ),
+                2,
+            )
+            timing = {
+                "completed_at": completed_at,
+                "inference_seconds": vlm_request_seconds,
+                "vlm_request_seconds": vlm_request_seconds,
+                "retry_wait_seconds": retry_wait_seconds,
+                "elapsed_seconds": elapsed_seconds,
+                "total_seconds": round(now_monotonic - queued_monotonic, 2),
+            }
             page.update(
                 {
                     "status": status,
-                    "completed_at": _utc_now_iso(),
-                    "inference_seconds": round(now_monotonic - started_monotonic, 2),
+                    **timing,
                     **details,
                 }
             )
+            event_details = {
+                "file_name": file_name or "unknown",
+                "page_idx": page_index,
+                "page_number": page_index + 1,
+                "status": status,
+                **timing,
+                **details,
+            }
             self._append_event_locked(
                 task_id,
                 f"page_{status}",
-                file_name=file_name or "unknown",
-                page_idx=page_index,
-                page_number=page_index + 1,
-                **details,
+                **event_details,
             )
+            return {
+                key: value
+                for key, value in page.items()
+                if not key.startswith("_")
+            }
 
     def _append_event_locked(self, task_id: str, event_type: str, **details: Any) -> None:
         task = self._tasks.get(task_id)

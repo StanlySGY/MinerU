@@ -18,7 +18,7 @@ import time
 import uuid
 import zipfile
 import zlib
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -27,11 +27,11 @@ import click
 import httpx
 import uvicorn
 import yaml
-from fastapi import File, Form, FastAPI, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from loguru import logger
 from pydantic import BaseModel, Field
-
 
 DEFAULT_DATA_DIR = "/tmp/mineru-ops"
 DEFAULT_TEST_ROOT = "./test-pdfs"
@@ -145,6 +145,31 @@ class OpsStore:
                     updated_at TEXT NOT NULL,
                     payload_json TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS task_page_timings (
+                    task_id TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    page_idx INTEGER NOT NULL,
+                    page_number INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    queued_at TEXT,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    queue_seconds REAL,
+                    vlm_request_seconds REAL,
+                    retry_wait_seconds REAL,
+                    inference_seconds REAL,
+                    elapsed_seconds REAL,
+                    total_seconds REAL,
+                    attempts INTEGER NOT NULL DEFAULT 1,
+                    error_type TEXT,
+                    error TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (task_id, file_name, page_idx)
+                );
+                CREATE INDEX IF NOT EXISTS idx_task_page_timings_status
+                    ON task_page_timings(task_id, status);
+                CREATE INDEX IF NOT EXISTS idx_task_page_timings_duration
+                    ON task_page_timings(task_id, total_seconds DESC);
                 CREATE TABLE IF NOT EXISTS batch_runs (
                     run_id TEXT PRIMARY KEY,
                     status TEXT NOT NULL,
@@ -167,6 +192,10 @@ class OpsStore:
                     success INTEGER NOT NULL,
                     detail TEXT
                 );
+                CREATE TABLE IF NOT EXISTS ops_schema_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
                 """
             )
             connection.execute(
@@ -178,10 +207,176 @@ class OpsStore:
                 """,
                 (utc_now_iso(),),
             )
+            marker = connection.execute(
+                "SELECT value FROM ops_schema_meta WHERE key = ?",
+                ("task_page_timings_backfill_v1",),
+            ).fetchone()
+            if marker is None:
+                self._backfill_page_timings(connection)
+                connection.execute(
+                    "INSERT INTO ops_schema_meta(key, value) VALUES (?, ?)",
+                    ("task_page_timings_backfill_v1", utc_now_iso()),
+                )
+
+    @staticmethod
+    def _as_float(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            return round(float(value), 3)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _as_int(value: Any, default: int = 1) -> int:
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return default
+
+    @classmethod
+    def _page_timing_rows(
+        cls,
+        task: dict[str, Any],
+        updated_at: str,
+    ) -> list[tuple[Any, ...]]:
+        task_id = str(task.get("task_id") or "")
+        if not task_id:
+            return []
+        progress = task.get("progress")
+        if not isinstance(progress, dict):
+            return []
+        rows: list[tuple[Any, ...]] = []
+        for file_state in progress.get("files") or []:
+            if not isinstance(file_state, dict):
+                continue
+            file_name = str(file_state.get("file_name") or "unknown")
+            for page in file_state.get("pages") or []:
+                if not isinstance(page, dict):
+                    continue
+                status = str(page.get("status") or "queued")
+                if status not in {"completed", "skipped", "failed"}:
+                    continue
+                page_number = cls._as_int(page.get("page_number"), 1)
+                try:
+                    page_idx = int(page.get("page_idx", page_number - 1))
+                except (TypeError, ValueError):
+                    page_idx = page_number - 1
+                vlm_request_seconds = cls._as_float(
+                    page.get("vlm_request_seconds", page.get("inference_seconds"))
+                )
+                rows.append(
+                    (
+                        task_id,
+                        file_name,
+                        page_idx,
+                        page_number,
+                        status,
+                        page.get("queued_at"),
+                        page.get("started_at"),
+                        page.get("completed_at"),
+                        cls._as_float(page.get("queue_seconds")),
+                        vlm_request_seconds,
+                        cls._as_float(page.get("retry_wait_seconds")),
+                        cls._as_float(page.get("inference_seconds", vlm_request_seconds)),
+                        cls._as_float(page.get("elapsed_seconds")),
+                        cls._as_float(page.get("total_seconds", page.get("elapsed_seconds"))),
+                        cls._as_int(page.get("attempts"), 1),
+                        str(page.get("error_type"))[:200] if page.get("error_type") else None,
+                        str(page.get("error"))[:4000] if page.get("error") else None,
+                        updated_at,
+                    )
+                )
+        return rows
+
+    @staticmethod
+    def _upsert_page_timing_rows(
+        connection: sqlite3.Connection,
+        rows: list[tuple[Any, ...]],
+    ) -> None:
+        if not rows:
+            return
+        connection.executemany(
+            """
+            INSERT INTO task_page_timings(
+                task_id, file_name, page_idx, page_number, status,
+                queued_at, started_at, completed_at,
+                queue_seconds, vlm_request_seconds, retry_wait_seconds,
+                inference_seconds, elapsed_seconds, total_seconds,
+                attempts, error_type, error, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(task_id, file_name, page_idx) DO UPDATE SET
+                page_number = excluded.page_number,
+                status = excluded.status,
+                queued_at = excluded.queued_at,
+                started_at = excluded.started_at,
+                completed_at = excluded.completed_at,
+                queue_seconds = excluded.queue_seconds,
+                vlm_request_seconds = excluded.vlm_request_seconds,
+                retry_wait_seconds = excluded.retry_wait_seconds,
+                inference_seconds = excluded.inference_seconds,
+                elapsed_seconds = excluded.elapsed_seconds,
+                total_seconds = excluded.total_seconds,
+                attempts = excluded.attempts,
+                error_type = excluded.error_type,
+                error = excluded.error,
+                updated_at = excluded.updated_at
+            """,
+            rows,
+        )
+
+    def _backfill_page_timings(self, connection: sqlite3.Connection) -> None:
+        updated_at = utc_now_iso()
+        snapshots = connection.execute(
+            "SELECT payload_json FROM task_snapshots"
+        ).fetchall()
+        rows: list[tuple[Any, ...]] = []
+        for snapshot in snapshots:
+            rows.extend(
+                self._page_timing_rows(
+                    json_loads_object(snapshot["payload_json"]),
+                    updated_at,
+                )
+            )
+        self._upsert_page_timing_rows(connection, rows)
 
     def upsert_tasks(self, tasks: list[dict[str, Any]]) -> None:
         now = utc_now_iso()
+        serialized = [
+            (
+                task,
+                str(task.get("task_id")),
+                str(task.get("status", "unknown")),
+                json.dumps(task, ensure_ascii=False),
+            )
+            for task in tasks
+            if task.get("task_id")
+        ]
+        if not serialized:
+            return
         with self.connect() as connection:
+            existing: dict[str, str] = {}
+            task_ids = [task_id for _, task_id, _, _ in serialized]
+            for start in range(0, len(task_ids), 400):
+                chunk = task_ids[start : start + 400]
+                placeholders = ", ".join("?" for _ in chunk)
+                existing.update(
+                    {
+                        str(row["task_id"]): str(row["payload_json"])
+                        for row in connection.execute(
+                            f"SELECT task_id, payload_json FROM task_snapshots "
+                            f"WHERE task_id IN ({placeholders})",
+                            chunk,
+                        ).fetchall()
+                    }
+                )
+            changed = [
+                item
+                for item in serialized
+                if existing.get(item[1]) != item[3]
+            ]
+            if not changed:
+                return
             connection.executemany(
                 """
                 INSERT INTO task_snapshots(task_id, status, updated_at, payload_json)
@@ -192,16 +387,129 @@ class OpsStore:
                     payload_json = excluded.payload_json
                 """,
                 [
-                    (
-                        str(task.get("task_id")),
-                        str(task.get("status", "unknown")),
-                        now,
-                        json.dumps(task, ensure_ascii=False),
-                    )
-                    for task in tasks
-                    if task.get("task_id")
+                    (task_id, status, now, payload_json)
+                    for _, task_id, status, payload_json in changed
                 ],
             )
+            timing_rows = [
+                row
+                for task, _, _, _ in changed
+                for row in self._page_timing_rows(task, now)
+            ]
+            self._upsert_page_timing_rows(connection, timing_rows)
+
+    def page_timings(
+        self,
+        task_id: str,
+        *,
+        status: str | None = None,
+        sort: str = "page_number",
+        descending: bool = False,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        allowed_statuses = {"completed", "skipped", "failed"}
+        if status is not None and status not in allowed_statuses:
+            raise ValueError(f"unsupported page timing status: {status}")
+        sort_columns = {
+            "page_number": "page_number",
+            "total_seconds": "total_seconds",
+            "vlm_request_seconds": "vlm_request_seconds",
+            "queue_seconds": "queue_seconds",
+            "status": "status",
+        }
+        sort_column = sort_columns.get(sort, "page_number")
+        direction = "DESC" if descending else "ASC"
+        where = "WHERE task_id = ?"
+        params: list[Any] = [task_id]
+        if status is not None:
+            where += " AND status = ?"
+            params.append(status)
+        normalized_limit = min(max(int(limit), 1), 500)
+        normalized_offset = max(int(offset), 0)
+        with self.connect() as connection:
+            total = int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM task_page_timings {where}",
+                    params,
+                ).fetchone()[0]
+            )
+            rows = connection.execute(
+                f"SELECT * FROM task_page_timings {where} "
+                f"ORDER BY {sort_column} {direction}, page_number ASC "
+                "LIMIT ? OFFSET ?",
+                [*params, normalized_limit, normalized_offset],
+            ).fetchall()
+        return {
+            "items": [dict(row) for row in rows],
+            "total": total,
+            "limit": normalized_limit,
+            "offset": normalized_offset,
+        }
+
+    def page_timing_summary(
+        self,
+        task_id: str,
+        *,
+        status: str | None = None,
+        slow_page_seconds: float = 120.0,
+    ) -> dict[str, Any]:
+        allowed_statuses = {"completed", "skipped", "failed"}
+        if status is not None and status not in allowed_statuses:
+            raise ValueError(f"unsupported page timing status: {status}")
+        query = "SELECT * FROM task_page_timings WHERE task_id = ?"
+        params: list[Any] = [task_id]
+        if status is not None:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY page_number ASC"
+        with self.connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        records = [dict(row) for row in rows]
+        durations = sorted(
+            float(row["vlm_request_seconds"])
+            for row in records
+            if row["status"] == "completed" and row["vlm_request_seconds"] is not None
+        )
+
+        def percentile(value: float) -> float | None:
+            if not durations:
+                return None
+            position = (len(durations) - 1) * value
+            lower = int(position)
+            upper = min(lower + 1, len(durations) - 1)
+            fraction = position - lower
+            return round(
+                durations[lower] + (durations[upper] - durations[lower]) * fraction,
+                3,
+            )
+
+        slow_pages = [
+            row
+            for row in records
+            if row["vlm_request_seconds"] is not None
+            and float(row["vlm_request_seconds"]) >= slow_page_seconds
+        ]
+        slow_pages.sort(
+            key=lambda row: float(row["vlm_request_seconds"]),
+            reverse=True,
+        )
+        return {
+            "task_id": task_id,
+            "recorded_pages": len(records),
+            "completed_pages": sum(row["status"] == "completed" for row in records),
+            "skipped_pages": sum(row["status"] == "skipped" for row in records),
+            "failed_pages": sum(row["status"] == "failed" for row in records),
+            "completed_average_vlm_request_seconds": round(sum(durations) / len(durations), 3)
+            if durations else None,
+            "completed_p50_vlm_request_seconds": percentile(0.50),
+            "completed_p95_vlm_request_seconds": percentile(0.95),
+            "completed_max_vlm_request_seconds": round(max(durations), 3)
+            if durations else None,
+            "slow_page_seconds": slow_page_seconds,
+            "slow_pages": len(slow_pages),
+            "slowest_pages": slow_pages[:10],
+        }
 
     def cached_tasks(self, limit: int = 100) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -347,6 +655,23 @@ class OpsRuntime:
         )
         self.batch_processes: dict[str, asyncio.subprocess.Process] = {}
         self.batch_task_sync_lock = asyncio.Lock()
+        self.task_sync_lock = asyncio.Lock()
+        self.task_sync_task: asyncio.Task[Any] | None = None
+        self.task_sync_interval_seconds = max(
+            1.0,
+            float(os.getenv("MINERU_OPS_TASK_SYNC_INTERVAL_SECONDS", "5")),
+        )
+        self.task_full_sync_interval_seconds = max(
+            30.0,
+            float(os.getenv("MINERU_OPS_TASK_FULL_SYNC_INTERVAL_SECONDS", "60")),
+        )
+        self.last_task_sync_monotonic = 0.0
+        self.last_full_task_sync_monotonic = 0.0
+        self.last_task_sync_items: list[dict[str, Any]] = []
+        self.slow_page_seconds = max(
+            1.0,
+            float(os.getenv("MINERU_OPS_SLOW_PAGE_SECONDS", "120")),
+        )
         self.last_batch_task_sync_monotonic = 0.0
         self.retained_preview_task_ids: set[str] = set()
         self.smoke_backend = os.getenv("MINERU_OPS_SMOKE_BACKEND", "vlm-http-client")
@@ -374,7 +699,33 @@ class OpsRuntime:
         self.cleanup_expired_artifacts()
         self.http_client = httpx.AsyncClient(timeout=15.0, follow_redirects=True)
 
+    async def start(self) -> None:
+        if self.task_sync_task is None or self.task_sync_task.done():
+            self.task_sync_task = asyncio.create_task(
+                self._task_sync_loop(),
+                name="mineru-ops-task-sync",
+            )
+
+    async def _task_sync_loop(self) -> None:
+        try:
+            while True:
+                try:
+                    await self.sync_task_snapshots()
+                except Exception as exc:
+                    logger.warning(
+                        "Ops task timing synchronization failed: {}",
+                        exc,
+                    )
+                await asyncio.sleep(self.task_sync_interval_seconds)
+        except asyncio.CancelledError:
+            raise
+
     async def close(self) -> None:
+        if self.task_sync_task is not None:
+            self.task_sync_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.task_sync_task
+            self.task_sync_task = None
         for process in list(self.batch_processes.values()):
             if process.returncode is None:
                 process.terminate()
@@ -847,6 +1198,79 @@ class OpsRuntime:
             if snapshots:
                 self.store.upsert_tasks(snapshots)
             self.last_batch_task_sync_monotonic = now
+
+    async def sync_task_snapshots(
+        self,
+        *,
+        force: bool = False,
+    ) -> list[dict[str, Any]]:
+        async with self.task_sync_lock:
+            now = time.monotonic()
+            if (
+                not force
+                and now - self.last_task_sync_monotonic
+                < self.task_sync_interval_seconds
+            ):
+                return list(self.last_task_sync_items)
+            try:
+                await self.sync_batch_task_snapshots()
+            except Exception as exc:
+                logger.warning("Ops batch-history synchronization failed: {}", exc)
+            try:
+                response = await self.http_client.get(
+                    f"{self.router_url}/tasks",
+                    params={"limit": 500, "offset": 0},
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise ValueError("router task list is not an object")
+            except Exception:
+                self.last_task_sync_monotonic = now
+                raise
+            items = [
+                item
+                for item in payload.get("items", [])
+                if isinstance(item, dict) and item.get("task_id")
+            ]
+            self.store.upsert_tasks(items)
+            total = int(payload.get("total", len(items)) or len(items))
+            full_sync_due = (
+                total > len(items)
+                and now - self.last_full_task_sync_monotonic
+                >= self.task_full_sync_interval_seconds
+            )
+            if full_sync_due:
+                offset = len(items)
+                try:
+                    while offset < total:
+                        response = await self.http_client.get(
+                            f"{self.router_url}/tasks",
+                            params={"limit": 500, "offset": offset},
+                        )
+                        response.raise_for_status()
+                        page_payload = response.json()
+                        if not isinstance(page_payload, dict):
+                            raise ValueError("router task page is not an object")
+                        page_items = [
+                            item
+                            for item in page_payload.get("items", [])
+                            if isinstance(item, dict) and item.get("task_id")
+                        ]
+                        if not page_items:
+                            break
+                        self.store.upsert_tasks(page_items)
+                        items.extend(page_items)
+                        offset += len(page_items)
+                    if offset >= total:
+                        self.last_full_task_sync_monotonic = now
+                except Exception as exc:
+                    logger.warning("Ops full task synchronization failed: {}", exc)
+            elif total <= len(items):
+                self.last_full_task_sync_monotonic = now
+            self.last_task_sync_items = list(items)
+            self.last_task_sync_monotonic = now
+            return items
 
     @staticmethod
     def pdf_page_count(path: Path) -> int:
@@ -1387,6 +1811,7 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.runtime = runtime
+        await runtime.start()
         try:
             yield
         finally:
@@ -1550,28 +1975,10 @@ def create_app() -> FastAPI:
         authorize(request)
         normalized_limit = min(max(limit, 1), 500)
         normalized_offset = max(offset, 0)
-        try:
-            await runtime.sync_batch_task_snapshots()
-        except Exception:
-            # Historical task recovery is best-effort; live Router tasks must remain visible.
-            pass
         live_items: list[dict[str, Any]] = []
         live_error: Exception | None = None
         try:
-            response = await runtime.http_client.get(
-                f"{runtime.router_url}/tasks",
-                params={"limit": 500, "offset": 0},
-            )
-            response.raise_for_status()
-            payload = response.json()
-            if not isinstance(payload, dict):
-                raise ValueError("router task list is not an object")
-            live_items = [
-                item
-                for item in payload.get("items", [])
-                if isinstance(item, dict) and item.get("task_id")
-            ]
-            runtime.store.upsert_tasks(live_items)
+            live_items = await runtime.sync_task_snapshots()
         except Exception as exc:
             live_error = exc
 
@@ -1645,6 +2052,35 @@ def create_app() -> FastAPI:
             cached["cache_error"] = str(exc)
             cached["preview_available"] = task_id in runtime.retained_preview_task_ids
             return cached
+
+    @app.get("/api/tasks/{task_id}/page-timings")
+    async def task_page_timings(
+        task_id: str,
+        request: Request,
+        status: str | None = None,
+        sort: str = "page_number",
+        order: str = "asc",
+        limit: int = 100,
+        offset: int = 0,
+    ):
+        authorize(request)
+        try:
+            result = runtime.store.page_timings(
+                task_id,
+                status=status,
+                sort=sort,
+                descending=order.lower() == "desc",
+                limit=limit,
+                offset=offset,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        result["summary"] = runtime.store.page_timing_summary(
+            task_id,
+            status=status,
+            slow_page_seconds=runtime.slow_page_seconds,
+        )
+        return result
 
     @app.get("/api/tasks/{task_id}/preview")
     async def task_preview(task_id: str, request: Request):

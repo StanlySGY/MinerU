@@ -4,6 +4,10 @@ const state = {
   tasks: [],
   activeTaskId: null,
   taskDetailRequestId: 0,
+  taskTimingStatus: "all",
+  taskTimingSort: "page_number",
+  taskTimingOrder: "asc",
+  taskTimingOffset: 0,
   taskRefreshLoading: false,
   batches: [],
   uploadItems: [],
@@ -319,9 +323,42 @@ function pageTitle(page, fileName) {
   const parts = [`${fileName} 第 ${page.page_number} 页`, statusText[page.status] || page.status || "未知"];
   if (page.attempts) parts.push(`尝试 ${page.attempts} 次`);
   if (page.queue_seconds != null) parts.push(`排队 ${page.queue_seconds} 秒`);
-  if (page.inference_seconds != null) parts.push(`处理 ${page.inference_seconds} 秒`);
+  if (page.vlm_request_seconds != null) parts.push(`VLM 请求 ${page.vlm_request_seconds} 秒`);
+  else if (page.inference_seconds != null) parts.push(`VLM 请求 ${page.inference_seconds} 秒`);
+  if (page.retry_wait_seconds != null && page.retry_wait_seconds > 0) parts.push(`重试等待 ${page.retry_wait_seconds} 秒`);
+  if (page.total_seconds != null) parts.push(`总计 ${page.total_seconds} 秒`);
   if (page.error) parts.push(page.error);
   return parts.join(" · ");
+}
+
+function formatPageSeconds(value) {
+  if (value == null || !Number.isFinite(Number(value))) return "-";
+  return `${Number(value).toFixed(2)} 秒`;
+}
+
+function renderPageTimingSummary(summary) {
+  if (!summary || !summary.recorded_pages) {
+    return `<div class="task-timing-empty">暂无已保存的页级耗时记录</div>`;
+  }
+  const cards = [
+    ["已记录页面", summary.recorded_pages],
+    ["平均 VLM 请求", formatPageSeconds(summary.completed_average_vlm_request_seconds)],
+    ["P50", formatPageSeconds(summary.completed_p50_vlm_request_seconds)],
+    ["P95", formatPageSeconds(summary.completed_p95_vlm_request_seconds)],
+    ["最慢请求", formatPageSeconds(summary.completed_max_vlm_request_seconds)],
+    ["慢页数量", summary.slow_pages || 0],
+  ];
+  return `<div class="task-timing-summary">${cards.map(([label, value]) => `<div><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`).join("")}</div>`;
+}
+
+function renderPageTimingTable(payload, taskId) {
+  const status = state.taskTimingStatus;
+  const sort = state.taskTimingSort;
+  const order = state.taskTimingOrder;
+  const items = payload?.items || [];
+  const statusOptions = [["all", "全部"], ["completed", "完成"], ["skipped", "跳过"], ["failed", "失败"]];
+  const rows = items.map(page => `<tr><td>${esc(page.file_name)} 第 ${esc(page.page_number)} 页</td><td>${badge(page.status)}</td><td>${formatPageSeconds(page.queue_seconds)}</td><td>${formatPageSeconds(page.vlm_request_seconds ?? page.inference_seconds)}</td><td>${formatPageSeconds(page.retry_wait_seconds)}</td><td>${formatPageSeconds(page.total_seconds ?? page.elapsed_seconds)}</td><td>${esc(page.attempts ?? "-")}</td><td>${esc(page.error || "-")}</td></tr>`).join("");
+  return `<section class="task-timing-panel"><div class="task-timing-heading"><h3>页面耗时</h3><div class="task-timing-controls"><label>状态 <select data-task-timing-status>${statusOptions.map(([value, label]) => `<option value="${value}" ${status === value ? "selected" : ""}>${label}</option>`).join("")}</select></label><label>排序 <select data-task-timing-sort><option value="page_number" ${sort === "page_number" ? "selected" : ""}>页码</option><option value="total_seconds" ${sort === "total_seconds" ? "selected" : ""}>总耗时</option><option value="vlm_request_seconds" ${sort === "vlm_request_seconds" ? "selected" : ""}>VLM 请求</option></select></label><label>顺序 <select data-task-timing-order><option value="asc" ${order === "asc" ? "selected" : ""}>升序</option><option value="desc" ${order === "desc" ? "selected" : ""}>降序</option></select></label></div></div>${renderPageTimingSummary(payload?.summary)}<div class="task-timing-table-wrap"><table class="task-timing-table"><thead><tr><th>页面</th><th>状态</th><th>排队</th><th>VLM 请求</th><th>重试等待</th><th>总耗时</th><th>尝试</th><th>错误</th></tr></thead><tbody>${rows || `<tr><td colspan="8" class="muted">暂无符合条件的页面记录</td></tr>`}</tbody></table></div><div class="task-timing-pagination"><button type="button" class="text-button" data-task-timing-prev ${payload?.offset ? "" : "disabled"}>上一页</button><span>${items.length ? `${payload.offset + 1}-${payload.offset + items.length} / ${payload.total}` : "0 / 0"}</span><button type="button" class="text-button" data-task-timing-next ${payload && payload.offset + items.length < payload.total ? "" : "disabled"}>下一页</button></div></section>`;
 }
 
 function currentTaskPosition(task, progress, pages) {
@@ -341,10 +378,29 @@ function currentTaskPosition(task, progress, pages) {
 
 async function loadTaskDetail(taskId, {silent = false} = {}) {
   const requestId = ++state.taskDetailRequestId;
+  if (state.activeTaskId !== taskId) {
+    state.taskTimingOffset = 0;
+    state.taskTimingStatus = "all";
+    state.taskTimingSort = "page_number";
+    state.taskTimingOrder = "asc";
+  }
   state.activeTaskId = taskId;
   renderTasks();
   try {
     const task = await api(`/api/tasks/${encodeURIComponent(taskId)}`);
+    let timingPayload = {items: [], total: 0, offset: state.taskTimingOffset, summary: null};
+    try {
+      const timingParams = new URLSearchParams({
+        sort: state.taskTimingSort,
+        order: state.taskTimingOrder,
+        limit: "100",
+        offset: String(state.taskTimingOffset),
+      });
+      if (state.taskTimingStatus !== "all") timingParams.set("status", state.taskTimingStatus);
+      timingPayload = await api(`/api/tasks/${encodeURIComponent(taskId)}/page-timings?${timingParams}`);
+    } catch (error) {
+      if (!silent) notice(`页级耗时暂不可用：${error.message}`);
+    }
     if (requestId !== state.taskDetailRequestId || state.activeTaskId !== taskId) return;
     const p = task.progress || {};
     const done = (p.completed_pages || 0) + (p.skipped_pages || 0) + (p.failed_pages || 0);
@@ -359,7 +415,7 @@ async function loadTaskDetail(taskId, {silent = false} = {}) {
     const elapsed = formatElapsed(task.started_at || task.created_at, task.completed_at);
     const fileSections = (p.files || []).map(file => `<section class="task-file-pages"><div class="task-file-heading"><strong>${esc(file.file_name)}</strong><span>${(file.pages || []).length} 页</span></div><div class="page-list">${(file.pages || []).map(page => `<span class="page-chip ${esc(page.status || "queued")}" title="${esc(pageTitle(page, file.file_name))}">${page.page_number}</span>`).join("")}</div></section>`).join("");
     const problemPages = pages.filter(page => page.status === "skipped" || page.status === "failed");
-    document.getElementById("task-detail").innerHTML = `<div class="task-detail-header"><div><h2>${esc((task.file_names || []).join(", "))}</h2><div class="mono muted">${esc(task.task_id)}</div></div><div class="task-detail-actions">${badge(task.partial_success ? "partial_success" : task.status)}${previewAction}</div></div><div class="task-live-position ${current.kind}"><span class="live-indicator"></span><div><small>当前处理位置</small><strong>${esc(current.title)}</strong><p>${esc(current.detail)}</p></div><time>${esc(formatDate(p.updated_at))}</time></div><div class="task-progress-row"><div class="progress"><span style="width:${percent}%"></span></div><strong>${percent}%</strong></div><div class="task-stat-grid"><div><span>总页数</span><strong>${p.total_pages || 0}</strong></div><div><span>已完成</span><strong>${p.completed_pages || 0}</strong></div><div><span>处理中</span><strong>${p.processing_pages || 0}</strong></div><div><span>等待中</span><strong>${p.queued_pages || 0}</strong></div><div><span>已跳过</span><strong>${p.skipped_pages || 0}</strong></div><div><span>失败</span><strong>${p.failed_pages || 0}</strong></div></div><div class="task-meta-line"><span>阶段：<strong>${esc(phaseText[p.phase] || p.phase || "-")}</strong></span><span>后端：<strong>${esc(task.backend || "-")}</strong></span><span>耗时：<strong class="task-elapsed">${esc(elapsed)}</strong></span>${task.error ? `<span class="bad-text">任务错误：${esc(task.error)}</span>` : ""}</div><div class="task-pages-heading"><h3>页面状态</h3><span>${pages.length} 个页面事件</span></div>${pageLegend()}<div class="task-file-page-list">${fileSections || `<div class="empty-state">尚未收到页级进度，任务启动后会自动显示</div>`}</div>${problemPages.length ? `<div class="task-problem-list"><h3>跳过和失败页面</h3>${problemPages.map(page => `<div class="task-problem-row"><strong>${esc(page.file_name)} 第 ${page.page_number} 页</strong>${badge(page.status)}<span>${esc(page.error_type || "")}</span><p>${esc(page.error || "未返回错误详情")}</p></div>`).join("")}</div>` : ""}`;
+    document.getElementById("task-detail").innerHTML = `<div class="task-detail-header"><div><h2>${esc((task.file_names || []).join(", "))}</h2><div class="mono muted">${esc(task.task_id)}</div></div><div class="task-detail-actions">${badge(task.partial_success ? "partial_success" : task.status)}${previewAction}</div></div><div class="task-live-position ${current.kind}"><span class="live-indicator"></span><div><small>当前处理位置</small><strong>${esc(current.title)}</strong><p>${esc(current.detail)}</p></div><time>${esc(formatDate(p.updated_at))}</time></div><div class="task-progress-row"><div class="progress"><span style="width:${percent}%"></span></div><strong>${percent}%</strong></div><div class="task-stat-grid"><div><span>总页数</span><strong>${p.total_pages || 0}</strong></div><div><span>已完成</span><strong>${p.completed_pages || 0}</strong></div><div><span>处理中</span><strong>${p.processing_pages || 0}</strong></div><div><span>等待中</span><strong>${p.queued_pages || 0}</strong></div><div><span>已跳过</span><strong>${p.skipped_pages || 0}</strong></div><div><span>失败</span><strong>${p.failed_pages || 0}</strong></div></div><div class="task-meta-line"><span>阶段：<strong>${esc(phaseText[p.phase] || p.phase || "-")}</strong></span><span>后端：<strong>${esc(task.backend || "-")}</strong></span><span>耗时：<strong class="task-elapsed">${esc(elapsed)}</strong></span>${task.error ? `<span class="bad-text">任务错误：${esc(task.error)}</span>` : ""}</div><div class="task-pages-heading"><h3>页面状态</h3><span>${pages.length} 个页面事件</span></div>${pageLegend()}<div class="task-file-page-list">${fileSections || `<div class="empty-state">尚未收到页级进度，任务启动后会自动显示</div>`}</div>${renderPageTimingTable(timingPayload, taskId)}${problemPages.length ? `<div class="task-problem-list"><h3>跳过和失败页面</h3>${problemPages.map(page => `<div class="task-problem-row"><strong>${esc(page.file_name)} 第 ${page.page_number} 页</strong>${badge(page.status)}<span>${esc(page.error_type || "")}</span><p>${esc(page.error || "未返回错误详情")}</p></div>`).join("")}</div>` : ""}`;
   } catch (error) {
     if (!silent) notice(error.message);
   }
@@ -368,6 +424,24 @@ async function loadTaskDetail(taskId, {silent = false} = {}) {
 document.getElementById("task-detail").addEventListener("click", event => {
   const button = event.target.closest("[data-task-preview]");
   if (button) openTaskPreview(button.dataset.taskPreview);
+});
+
+document.getElementById("task-detail").addEventListener("change", event => {
+  const target = event.target;
+  if (target.matches("[data-task-timing-status]")) state.taskTimingStatus = target.value;
+  if (target.matches("[data-task-timing-sort]")) state.taskTimingSort = target.value;
+  if (target.matches("[data-task-timing-order]")) state.taskTimingOrder = target.value;
+  if (target.matches("[data-task-timing-status], [data-task-timing-sort], [data-task-timing-order]")) {
+    state.taskTimingOffset = 0;
+    if (state.activeTaskId) loadTaskDetail(state.activeTaskId, {silent: true});
+  }
+});
+
+document.getElementById("task-detail").addEventListener("click", event => {
+  const button = event.target.closest("[data-task-timing-prev], [data-task-timing-next]");
+  if (!button || button.disabled || !state.activeTaskId) return;
+  state.taskTimingOffset = Math.max(0, state.taskTimingOffset + (button.matches("[data-task-timing-next]") ? 100 : -100));
+  loadTaskDetail(state.activeTaskId, {silent: true});
 });
 
 async function refreshTasksView() {

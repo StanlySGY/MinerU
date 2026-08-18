@@ -1,8 +1,42 @@
 import asyncio
 
 from mineru.backend.vlm.resilience import aio_extract_pages_with_failure_isolation
-from mineru.utils.task_progress import TaskProgressRegistry
-from mineru.utils.task_progress import task_progress_registry
+from mineru.utils import task_progress as task_progress_module
+from mineru.utils.task_progress import TaskProgressRegistry, task_progress_registry
+
+
+def test_task_progress_preserves_first_start_and_terminal_timing(monkeypatch):
+    class Clock:
+        def __init__(self):
+            self.value = 10.0
+
+        def monotonic(self):
+            return self.value
+
+    clock = Clock()
+    monkeypatch.setattr(task_progress_module, "time", clock)
+    registry = TaskProgressRegistry()
+    registry.initialize("timing-task", ["sample.pdf"])
+    registry.queue_pages("timing-task", "sample.pdf", 0, 1)
+
+    clock.value = 12.345
+    registry.page_started("timing-task", "sample.pdf", 0, 1)
+    first_started_at = registry.snapshot("timing-task")["files"][0]["pages"][0]["started_at"]
+    clock.value = 13.0
+    registry.page_started("timing-task", "sample.pdf", 0, 2)
+    clock.value = 18.678
+    registry.page_completed("timing-task", "sample.pdf", 0, 2)
+
+    page = registry.snapshot("timing-task")["files"][0]["pages"][0]
+    terminal_event = registry.snapshot("timing-task")["events"][-1]
+    assert page["started_at"] == first_started_at
+    assert page["attempts"] == 2
+    assert page["queue_seconds"] == 2.35
+    assert page["inference_seconds"] == 6.33
+    assert page["vlm_request_seconds"] == 6.33
+    assert page["total_seconds"] == 8.68
+    assert terminal_event["inference_seconds"] == 6.33
+    assert terminal_event["total_seconds"] == 8.68
 
 
 def test_task_progress_tracks_concurrent_page_outcomes():
@@ -89,3 +123,10 @@ def test_vlm_resilience_emits_page_progress(monkeypatch) -> None:
     assert failures == []
     assert snapshot["completed_pages"] == 2
     assert snapshot["processing_pages"] == 0
+    pages = snapshot["files"][0]["pages"]
+    assert all(page["status"] == "completed" for page in pages)
+    assert all(page["attempts"] == 1 for page in pages)
+    assert all(page["queue_seconds"] >= 0 for page in pages)
+    assert all(page["vlm_request_seconds"] >= 0 for page in pages)
+    assert all(page["total_seconds"] >= 0 for page in pages)
+    assert all(not any(key.startswith("_") for key in page) for page in pages)

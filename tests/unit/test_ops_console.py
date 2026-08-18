@@ -3,6 +3,7 @@ import struct
 from pathlib import Path
 from tempfile import SpooledTemporaryFile
 
+import httpx
 import pytest
 import yaml
 from fastapi import HTTPException, UploadFile
@@ -25,6 +26,132 @@ def test_ops_store_persists_task_snapshots(tmp_path: Path):
 
     assert store.cached_task("task-1") == payload
     assert store.cached_tasks() == [payload]
+
+
+def test_ops_store_persists_and_summarizes_page_timings(tmp_path: Path):
+    store = OpsStore(tmp_path / "ops.db")
+    pages = [
+        {
+            "page_idx": index,
+            "page_number": index + 1,
+            "status": "completed",
+            "queue_seconds": 1.0,
+            "vlm_request_seconds": duration,
+            "retry_wait_seconds": 0.0,
+            "elapsed_seconds": duration,
+            "total_seconds": duration + 1.0,
+            "attempts": 1,
+        }
+        for index, duration in enumerate([10.0, 20.0, 30.0, 40.0])
+    ]
+    pages.append(
+        {
+            "page_idx": 4,
+            "page_number": 5,
+            "status": "skipped",
+            "queue_seconds": 2.0,
+            "inference_seconds": 600.0,
+            "elapsed_seconds": 602.0,
+            "attempts": 1,
+            "error_type": "TimeoutError",
+            "error": "page timed out",
+        }
+    )
+    payload = {
+        "task_id": "timing-task",
+        "status": "completed",
+        "progress": {
+            "files": [
+                {"file_name": "sample.pdf", "total_pages": 5, "pages": pages}
+            ]
+        },
+    }
+
+    store.upsert_tasks([payload])
+    store.upsert_tasks([payload])
+
+    result = store.page_timings(
+        "timing-task",
+        sort="vlm_request_seconds",
+        descending=True,
+    )
+    summary = store.page_timing_summary("timing-task", slow_page_seconds=30.0)
+    assert result["total"] == 5
+    assert result["items"][0]["page_number"] == 5
+    assert result["items"][0]["vlm_request_seconds"] == 600.0
+    assert summary["recorded_pages"] == 5
+    assert summary["completed_pages"] == 4
+    assert summary["skipped_pages"] == 1
+    assert summary["completed_average_vlm_request_seconds"] == 25.0
+    assert summary["completed_p50_vlm_request_seconds"] == 25.0
+    assert summary["completed_p95_vlm_request_seconds"] == 38.5
+    assert summary["completed_max_vlm_request_seconds"] == 40.0
+    assert summary["slow_pages"] == 3
+    skipped_summary = store.page_timing_summary("timing-task", status="skipped")
+    assert skipped_summary["recorded_pages"] == 1
+    assert skipped_summary["completed_pages"] == 0
+    assert skipped_summary["completed_p95_vlm_request_seconds"] is None
+
+
+def test_ops_runtime_background_sync_persists_router_tasks(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
+    monkeypatch.setenv("MINERU_OPS_TASK_SYNC_INTERVAL_SECONDS", "0.01")
+    runtime = OpsRuntime()
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        assert request.url.path == "/tasks"
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    {
+                        "task_id": "background-task",
+                        "status": "completed",
+                        "progress": {
+                            "files": [
+                                {
+                                    "file_name": "sample.pdf",
+                                    "pages": [
+                                        {
+                                            "page_idx": 0,
+                                            "page_number": 1,
+                                            "status": "completed",
+                                            "vlm_request_seconds": 3.5,
+                                            "total_seconds": 4.0,
+                                        }
+                                    ],
+                                }
+                            ]
+                        },
+                    }
+                ],
+                "total": 1,
+            },
+        )
+
+    async def scenario():
+        await runtime.http_client.aclose()
+        runtime.http_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            base_url="http://router",
+        )
+        runtime.router_url = "http://router"
+        runtime.task_sync_interval_seconds = 0.01
+        await runtime.start()
+        await asyncio.sleep(0.03)
+        await runtime.close()
+
+    asyncio.run(scenario())
+
+    assert requests >= 2
+    assert runtime.store.cached_task("background-task")["status"] == "completed"
+    assert runtime.store.page_timings("background-task")["items"][0][
+        "vlm_request_seconds"
+    ] == 3.5
 
 
 def test_ops_runtime_discovers_compose_roles_and_external_vlm(tmp_path: Path, monkeypatch):
@@ -78,6 +205,7 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "/api/health" in paths
     assert "/api/services" in paths
     assert "/api/tasks" in paths
+    assert "/api/tasks/{task_id}/page-timings" in paths
     assert "/api/tasks/{task_id}/preview" in paths
     assert "/api/tasks/{task_id}/preview/pages/{page_number}" in paths
     assert "/api/batch-runs" in paths
@@ -103,6 +231,10 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "data-task-preview" in dashboard_js
     assert "task.preview_available" in dashboard_js
     assert "refreshTasksView" in dashboard_js
+    assert "task-timing-summary" in dashboard_js
+    assert "vlm_request_seconds" in dashboard_js
+    assert "页面耗时" in dashboard_js
+    assert "task-timing-table" in dashboard_css
     assert "width: calc(100vw - 24px)" in dashboard_css
 
 
