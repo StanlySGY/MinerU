@@ -93,6 +93,122 @@ def test_ops_store_persists_and_summarizes_page_timings(tmp_path: Path):
     assert skipped_summary["completed_p95_vlm_request_seconds"] is None
 
 
+def _seed_report_task(store: OpsStore, *, page_count: int = 3) -> dict:
+    pages = [
+        {
+            "page_idx": index,
+            "page_number": index + 1,
+            "status": "completed",
+            "queue_seconds": 1.5,
+            "vlm_request_seconds": 10.0 + index,
+            "retry_wait_seconds": 0.0,
+            "elapsed_seconds": 10.0 + index,
+            "total_seconds": 11.5 + index,
+            "attempts": 1,
+        }
+        for index in range(page_count)
+    ]
+    pages.append(
+        {
+            "page_idx": page_count,
+            "page_number": page_count + 1,
+            "status": "failed",
+            "queue_seconds": 2.0,
+            "vlm_request_seconds": 300.0,
+            "retry_wait_seconds": 5.0,
+            "total_seconds": 307.0,
+            "attempts": 3,
+            "error_type": "TimeoutError",
+            "error": "page | timed out\nafter retries",
+        }
+    )
+    payload = {
+        "task_id": "report-task",
+        "status": "completed",
+        "backend": "vlm-http-client",
+        "file_names": ["report.pdf"],
+        "created_at": "2026-08-19T00:00:00+00:00",
+        "started_at": "2026-08-19T00:00:01+00:00",
+        "completed_at": "2026-08-19T00:05:00+00:00",
+        "progress": {
+            "total_pages": page_count + 1,
+            "completed_pages": page_count,
+            "skipped_pages": 0,
+            "failed_pages": 1,
+            "files": [
+                {"file_name": "report.pdf", "total_pages": page_count + 1, "pages": pages}
+            ],
+        },
+    }
+    store.upsert_tasks([payload])
+    return payload
+
+
+def test_task_report_markdown_lists_every_page(tmp_path: Path) -> None:
+    store = OpsStore(tmp_path / "ops.db")
+    task = _seed_report_task(store, page_count=3)
+
+    items = store.all_page_timings("report-task")
+    summary = store.page_timing_summary("report-task", slow_page_seconds=30.0)
+    content = OpsRuntime.task_report_markdown(task, {"items": items, "summary": summary})
+
+    assert len(items) == 4
+    assert [row["page_number"] for row in items] == [1, 2, 3, 4]
+    assert "# MinerU 任务耗时报告" in content
+    assert "report-task" in content
+    assert "report.pdf" in content
+    assert "## 耗时摘要" in content
+    assert "## 逐页耗时" in content
+    # every page has its own row, none truncated away
+    for page_number in (1, 2, 3, 4):
+        assert f"| {page_number} |" in content
+    # pipe and newline in the error must not break the table layout
+    assert "page \\| timed out after retries" in content
+    assert content.count("\n|") >= 6
+
+
+def test_task_report_csv_contains_full_page_rows(tmp_path: Path) -> None:
+    import csv as csv_module
+    import io as io_module
+
+    store = OpsStore(tmp_path / "ops.db")
+    _seed_report_task(store, page_count=3)
+
+    items = store.all_page_timings("report-task")
+    content = OpsRuntime.task_report_csv({"items": items})
+    rows = list(csv_module.reader(io_module.StringIO(content)))
+
+    assert rows[0] == [
+        "file_name",
+        "page_number",
+        "page_idx",
+        "status",
+        "queue_seconds",
+        "vlm_request_seconds",
+        "retry_wait_seconds",
+        "total_seconds",
+        "attempts",
+        "error_type",
+        "error",
+    ]
+    assert len(rows) == 5  # header + 4 pages
+    assert [row[1] for row in rows[1:]] == ["1", "2", "3", "4"]
+    failed_row = rows[-1]
+    assert failed_row[3] == "failed"
+    assert failed_row[8] == "3"
+    assert failed_row[9] == "TimeoutError"
+
+
+def test_all_page_timings_filters_by_status(tmp_path: Path) -> None:
+    store = OpsStore(tmp_path / "ops.db")
+    _seed_report_task(store, page_count=3)
+
+    assert len(store.all_page_timings("report-task", status="completed")) == 3
+    assert len(store.all_page_timings("report-task", status="failed")) == 1
+    with pytest.raises(ValueError):
+        store.all_page_timings("report-task", status="bogus")
+
+
 def test_ops_runtime_background_sync_persists_router_tasks(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
@@ -206,6 +322,7 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "/api/services" in paths
     assert "/api/tasks" in paths
     assert "/api/tasks/{task_id}/page-timings" in paths
+    assert "/api/tasks/{task_id}/report" in paths
     assert "/api/tasks/{task_id}/preview" in paths
     assert "/api/tasks/{task_id}/preview/pages/{page_number}" in paths
     assert "/api/batch-runs" in paths
@@ -234,6 +351,9 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "task-timing-summary" in dashboard_js
     assert "vlm_request_seconds" in dashboard_js
     assert "页面耗时" in dashboard_js
+    assert "data-task-report" in dashboard_js
+    assert "导出 Markdown 报告" in dashboard_js
+    assert "导出 CSV" in dashboard_js
     assert "task-timing-table" in dashboard_css
     assert "width: calc(100vw - 24px)" in dashboard_css
 

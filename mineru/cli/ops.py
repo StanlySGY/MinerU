@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import hashlib
 import io
 import json
@@ -97,6 +98,25 @@ def json_loads_object(value: str | None) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def markdown_table_cell(value: Any, limit: int = 500) -> str:
+    if value is None:
+        return ""
+    text = str(value).replace("\r", " ").replace("\n", " ").replace("|", "\\|")
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > limit:
+        return text[: limit - 3] + "..."
+    return text
+
+
+def format_seconds_cell(value: Any) -> str:
+    if value is None:
+        return "-"
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return "-"
 
 
 def build_smoke_test_pdf() -> bytes:
@@ -446,6 +466,25 @@ class OpsStore:
             "limit": normalized_limit,
             "offset": normalized_offset,
         }
+
+    def all_page_timings(
+        self,
+        task_id: str,
+        *,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        allowed_statuses = {"completed", "skipped", "failed"}
+        if status is not None and status not in allowed_statuses:
+            raise ValueError(f"unsupported page timing status: {status}")
+        query = "SELECT * FROM task_page_timings WHERE task_id = ?"
+        params: list[Any] = [task_id]
+        if status is not None:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY file_name ASC, page_number ASC"
+        with self.connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
 
     def page_timing_summary(
         self,
@@ -1487,6 +1526,119 @@ class OpsRuntime:
         ]
         return "\n".join(lines)
 
+    @staticmethod
+    def task_report_markdown(
+        task: dict[str, Any],
+        timing: dict[str, Any],
+    ) -> str:
+        progress = task.get("progress") or {}
+        summary = timing.get("summary") or {}
+        items = timing.get("items") or []
+        lines = [
+            "# MinerU 任务耗时报告",
+            "",
+            f"- Task ID：`{task.get('task_id', '-')}`",
+            f"- 文件：{markdown_table_cell(', '.join(task.get('file_names') or []), 300)}",
+            f"- 状态：`{task.get('status', '-')}`",
+            f"- Backend：`{task.get('backend', '-')}`",
+            f"- 创建时间：{task.get('created_at') or '-'}",
+            f"- 开始时间：{task.get('started_at') or '-'}",
+            f"- 完成时间：{task.get('completed_at') or '-'}",
+            f"- 总页数：{progress.get('total_pages', 0)}",
+            f"- 已完成：{progress.get('completed_pages', 0)}",
+            f"- 已跳过：{progress.get('skipped_pages', 0)}",
+            f"- 失败：{progress.get('failed_pages', 0)}",
+        ]
+        if task.get("error"):
+            lines.append(f"- 任务错误：{markdown_table_cell(task.get('error'), 800)}")
+        lines.extend(["", "## 耗时摘要", ""])
+        if summary.get("recorded_pages"):
+            lines.extend(
+                [
+                    f"- 已记录页面：{summary.get('recorded_pages', 0)}",
+                    f"- 完成页数：{summary.get('completed_pages', 0)}",
+                    f"- 跳过页数：{summary.get('skipped_pages', 0)}",
+                    f"- 失败页数：{summary.get('failed_pages', 0)}",
+                    f"- 平均 VLM 请求耗时：{format_seconds_cell(summary.get('completed_average_vlm_request_seconds'))} 秒",
+                    f"- P50：{format_seconds_cell(summary.get('completed_p50_vlm_request_seconds'))} 秒",
+                    f"- P95：{format_seconds_cell(summary.get('completed_p95_vlm_request_seconds'))} 秒",
+                    f"- 最慢请求：{format_seconds_cell(summary.get('completed_max_vlm_request_seconds'))} 秒",
+                    f"- 慢页阈值：{summary.get('slow_page_seconds', '-')} 秒",
+                    f"- 慢页数量：{summary.get('slow_pages', 0)}",
+                ]
+            )
+        else:
+            lines.append("暂无已保存的页级耗时记录。")
+        lines.extend(
+            [
+                "",
+                "## 逐页耗时",
+                "",
+                "| 文件 | 页码 | 状态 | 排队(秒) | VLM 请求(秒) | 重试等待(秒) | 总耗时(秒) | 尝试次数 | 错误 |",
+                "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+            ]
+        )
+        if items:
+            row_format = (
+                "| {file_name} | {page_number} | {status} | {queue} | {vlm} | "
+                "{retry} | {total} | {attempts} | {error} |"
+            )
+            for row in items:
+                lines.append(
+                    row_format.format(
+                        file_name=markdown_table_cell(row.get("file_name"), 160),
+                        page_number=row.get("page_number", "-"),
+                        status=markdown_table_cell(row.get("status"), 30),
+                        queue=format_seconds_cell(row.get("queue_seconds")),
+                        vlm=format_seconds_cell(row.get("vlm_request_seconds")),
+                        retry=format_seconds_cell(row.get("retry_wait_seconds")),
+                        total=format_seconds_cell(row.get("total_seconds")),
+                        attempts=row.get("attempts", "-"),
+                        error=markdown_table_cell(row.get("error"), 300),
+                    )
+                )
+        else:
+            lines.append("| - | - | - | - | - | - | - | - | 暂无已保存的页级耗时记录 |")
+        lines.append("")
+        return "\n".join(lines)
+
+    @staticmethod
+    def task_report_csv(timing: dict[str, Any]) -> str:
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow(
+            [
+                "file_name",
+                "page_number",
+                "page_idx",
+                "status",
+                "queue_seconds",
+                "vlm_request_seconds",
+                "retry_wait_seconds",
+                "total_seconds",
+                "attempts",
+                "error_type",
+                "error",
+            ]
+        )
+        for row in timing.get("items") or []:
+            writer.writerow(
+                [
+                    row.get("file_name", ""),
+                    row.get("page_number", ""),
+                    row.get("page_idx", ""),
+                    row.get("status", ""),
+                    row.get("queue_seconds", ""),
+                    row.get("vlm_request_seconds", ""),
+                    row.get("retry_wait_seconds", ""),
+                    row.get("total_seconds", ""),
+                    row.get("attempts", ""),
+                    row.get("error_type", "") or "",
+                    row.get("error", "") or "",
+                ]
+            )
+        return buffer.getvalue()
+
     async def start_batch(self, request: BatchRunRequest) -> dict[str, Any]:
         if not self.batch_script.is_file():
             raise HTTPException(status_code=503, detail="batch diagnosis script is unavailable")
@@ -2081,6 +2233,57 @@ def create_app() -> FastAPI:
             slow_page_seconds=runtime.slow_page_seconds,
         )
         return result
+
+    @app.get("/api/tasks/{task_id}/report")
+    async def task_report(
+        task_id: str,
+        request: Request,
+        format: str = "markdown",
+        status: str | None = None,
+    ):
+        authorize(request)
+        if format not in {"markdown", "csv"}:
+            raise HTTPException(status_code=400, detail="format must be markdown or csv")
+        cached = runtime.store.cached_task(task_id)
+        if cached is None:
+            try:
+                response = await runtime.http_client.get(f"{runtime.router_url}/tasks/{task_id}")
+                response.raise_for_status()
+                payload = response.json()
+                if isinstance(payload, dict):
+                    runtime.store.upsert_tasks([payload])
+                    cached = payload
+            except Exception:
+                pass
+        if cached is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        try:
+            items = runtime.store.all_page_timings(task_id, status=status)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        summary = runtime.store.page_timing_summary(
+            task_id,
+            status=status,
+            slow_page_seconds=runtime.slow_page_seconds,
+        )
+        timing = {"items": items, "summary": summary}
+        if format == "csv":
+            content = runtime.task_report_csv(timing)
+            return Response(
+                content=content,
+                media_type="text/csv; charset=utf-8",
+                headers={
+                    "Content-Disposition": f'attachment; filename="task-report-{task_id}.csv"'
+                },
+            )
+        content = runtime.task_report_markdown(cached, timing)
+        return Response(
+            content=content,
+            media_type="text/markdown; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="task-report-{task_id}.md"'
+            },
+        )
 
     @app.get("/api/tasks/{task_id}/preview")
     async def task_preview(task_id: str, request: Request):

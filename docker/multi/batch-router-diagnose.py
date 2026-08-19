@@ -576,6 +576,50 @@ def collect_failed_pages(file_results: list[dict[str, Any]]) -> list[dict[str, A
     return failed_pages
 
 
+def collect_all_pages(progress: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten progress.files[].pages[] (from the Router status payload) into
+    a per-page list, tagging each row with its file name and sorted by
+    file name then page number. Returns [] when the server response has no
+    page-level progress (older deployments, or a task that never queued
+    per-page timing)."""
+    rows: list[dict[str, Any]] = []
+    files = progress.get("files")
+    if not isinstance(files, list):
+        return rows
+    for file_state in files:
+        if not isinstance(file_state, dict):
+            continue
+        file_name = file_state.get("file_name")
+        pages = file_state.get("pages")
+        if not isinstance(pages, list):
+            continue
+        for page in pages:
+            if not isinstance(page, dict):
+                continue
+            status = page.get("status")
+            if status not in {"completed", "skipped", "failed"}:
+                continue
+            item = dict(page)
+            item.setdefault("file_name", file_name)
+            rows.append(item)
+    rows.sort(
+        key=lambda row: (
+            str(row.get("file_name") or ""),
+            int(row.get("page_number") or 0),
+        )
+    )
+    return rows
+
+
+def format_page_seconds(value: Any) -> str:
+    if value is None:
+        return "-"
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return "-"
+
+
 def classify_result(
     task_status: str,
     partial_success: bool,
@@ -948,6 +992,32 @@ def render_report(
                         elapsed=format_duration(page.get("elapsed_seconds")),
                         attempts=page.get("attempts", "-"),
                         error=markdown_escape(page.get("error") or "", 500),
+                    )
+                )
+
+        page_rows = collect_all_pages(item.get("progress") or {})
+        if page_rows:
+            lines.extend(
+                [
+                    "",
+                    "#### 逐页耗时",
+                    "",
+                    "| 文件 | 页码 | 状态 | 排队(秒) | VLM请求(秒) | 重试等待(秒) | 总耗时(秒) | 尝试次数 | 错误 |",
+                    "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+                ]
+            )
+            for page in page_rows:
+                lines.append(
+                    "| {file_name} | {number} | {status} | {queue} | {vlm} | {retry} | {total} | {attempts} | {error} |".format(
+                        file_name=markdown_escape(page.get("file_name") or "", 160),
+                        number=page.get("page_number", "-"),
+                        status=markdown_escape(page.get("status") or "", 30),
+                        queue=format_page_seconds(page.get("queue_seconds")),
+                        vlm=format_page_seconds(page.get("vlm_request_seconds")),
+                        retry=format_page_seconds(page.get("retry_wait_seconds")),
+                        total=format_page_seconds(page.get("total_seconds")),
+                        attempts=page.get("attempts", "-"),
+                        error=markdown_escape(page.get("error") or "", 300),
                     )
                 )
 
