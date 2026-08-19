@@ -159,6 +159,14 @@ def test_task_report_markdown_lists_every_page(tmp_path: Path) -> None:
     assert "report.pdf" in content
     assert "## 耗时摘要" in content
     assert "## 逐页耗时" in content
+    # the Ops-side display threshold says nothing about the runtime page timeout,
+    # so it must not appear in a report meant for diagnosing per-page duration
+    assert "慢页阈值" not in content
+    assert "慢页数量" not in content
+    assert "最慢请求" in content
+    # the four aggregate stats cover completed pages only; say so, or a 600s
+    # skipped page silently hides behind a small "最慢请求"
+    assert "仅基于已完成页面" in content
     # every page has its own row, none truncated away
     for page_number in (1, 2, 3, 4):
         assert f"| {page_number} |" in content

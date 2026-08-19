@@ -1559,12 +1559,13 @@ class OpsRuntime:
                     f"- 完成页数：{summary.get('completed_pages', 0)}",
                     f"- 跳过页数：{summary.get('skipped_pages', 0)}",
                     f"- 失败页数：{summary.get('failed_pages', 0)}",
+                    "",
+                    "以下 VLM 请求耗时统计仅基于已完成页面，跳过/失败页不计入（其耗时见下方逐页表）：",
+                    "",
                     f"- 平均 VLM 请求耗时：{format_seconds_cell(summary.get('completed_average_vlm_request_seconds'))} 秒",
                     f"- P50：{format_seconds_cell(summary.get('completed_p50_vlm_request_seconds'))} 秒",
                     f"- P95：{format_seconds_cell(summary.get('completed_p95_vlm_request_seconds'))} 秒",
                     f"- 最慢请求：{format_seconds_cell(summary.get('completed_max_vlm_request_seconds'))} 秒",
-                    f"- 慢页阈值：{summary.get('slow_page_seconds', '-')} 秒",
-                    f"- 慢页数量：{summary.get('slow_pages', 0)}",
                 ]
             )
         else:
