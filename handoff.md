@@ -5,7 +5,8 @@
 - 当前分支：`dev`。
 - 已将最新 `origin/master`（`4fe4bde1`，MinerU `3.4.5`）合并到 `dev`，合并提交：`bab95584878e4f231240c70c332d8548598ba472`。
 - 本次运维控制台与 VLM 基准测试改动提交：`5807835d`（`feat: improve ops timeout diagnostics and VLM benchmarks`）。
-- 本记录提交后，需要将 `dev` 推送到 `origin`；服务器和现场均应拉取 `dev`，不要从旧的 `master` 构建本次测试镜像。
+- 上一轮 handoff 已提交为 `1efb0a53`；本次补充现场既有目录、`ops-ui7` 镜像命名和 `env.multi.example` 易读注释后，再次提交并推送 `dev`。
+- 服务器和现场均应使用最新 `dev`，不要从旧的 `master` 构建本次测试镜像。
 - 本次只提交了明确列出的功能、测试和 handoff 文件；`.gitignore`、`.codegraph/`、`.mimocode/`、`docs/analysis-error/`、`mineru-ops-data/`、`mineru_diag.py`、`test.pdf` 等本地内容不要整体暂存或清理。
 
 ## 五项问题的核查结论与实现
@@ -115,6 +116,57 @@ git diff --check
 - `docker/multi/update-code.sh <tag>` 会构建代码镜像、更新 `env.multi` 中的 `MINERU_CODE_IMAGE`，随后通过 `start-multi.sh stop/start` 重建 Router/API，并重启 Ops。离线现场使用导入镜像时，应手动把 `env.multi` 的 `MINERU_CODE_IMAGE` 改成导入后的 tag，再执行 `start-multi.sh stop && start-multi.sh start`。
 - `MINERU_VLM_CLIENT_HTTP_TIMEOUT=7200` 是 API 容器启动参数，修改 `env.multi` 后必须重新创建 API 容器才会生效。
 - 建议保留 `MINERU_VLM_CLIENT_MAX_RETRIES=0`，避免底层 HTTP Client 和页级重试叠加。
+
+本次沿用服务器既有目录与上一版命名规则，只把 `ops-ui6` 升级为 `ops-ui7`：
+
+```text
+服务器仓库：/data/maas/sgy_arm/gd-dev/MinerU
+上一版归档：mineru-code-v3.4.2-ops-ui6.tar.gz
+本次镜像：mineru-code:v3.4.2-ops-ui7
+本次归档：/data/maas/sgy_arm/gd-dev/MinerU/docker/base/export/mineru-code-v3.4.2-ops-ui7.tar.gz
+```
+
+服务器构建和导出命令：
+
+```bash
+cd /data/maas/sgy_arm/gd-dev/MinerU
+git fetch origin
+git switch dev
+git pull --ff-only origin dev
+
+cd /data/maas/sgy_arm/gd-dev/MinerU/docker/base
+MINERU_CODE_TAG=v3.4.2-ops-ui7 ./build.sh code
+MINERU_CODE_TAG=v3.4.2-ops-ui7 ./build.sh export-code
+
+docker image inspect mineru-code:v3.4.2-ops-ui7
+ls -lh /data/maas/sgy_arm/gd-dev/MinerU/docker/base/export/mineru-code-v3.4.2-ops-ui7.tar.gz
+
+cd /data/maas/sgy_arm/gd-dev/MinerU/docker/base/export
+sha256sum mineru-code-v3.4.2-ops-ui7.tar.gz \
+  > mineru-code-v3.4.2-ops-ui7.tar.gz.sha256
+```
+
+注意：`mineru-code` 归档只包含代码镜像中的 `mineru/` 和 `pyproject.toml`，不会携带本次同样有改动的 `docker/multi/batch-router-diagnose.py`、`docker/multi/compose-multi.yaml` 和 `docker/multi/env.multi.example`。因此现场部署目录也必须更新到最新 `dev`，不能只导入代码镜像。如果现场不直接拉 Git，可在服务器额外生成部署文件包并与代码镜像一起交付：
+
+```bash
+cd /data/maas/sgy_arm/gd-dev/MinerU
+git archive \
+  --format=tar.gz \
+  --output=docker/base/export/mineru-multi-v3.4.2-ops-ui7.tar.gz \
+  HEAD docker/multi
+```
+
+现场覆盖 `docker/multi` 前必须备份实际使用的 `env.multi`，不要让示例文件覆盖现场密钥、地址和设备配置。现场 `env.multi` 至少确认：
+
+```env
+MINERU_CODE_IMAGE=mineru-code:v3.4.2-ops-ui7
+MINERU_VLM_PAGE_TIMEOUT_SECONDS=600
+MINERU_VLM_CONNECT_MAX_RETRIES=1
+MINERU_VLM_CLIENT_MAX_RETRIES=0
+MINERU_VLM_CLIENT_HTTP_TIMEOUT=7200
+```
+
+`page_timeout_seconds`、`page_connect_max_retries`、`vlm_batch_size` 是 Ops 控制台每个批次的输入参数，不是在 `env.multi` 中新增的变量。`docker/multi/env.multi.example` 已补充中文注释，说明默认值、控制台覆盖方式、建议测试值，以及 hard timeout 修改后必须重新创建 API 容器。
 
 ## 现场验收建议
 
