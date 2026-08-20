@@ -127,6 +127,9 @@ def _run_config(tmp_path: Path):
         recursive=False,
         poll_interval=5.0,
         task_timeout=3600.0,
+        page_timeout_seconds=600.0,
+        page_connect_max_retries=0,
+        vlm_batch_size=1,
         pause_seconds=0.0,
         submit_retries=1,
         curl_bin="curl",
@@ -177,7 +180,7 @@ def test_render_report_lists_every_page_timing(tmp_path: Path) -> None:
     report = MODULE.render_report(_run_config(tmp_path), 1, results, None, "2026-08-19T00:00:00+00:00")
 
     assert "#### 逐页耗时" in report
-    assert "| 文件 | 页码 | 状态 | 排队(秒) | VLM请求(秒) | 重试等待(秒) | 总耗时(秒) | 尝试次数 | 错误 |" in report
+    assert "| 文件 | 页码 | 状态 | 排队(秒) | 成功尝试(秒) | 失败尝试(秒) | VLM请求累计(秒) | 重试等待(秒) | 含重试总耗时(秒) | 尝试次数 | 错误 |" in report
     for page_number in (1, 2, 3):
         assert f"| a.pdf | {page_number} |" in report
     # escaped so the pipe/newline cannot break the table
@@ -206,3 +209,93 @@ def test_render_report_omits_page_table_without_page_progress(tmp_path: Path) ->
     report = MODULE.render_report(_run_config(tmp_path), 1, results, None, "2026-08-19T00:00:00+00:00")
 
     assert "#### 逐页耗时" not in report
+
+
+def test_build_submit_forms_includes_page_request_controls(tmp_path: Path) -> None:
+    config = _run_config(tmp_path)
+
+    forms = dict(MODULE.build_submit_forms(config))
+
+    assert forms["page_timeout_seconds"] == "600.0"
+    assert forms["page_connect_max_retries"] == "0"
+    assert forms["vlm_batch_size"] == "1"
+
+
+def test_poll_task_timeout_preserves_last_remote_progress(tmp_path: Path, monkeypatch) -> None:
+    config = _run_config(tmp_path)
+    payload = {
+        "task_id": "task-timeout",
+        "status": "processing",
+        "progress": {"total_pages": 3, "completed_pages": 2},
+    }
+    monotonic_values = iter([0.0, 0.5, 1.1])
+    monkeypatch.setattr(MODULE.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(MODULE.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        MODULE,
+        "curl_request",
+        lambda *_args, **_kwargs: MODULE.HttpResponse(200, payload, "{}"),
+    )
+    raw_path = tmp_path / "raw/status-timeout.json"
+    monkeypatch.setattr(MODULE, "write_raw_response", lambda *_args, **_kwargs: raw_path)
+    config = MODULE.RunConfig(**{**config.__dict__, "task_timeout": 1.0})
+
+    with pytest.raises(MODULE.TaskWaitTimeout) as captured:
+        MODULE.poll_task(config, "task-timeout", "0001-sample")
+
+    assert captured.value.last_payload == payload
+    assert captured.value.raw_paths == [raw_path]
+    assert "remote task was not cancelled" in str(captured.value)
+
+
+def test_diagnose_pdf_marks_wait_timeout_without_fabricating_failures(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = _run_config(tmp_path)
+    pdf_path = tmp_path / "sample.pdf"
+    pdf_path.write_bytes(b"%PDF-test")
+    last_payload = {
+        "task_id": "task-timeout",
+        "status": "processing",
+        "partial_success": True,
+        "progress": {
+            "total_pages": 3,
+            "completed_pages": 2,
+            "failed_pages": 0,
+            "files": [],
+        },
+    }
+    monkeypatch.setattr(
+        MODULE,
+        "submit_pdf",
+        lambda *_args, **_kwargs: MODULE.HttpResponse(
+            202,
+            {"task_id": "task-timeout"},
+            '{"task_id":"task-timeout"}',
+        ),
+    )
+    monkeypatch.setattr(
+        MODULE,
+        "poll_task",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            MODULE.TaskWaitTimeout(
+                "monitoring stopped",
+                last_payload=last_payload,
+                raw_paths=[tmp_path / "status-timeout.json"],
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        MODULE,
+        "write_raw_response",
+        lambda *_args, **_kwargs: tmp_path / "submit.json",
+    )
+
+    result = MODULE.diagnose_pdf(config, pdf_path, 1)
+
+    assert result["task_status"] == "wait_timeout"
+    assert result["classification"] == "monitoring_stopped"
+    assert result["progress"] == last_payload["progress"]
+    assert result["failed_pages"] == []
+    assert result["partial_success"] is True

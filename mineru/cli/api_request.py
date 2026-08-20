@@ -50,6 +50,9 @@ class ParseRequestOptions:
     client_side_output_generation: bool
     start_page_id: int
     end_page_id: int
+    page_timeout_seconds: float
+    page_connect_max_retries: int
+    vlm_batch_size: int
 
 
 def validate_parse_method(parse_method: str) -> str:
@@ -209,6 +212,18 @@ async def parse_request_form(
         int,
         Form(description="The ending page for PDF parsing, beginning from 0"),
     ] = 99999,
+    page_timeout_seconds: Annotated[
+        float,
+        Form(description="Soft timeout in seconds for one VLM request (1-7200)"),
+    ] = 600.0,
+    page_connect_max_retries: Annotated[
+        int,
+        Form(description="Retries for transient VLM connection errors (0-3)"),
+    ] = 1,
+    vlm_batch_size: Annotated[
+        int,
+        Form(description="Pages per VLM micro-batch (1-16)"),
+    ] = 1,
 ) -> ParseRequestOptions:
     """解析 API/Router 共用的 multipart 表单，并保持 Swagger 参数同源。"""
     backend = validate_parse_backend(backend)
@@ -229,6 +244,13 @@ async def parse_request_form(
         return_model_output = True
         return_content_list = False
         return_images = True
+
+    if not 1.0 <= page_timeout_seconds <= 7200.0:
+        raise HTTPException(status_code=400, detail="page_timeout_seconds must be between 1 and 7200")
+    if not 0 <= page_connect_max_retries <= 3:
+        raise HTTPException(status_code=400, detail="page_connect_max_retries must be between 0 and 3")
+    if not 1 <= vlm_batch_size <= 16:
+        raise HTTPException(status_code=400, detail="vlm_batch_size must be between 1 and 16")
 
     effective_return_original_file = return_original_file and response_format_zip
     return ParseRequestOptions(
@@ -251,4 +273,7 @@ async def parse_request_form(
         client_side_output_generation=client_side_output_generation,
         start_page_id=start_page_id,
         end_page_id=end_page_id,
+        page_timeout_seconds=page_timeout_seconds,
+        page_connect_max_retries=page_connect_max_retries,
+        vlm_batch_size=vlm_batch_size,
     )

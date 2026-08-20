@@ -72,7 +72,7 @@ services:
       - --max-retries
       - ${MINERU_VLM_CLIENT_MAX_RETRIES:-0}
       - --http-timeout
-      - ${MINERU_VLM_CLIENT_HTTP_TIMEOUT:-600}
+      - ${MINERU_VLM_CLIENT_HTTP_TIMEOUT:-7200}
     healthcheck: &api-healthcheck
       test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
       interval: 30s

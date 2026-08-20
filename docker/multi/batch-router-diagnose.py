@@ -29,6 +29,21 @@ class CurlRequestError(RuntimeError):
     pass
 
 
+class TaskWaitTimeout(TimeoutError):
+    """The diagnostic client stopped waiting; the remote task may still be running."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        last_payload: dict[str, Any] | None = None,
+        raw_paths: list[Path] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.last_payload = last_payload or {}
+        self.raw_paths = list(raw_paths or [])
+
+
 @dataclass(frozen=True)
 class HttpResponse:
     status_code: int
@@ -53,6 +68,9 @@ class RunConfig:
     recursive: bool
     poll_interval: float
     task_timeout: float
+    page_timeout_seconds: float
+    page_connect_max_retries: int
+    vlm_batch_size: int
     pause_seconds: float
     submit_retries: int
     curl_bin: str
@@ -655,6 +673,9 @@ def build_submit_forms(config: RunConfig) -> list[tuple[str, str]]:
         ("client_side_output_generation", "false"),
         ("start_page_id", str(config.start_page_id)),
         ("end_page_id", str(config.end_page_id)),
+        ("page_timeout_seconds", str(config.page_timeout_seconds)),
+        ("page_connect_max_retries", str(config.page_connect_max_retries)),
+        ("vlm_batch_size", str(config.vlm_batch_size)),
     ]
     if config.server_url:
         forms.append(("server_url", config.server_url))
@@ -718,7 +739,12 @@ def poll_task(
     if last_payload is not None:
         timeout_response = HttpResponse(200, last_payload, json.dumps(last_payload))
         raw_paths.append(write_raw_response(config.raw_dir, raw_prefix, "status-timeout", timeout_response))
-    raise TimeoutError(f"task did not reach a terminal state within {format_duration(config.task_timeout)}")
+    raise TaskWaitTimeout(
+        f"diagnostic client stopped waiting after {format_duration(config.task_timeout)}; "
+        "the remote task was not cancelled and may still be running",
+        last_payload=last_payload,
+        raw_paths=raw_paths,
+    )
 
 
 def diagnose_pdf(config: RunConfig, pdf_path: Path, index: int) -> dict[str, Any]:
@@ -798,6 +824,29 @@ def diagnose_pdf(config: RunConfig, pdf_path: Path, index: int) -> dict[str, Any
             "elapsed_seconds": round(time.monotonic() - started, 2),
             "raw_paths": raw_paths,
             "page_report_available": bool(file_results),
+            "preview": preview,
+        }
+    except TaskWaitTimeout as exc:
+        raw_paths.extend(path for path in exc.raw_paths if path not in raw_paths)
+        progress = exc.last_payload.get("progress")
+        result = {
+            "index": index,
+            "file_name": pdf_path.name,
+            "relative_path": relative_path,
+            "size_bytes": pdf_path.stat().st_size,
+            "task_id": task_id,
+            "task_status": "wait_timeout",
+            "classification": "monitoring_stopped",
+            "partial_success": bool(exc.last_payload.get("partial_success", False)),
+            "progress": progress if isinstance(progress, dict) else {},
+            "file_results": [],
+            "failed_pages": [],
+            "error": f"{type(exc).__name__}: {exc}",
+            "started_at": started_at,
+            "completed_at": utc_now_iso(),
+            "elapsed_seconds": round(time.monotonic() - started, 2),
+            "raw_paths": raw_paths,
+            "page_report_available": False,
             "preview": preview,
         }
     except (CurlRequestError, TimeoutError, OSError) as exc:
@@ -1002,20 +1051,26 @@ def render_report(
                     "",
                     "#### 逐页耗时",
                     "",
-                    "| 文件 | 页码 | 状态 | 排队(秒) | VLM请求(秒) | 重试等待(秒) | 总耗时(秒) | 尝试次数 | 错误 |",
-                    "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+                    "| 文件 | 页码 | 状态 | 排队(秒) | 成功尝试(秒) | 失败尝试(秒) | VLM请求累计(秒) | 重试等待(秒) | 含重试总耗时(秒) | 尝试次数 | 错误 |",
+                    "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
                 ]
             )
             for page in page_rows:
                 lines.append(
-                    "| {file_name} | {number} | {status} | {queue} | {vlm} | {retry} | {total} | {attempts} | {error} |".format(
+                    "| {file_name} | {number} | {status} | {queue} | {successful} | {failed} | {vlm} | {retry} | {total} | {attempts} | {error} |".format(
                         file_name=markdown_escape(page.get("file_name") or "", 160),
                         number=page.get("page_number", "-"),
                         status=markdown_escape(page.get("status") or "", 30),
                         queue=format_page_seconds(page.get("queue_seconds")),
+                        successful=format_page_seconds(page.get("successful_attempt_seconds")),
+                        failed=format_page_seconds(page.get("failed_attempt_seconds")),
                         vlm=format_page_seconds(page.get("vlm_request_seconds")),
-                        retry=format_page_seconds(page.get("retry_wait_seconds")),
-                        total=format_page_seconds(page.get("total_seconds")),
+                        retry=format_page_seconds(
+                            page.get("retry_overhead_seconds", page.get("retry_wait_seconds"))
+                        ),
+                        total=format_page_seconds(
+                            page.get("with_retry_wall_seconds", page.get("total_seconds"))
+                        ),
                         attempts=page.get("attempts", "-"),
                         error=markdown_escape(page.get("error") or "", 300),
                     )
@@ -1130,6 +1185,14 @@ def parse_args() -> argparse.Namespace:
         default=7200.0,
         help="Maximum seconds to wait for each PDF task (default: %(default)s)",
     )
+    parser.add_argument(
+        "--page-timeout-seconds",
+        type=float,
+        default=600.0,
+        help="Soft timeout in seconds for one VLM request (default: %(default)s)",
+    )
+    parser.add_argument("--page-connect-max-retries", type=int, default=0)
+    parser.add_argument("--vlm-batch-size", type=int, default=1)
     parser.add_argument("--pause-seconds", type=float, default=2.0)
     parser.add_argument("--submit-retries", type=int, default=2)
     parser.add_argument("--limit", type=int, default=0)
@@ -1204,6 +1267,9 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         recursive=args.recursive,
         poll_interval=max(0.5, args.poll_interval),
         task_timeout=max(1.0, args.task_timeout),
+        page_timeout_seconds=min(7200.0, max(1.0, args.page_timeout_seconds)),
+        page_connect_max_retries=min(3, max(0, args.page_connect_max_retries)),
+        vlm_batch_size=min(16, max(1, args.vlm_batch_size)),
         pause_seconds=max(0.0, args.pause_seconds),
         submit_retries=max(0, args.submit_retries),
         curl_bin=args.curl_bin,

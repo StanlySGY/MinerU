@@ -34,6 +34,8 @@ from fastapi.staticfiles import StaticFiles
 from loguru import logger
 from pydantic import BaseModel, Field
 
+from mineru.utils.pdfium_guard import rewrite_pdf_bytes_with_pdfium
+
 DEFAULT_DATA_DIR = "/tmp/mineru-ops"
 DEFAULT_TEST_ROOT = "./test-pdfs"
 TERMINAL_BATCH_STATES = {
@@ -190,6 +192,25 @@ class OpsStore:
                     ON task_page_timings(task_id, status);
                 CREATE INDEX IF NOT EXISTS idx_task_page_timings_duration
                     ON task_page_timings(task_id, total_seconds DESC);
+                CREATE TABLE IF NOT EXISTS task_page_attempts (
+                    task_id TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    page_idx INTEGER NOT NULL,
+                    attempt_no INTEGER NOT NULL,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    outcome TEXT NOT NULL,
+                    error_type TEXT,
+                    error TEXT,
+                    request_seconds REAL,
+                    retry_wait_before_seconds REAL,
+                    timeout_seconds REAL,
+                    batch_size INTEGER,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (task_id, file_name, page_idx, attempt_no)
+                );
+                CREATE INDEX IF NOT EXISTS idx_task_page_attempts_page
+                    ON task_page_attempts(task_id, file_name, page_idx, attempt_no);
                 CREATE TABLE IF NOT EXISTS batch_runs (
                     run_id TEXT PRIMARY KEY,
                     status TEXT NOT NULL,
@@ -264,7 +285,7 @@ class OpsStore:
         if not task_id:
             return []
         progress = task.get("progress")
-        if not isinstance(progress, dict):
+        if not isinstance(progress, dict) or progress.get("synthetic") is True:
             return []
         rows: list[tuple[Any, ...]] = []
         for file_state in progress.get("files") or []:
@@ -308,6 +329,74 @@ class OpsStore:
                     )
                 )
         return rows
+
+    @classmethod
+    def _page_attempt_rows(
+        cls,
+        task: dict[str, Any],
+        updated_at: str,
+    ) -> list[tuple[Any, ...]]:
+        task_id = str(task.get("task_id") or "")
+        progress = task.get("progress")
+        if not task_id or not isinstance(progress, dict) or progress.get("synthetic") is True:
+            return []
+        rows: list[tuple[Any, ...]] = []
+        for file_state in progress.get("files") or []:
+            if not isinstance(file_state, dict):
+                continue
+            file_name = str(file_state.get("file_name") or "unknown")
+            for page in file_state.get("pages") or []:
+                if not isinstance(page, dict):
+                    continue
+                try:
+                    page_idx = int(page.get("page_idx", int(page.get("page_number", 1)) - 1))
+                except (TypeError, ValueError):
+                    continue
+                for position, attempt in enumerate(page.get("attempt_details") or [], start=1):
+                    if not isinstance(attempt, dict):
+                        continue
+                    try:
+                        attempt_no = max(1, int(attempt.get("attempt_no", position)))
+                    except (TypeError, ValueError):
+                        attempt_no = position
+                    rows.append((
+                        task_id, file_name, page_idx, attempt_no,
+                        attempt.get("started_at"), attempt.get("completed_at"),
+                        str(attempt.get("outcome") or "unknown"),
+                        str(attempt.get("error_type"))[:200] if attempt.get("error_type") else None,
+                        str(attempt.get("error"))[:4000] if attempt.get("error") else None,
+                        cls._as_float(attempt.get("request_seconds")),
+                        cls._as_float(attempt.get("retry_wait_before_seconds")),
+                        cls._as_float(attempt.get("timeout_seconds")),
+                        cls._as_int(attempt.get("batch_size"), 1),
+                        updated_at,
+                    ))
+        return rows
+
+    @staticmethod
+    def _upsert_page_attempt_rows(
+        connection: sqlite3.Connection,
+        rows: list[tuple[Any, ...]],
+    ) -> None:
+        if not rows:
+            return
+        connection.executemany(
+            """
+            INSERT INTO task_page_attempts(
+                task_id, file_name, page_idx, attempt_no, started_at, completed_at,
+                outcome, error_type, error, request_seconds,
+                retry_wait_before_seconds, timeout_seconds, batch_size, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(task_id, file_name, page_idx, attempt_no) DO UPDATE SET
+                started_at = excluded.started_at, completed_at = excluded.completed_at,
+                outcome = excluded.outcome, error_type = excluded.error_type,
+                error = excluded.error, request_seconds = excluded.request_seconds,
+                retry_wait_before_seconds = excluded.retry_wait_before_seconds,
+                timeout_seconds = excluded.timeout_seconds, batch_size = excluded.batch_size,
+                updated_at = excluded.updated_at
+            """,
+            rows,
+        )
 
     @staticmethod
     def _upsert_page_timing_rows(
@@ -359,6 +448,15 @@ class OpsStore:
                 )
             )
         self._upsert_page_timing_rows(connection, rows)
+        attempt_rows = [
+            row
+            for snapshot in snapshots
+            for row in self._page_attempt_rows(
+                json_loads_object(snapshot["payload_json"]),
+                updated_at,
+            )
+        ]
+        self._upsert_page_attempt_rows(connection, attempt_rows)
 
     def upsert_tasks(self, tasks: list[dict[str, Any]]) -> None:
         now = utc_now_iso()
@@ -417,6 +515,49 @@ class OpsStore:
                 for row in self._page_timing_rows(task, now)
             ]
             self._upsert_page_timing_rows(connection, timing_rows)
+            attempt_rows = [
+                row
+                for task, _, _, _ in changed
+                for row in self._page_attempt_rows(task, now)
+            ]
+            self._upsert_page_attempt_rows(connection, attempt_rows)
+
+    @staticmethod
+    def _attach_page_attempts(
+        connection: sqlite3.Connection,
+        task_id: str,
+        records: list[dict[str, Any]],
+    ) -> None:
+        if not records:
+            return
+        attempts = connection.execute(
+            "SELECT * FROM task_page_attempts WHERE task_id = ? "
+            "ORDER BY file_name, page_idx, attempt_no",
+            (task_id,),
+        ).fetchall()
+        grouped: dict[tuple[str, int], list[dict[str, Any]]] = {}
+        for row in attempts:
+            item = dict(row)
+            grouped.setdefault((str(item["file_name"]), int(item["page_idx"])), []).append(item)
+        for record in records:
+            details = grouped.get((str(record["file_name"]), int(record["page_idx"])), [])
+            record["attempt_details"] = details
+            if not details:
+                record["successful_attempt_seconds"] = None
+                record["failed_attempt_seconds"] = None
+                record["retry_overhead_seconds"] = None
+                continue
+            record["successful_attempt_seconds"] = round(sum(
+                float(item.get("request_seconds") or 0.0)
+                for item in details if item.get("outcome") == "completed"
+            ), 3)
+            record["failed_attempt_seconds"] = round(sum(
+                float(item.get("request_seconds") or 0.0)
+                for item in details if item.get("outcome") != "completed"
+            ), 3)
+            record["retry_overhead_seconds"] = round(sum(
+                float(item.get("retry_wait_before_seconds") or 0.0) for item in details
+            ), 3)
 
     def page_timings(
         self,
@@ -460,8 +601,10 @@ class OpsStore:
                 "LIMIT ? OFFSET ?",
                 [*params, normalized_limit, normalized_offset],
             ).fetchall()
+            items = [dict(row) for row in rows]
+            self._attach_page_attempts(connection, task_id, items)
         return {
-            "items": [dict(row) for row in rows],
+            "items": items,
             "total": total,
             "limit": normalized_limit,
             "offset": normalized_offset,
@@ -484,7 +627,9 @@ class OpsStore:
         query += " ORDER BY file_name ASC, page_number ASC"
         with self.connect() as connection:
             rows = connection.execute(query, params).fetchall()
-        return [dict(row) for row in rows]
+            records = [dict(row) for row in rows]
+            self._attach_page_attempts(connection, task_id, records)
+        return records
 
     def page_timing_summary(
         self,
@@ -665,6 +810,9 @@ class BatchRunRequest(BaseModel):
     server_url: str | None = None
     recursive: bool = True
     task_timeout: int = Field(default=7200, ge=60, le=86400)
+    page_timeout_seconds: float = Field(default=600.0, ge=1, le=7200)
+    page_connect_max_retries: int = Field(default=0, ge=0, le=3)
+    vlm_batch_size: int = Field(default=1, ge=1, le=16)
     pause_seconds: float = Field(default=2.0, ge=0, le=300)
 
 
@@ -939,8 +1087,10 @@ class OpsRuntime:
                 continue
             shutil.rmtree(run_dir / "input", ignore_errors=True)
             shutil.rmtree(run_dir / "results", ignore_errors=True)
-            for zip_path in run_dir.glob("mineru-batch-*.zip"):
-                zip_path.unlink(missing_ok=True)
+            for zip_pattern in ("mineru-batch-*.zip", "mineru-problem-pages-*.zip"):
+                for zip_path in run_dir.glob(zip_pattern):
+                    zip_path.unlink(missing_ok=True)
+            shutil.rmtree(run_dir / "problem-pages", ignore_errors=True)
 
     def run_dir_for_record(self, record: dict[str, Any]) -> Path:
         run_dir = Path(record["report_path"]).parent.resolve()
@@ -992,6 +1142,166 @@ class OpsRuntime:
             "storage_bytes": self.directory_size(input_root) + self.directory_size(results_root),
             "retention_days": self.artifact_retention_days,
         }
+
+    @classmethod
+    def _problem_pages_from_preview(cls, preview: dict[str, Any]) -> list[dict[str, Any]]:
+        by_page_number: dict[int, dict[str, Any]] = {}
+
+        def add_page(page: Any, *, default_status: str | None = None) -> None:
+            if not isinstance(page, dict):
+                return
+            status = str(page.get("status") or default_status or "")
+            if status not in {"skipped", "failed"}:
+                return
+            page_number = cls._failed_page_number(page)
+            if page_number is None:
+                return
+            previous = by_page_number.get(page_number, {})
+            by_page_number[page_number] = {
+                **previous,
+                **page,
+                "page_idx": page_number - 1,
+                "page_number": page_number,
+                "status": status,
+            }
+
+        progress = preview.get("progress")
+        if isinstance(progress, dict):
+            for file_state in progress.get("files") or []:
+                if not isinstance(file_state, dict):
+                    continue
+                for page in file_state.get("pages") or []:
+                    add_page(page)
+        for page in preview.get("failed_pages") or []:
+            add_page(page, default_status="skipped")
+        return [by_page_number[number] for number in sorted(by_page_number)]
+
+    def build_problem_pages_archive(self, record: dict[str, Any]) -> Path:
+        artifacts = self.batch_artifacts(record)
+        originals_by_path = {
+            str(item.get("path") or ""): item
+            for item in artifacts["originals"]
+        }
+        problem_sources = []
+        for preview in artifacts["previews"]:
+            pages = self._problem_pages_from_preview(preview)
+            if pages:
+                problem_sources.append((preview, pages))
+        if not problem_sources:
+            raise HTTPException(status_code=404, detail="no skipped or failed pages are available")
+
+        run_dir = self.run_dir_for_record(record)
+        output_dir = run_dir / "problem-pages"
+        shutil.rmtree(output_dir, ignore_errors=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        manifest_rows: list[dict[str, Any]] = []
+
+        for position, (preview, pages) in enumerate(problem_sources, start=1):
+            relative_path = str(preview.get("relative_path") or preview.get("file_name") or "")
+            original = originals_by_path.get(relative_path)
+            if original is None:
+                same_name = [
+                    item for item in artifacts["originals"]
+                    if str(item.get("name") or "") == str(preview.get("file_name") or "")
+                ]
+                if len(same_name) == 1:
+                    original = same_name[0]
+            page_numbers = [int(page["page_number"]) for page in pages]
+            page_details = [
+                {
+                    "page_number": int(page["page_number"]),
+                    "status": str(page.get("status") or "unknown"),
+                    "error_type": page.get("error_type"),
+                    "error": page.get("error"),
+                }
+                for page in pages
+            ]
+            row: dict[str, Any] = {
+                "source_path": relative_path,
+                "source_file": str(preview.get("file_name") or Path(relative_path).name),
+                "task_id": preview.get("task_id"),
+                "original_page_numbers": page_numbers,
+                "exported_page_count": 0,
+                "output_file": None,
+                "page_details": page_details,
+                "export_error": None,
+            }
+            try:
+                if original is None:
+                    raise FileNotFoundError("original PDF is unavailable")
+                original_path = self.resolve_artifact(
+                    record,
+                    str(original.get("kind") or "input"),
+                    str(original["path"]),
+                )
+                output_bytes = rewrite_pdf_bytes_with_pdfium(
+                    original_path.read_bytes(),
+                    page_indices=[page_number - 1 for page_number in page_numbers],
+                )
+                if not output_bytes:
+                    raise ValueError("none of the selected pages could be exported")
+                safe_stem = re.sub(
+                    r"[^\w.-]+",
+                    "-",
+                    Path(row["source_file"]).stem,
+                ).strip("-._") or "document"
+                output_name = f"{position:04d}-{safe_stem}-problem-pages.pdf"
+                output_path = output_dir / output_name
+                output_path.write_bytes(output_bytes)
+                row["exported_page_count"] = len(page_numbers)
+                row["output_file"] = f"problem-pages/{output_name}"
+            except Exception as exc:
+                row["export_error"] = f"{type(exc).__name__}: {exc}"
+            manifest_rows.append(row)
+
+        manifest = {
+            "run_id": record["run_id"],
+            "generated_at": utc_now_iso(),
+            "files": manifest_rows,
+        }
+        csv_buffer = io.StringIO()
+        writer = csv.writer(csv_buffer)
+        writer.writerow([
+            "source_path",
+            "source_file",
+            "task_id",
+            "original_page_numbers",
+            "statuses",
+            "exported_page_count",
+            "output_file",
+            "errors",
+            "export_error",
+        ])
+        for row in manifest_rows:
+            writer.writerow([
+                row["source_path"],
+                row["source_file"],
+                row.get("task_id") or "",
+                ",".join(str(number) for number in row["original_page_numbers"]),
+                ",".join(str(item["status"]) for item in row["page_details"]),
+                row["exported_page_count"],
+                row.get("output_file") or "",
+                " | ".join(
+                    f"p{item['page_number']} {item.get('error_type') or ''}: {item.get('error') or ''}".strip()
+                    for item in row["page_details"]
+                    if item.get("error_type") or item.get("error")
+                ),
+                row.get("export_error") or "",
+            ])
+
+        zip_path = run_dir / f"mineru-problem-pages-{record['run_id']}.zip"
+        temporary_zip = zip_path.with_suffix(".zip.tmp")
+        temporary_zip.unlink(missing_ok=True)
+        with zipfile.ZipFile(temporary_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for output_path in sorted(output_dir.glob("*.pdf")):
+                archive.write(output_path, f"problem-pages/{output_path.name}")
+            archive.writestr(
+                "manifest.json",
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            )
+            archive.writestr("manifest.csv", csv_buffer.getvalue())
+        temporary_zip.replace(zip_path)
+        return zip_path
 
     def task_preview_artifacts(self, task_id: str) -> dict[str, Any]:
         for record in self.store.list_batch_runs(limit=10000):
@@ -1117,7 +1427,7 @@ class OpsRuntime:
 
         task_status = str(preview.get("task_status") or "unknown")
         pages = []
-        totals = {"completed": 0, "skipped": 0, "failed": 0}
+        totals = {"completed": 0, "skipped": 0, "failed": 0, "unknown": 0}
         for page_number in range(1, page_count + 1):
             failure = failed_by_number.get(page_number)
             if failure is not None:
@@ -1137,12 +1447,12 @@ class OpsRuntime:
                     "status": status,
                 }
             else:
-                status = "failed"
+                status = "unknown"
                 page = {
                     "page_idx": page_number - 1,
                     "page_number": page_number,
                     "status": status,
-                    "error": preview.get("error") or "任务未完成",
+                    "note": "诊断客户端已停止等待，远端任务状态未知",
                 }
             totals[status] += 1
             pages.append(page)
@@ -1150,12 +1460,14 @@ class OpsRuntime:
         updated_at = preview.get("completed_at") or record.get("completed_at")
         file_name = str(preview.get("file_name") or relative_path or "unknown")
         return {
-            "phase": "completed" if task_status == "completed" else "failed",
+            "phase": "completed" if task_status == "completed" else "monitoring_stopped",
             "version": 1,
+            "synthetic": True,
             "total_pages": page_count,
             "completed_pages": totals["completed"],
             "processing_pages": 0,
             "queued_pages": 0,
+            "unknown_pages": totals["unknown"],
             "skipped_pages": totals["skipped"],
             "failed_pages": totals["failed"],
             "updated_at": updated_at,
@@ -1176,7 +1488,7 @@ class OpsRuntime:
         }
         snapshots = []
         retained_preview_task_ids: set[str] = set()
-        terminal_statuses = {"completed", "failed", "cancelled", "client_error"}
+        terminal_statuses = {"completed", "failed", "cancelled"}
         for record in self.store.list_batch_runs(limit=10000):
             artifacts = self.batch_artifacts(record)
             for preview in artifacts["previews"]:
@@ -1185,6 +1497,9 @@ class OpsRuntime:
                     continue
                 retained_preview_task_ids.add(task_id)
                 cached = cached_by_id.get(task_id)
+                if cached and not cached.get("source_batch_run_id"):
+                    # Never let retained diagnostic metadata overwrite a Router snapshot.
+                    continue
                 if cached and str(cached.get("status")) in terminal_statuses:
                     continue
                 raw_progress = preview.get("progress")
@@ -1205,8 +1520,9 @@ class OpsRuntime:
                 raw_task_status = str(preview.get("task_status") or "unknown")
                 task_status = (
                     raw_task_status
-                    if raw_task_status in {"pending", "processing", "completed", "failed"}
-                    else "failed"
+                    if raw_task_status
+                    in {"pending", "processing", "completed", "failed", "wait_timeout"}
+                    else "unknown"
                 )
                 snapshot = {
                     "task_id": task_id,
@@ -1575,14 +1891,14 @@ class OpsRuntime:
                 "",
                 "## 逐页耗时",
                 "",
-                "| 文件 | 页码 | 状态 | 排队(秒) | VLM 请求(秒) | 重试等待(秒) | 总耗时(秒) | 尝试次数 | 错误 |",
-                "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | --- |",
+                "| 文件 | 页码 | 状态 | 排队(秒) | 成功尝试(秒) | 失败尝试(秒) | VLM 请求累计(秒) | 重试等待(秒) | 含重试总耗时(秒) | 尝试次数 | 错误 |",
+                "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
             ]
         )
         if items:
             row_format = (
-                "| {file_name} | {page_number} | {status} | {queue} | {vlm} | "
-                "{retry} | {total} | {attempts} | {error} |"
+                "| {file_name} | {page_number} | {status} | {queue} | {successful} | "
+                "{failed} | {vlm} | {retry} | {total} | {attempts} | {error} |"
             )
             for row in items:
                 lines.append(
@@ -1591,15 +1907,17 @@ class OpsRuntime:
                         page_number=row.get("page_number", "-"),
                         status=markdown_table_cell(row.get("status"), 30),
                         queue=format_seconds_cell(row.get("queue_seconds")),
+                        successful=format_seconds_cell(row.get("successful_attempt_seconds")),
+                        failed=format_seconds_cell(row.get("failed_attempt_seconds")),
                         vlm=format_seconds_cell(row.get("vlm_request_seconds")),
-                        retry=format_seconds_cell(row.get("retry_wait_seconds")),
+                        retry=format_seconds_cell(row.get("retry_overhead_seconds", row.get("retry_wait_seconds"))),
                         total=format_seconds_cell(row.get("total_seconds")),
                         attempts=row.get("attempts", "-"),
                         error=markdown_table_cell(row.get("error"), 300),
                     )
                 )
         else:
-            lines.append("| - | - | - | - | - | - | - | - | 暂无已保存的页级耗时记录 |")
+            lines.append("| - | - | - | - | - | - | - | - | - | - | 暂无已保存的页级耗时记录 |")
         lines.append("")
         return "\n".join(lines)
 
@@ -1614,8 +1932,10 @@ class OpsRuntime:
                 "page_idx",
                 "status",
                 "queue_seconds",
+                "successful_attempt_seconds",
+                "failed_attempt_seconds",
                 "vlm_request_seconds",
-                "retry_wait_seconds",
+                "retry_overhead_seconds",
                 "total_seconds",
                 "attempts",
                 "error_type",
@@ -1630,8 +1950,10 @@ class OpsRuntime:
                     row.get("page_idx", ""),
                     row.get("status", ""),
                     row.get("queue_seconds", ""),
+                    row.get("successful_attempt_seconds", ""),
+                    row.get("failed_attempt_seconds", ""),
                     row.get("vlm_request_seconds", ""),
-                    row.get("retry_wait_seconds", ""),
+                    row.get("retry_overhead_seconds", row.get("retry_wait_seconds", "")),
                     row.get("total_seconds", ""),
                     row.get("attempts", ""),
                     row.get("error_type", "") or "",
@@ -1847,6 +2169,12 @@ class OpsRuntime:
             request.lang,
             "--task-timeout",
             str(request.task_timeout),
+            "--page-timeout-seconds",
+            str(request.page_timeout_seconds),
+            "--page-connect-max-retries",
+            str(request.page_connect_max_retries),
+            "--vlm-batch-size",
+            str(request.vlm_batch_size),
             "--pause-seconds",
             str(request.pause_seconds),
             "--output",
@@ -2173,14 +2501,6 @@ def create_app() -> FastAPI:
     @app.get("/api/tasks/{task_id}")
     async def task_detail(task_id: str, request: Request):
         authorize(request)
-        cached = runtime.store.cached_task(task_id)
-        if cached and cached.get("source_batch_run_id") and str(cached.get("status")) in {
-            "completed",
-            "failed",
-        }:
-            cached["source"] = "batch_history"
-            cached["preview_available"] = task_id in runtime.retained_preview_task_ids
-            return cached
         try:
             response = await runtime.http_client.get(f"{runtime.router_url}/tasks/{task_id}")
             response.raise_for_status()
@@ -2375,6 +2695,9 @@ def create_app() -> FastAPI:
         backend: str = Form("vlm-http-client"),
         lang: str = Form("ch"),
         task_timeout: int = Form(7200),
+        page_timeout_seconds: float = Form(600.0),
+        page_connect_max_retries: int = Form(0),
+        vlm_batch_size: int = Form(1),
         server_url: str | None = Form(None),
         recursive: bool = Form(True),
     ):
@@ -2388,6 +2711,9 @@ def create_app() -> FastAPI:
                 backend=backend,
                 lang=lang,
                 task_timeout=task_timeout,
+                page_timeout_seconds=page_timeout_seconds,
+                page_connect_max_retries=page_connect_max_retries,
+                vlm_batch_size=vlm_batch_size,
                 server_url=server_url or None,
                 recursive=recursive,
             )
@@ -2513,10 +2839,13 @@ def create_app() -> FastAPI:
                 media_type="text/markdown; charset=utf-8",
                 headers={"Content-Disposition": f'attachment; filename="PROCESS_LOG-{run_id}.md"'},
             )
+        if format == "problem_pages":
+            archive_path = runtime.build_problem_pages_archive(record)
+            return FileResponse(archive_path, filename=archive_path.name)
         if format != "zip":
             raise HTTPException(
                 status_code=400,
-                detail="format must be markdown, process_markdown, json, or zip",
+                detail="format must be markdown, process_markdown, problem_pages, json, or zip",
             )
         zip_path = report_path.parent / f"mineru-batch-{run_id}.zip"
         with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:

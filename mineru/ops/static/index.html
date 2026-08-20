@@ -119,7 +119,10 @@
               </select>
             </label>
             <label><span>语言</span><input name="lang" value="ch"></label>
-            <label><span>单文件超时（秒）</span><input name="task_timeout" type="number" value="7200" min="60"></label>
+            <label><span>控制台等待上限（秒）</span><input name="task_timeout" type="number" value="7200" min="60"><small>达到上限只停止诊断脚本等待，不会取消 MinerU 后台任务</small></label>
+            <label><span>VLM 单次请求超时（秒）</span><input name="page_timeout_seconds" type="number" value="600" min="1" max="7200" step="1"><small>用于测试异常页真实处理时长；底层 HTTP 硬超时必须不小于此值</small></label>
+            <label><span>连接错误重试次数</span><input name="page_connect_max_retries" type="number" value="0" min="0" max="3"><small>耗时基准测试建议保持 0</small></label>
+            <label><span>VLM micro-batch 页数</span><input name="vlm_batch_size" type="number" value="1" min="1" max="16"><small>可尝试 2 或 4；批处理失败时会自动逐页隔离</small></label>
             <label class="server-url"><span>VLM Server URL</span><input name="server_url" placeholder="可选，例如 http://10.0.0.8:30000"></label>
             <label class="check-label"><input name="recursive" type="checkbox" checked><span>包含子目录</span></label>
             <button id="batch-submit" type="submit" class="primary-button">开始测试</button>
@@ -155,6 +158,7 @@
       </div>
       <div class="actions">
         <button id="export-current-batch-document" type="button" class="secondary-button">导出当前内容</button>
+        <button type="button" class="secondary-button" data-dialog-export="problem_pages">导出异常页 PDF</button>
         <button type="button" class="secondary-button" data-dialog-export="zip">导出完整 ZIP</button>
       </div>
     </div>

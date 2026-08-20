@@ -33,7 +33,8 @@ const statusText = {
   partial_success: "部分成功", running: "运行中", paused: "已暂停", cancelled: "已取消",
   completed_with_failures: "完成（存在失败）", interrupted: "已中断", unhealthy: "异常",
   healthy: "健康", unavailable: "不可用", unknown: "未知", success: "成功", partial: "部分成功",
-  client_error: "客户端错误"
+  client_error: "客户端错误", wait_timeout: "停止等待（后台可能仍在运行）",
+  monitoring_stopped: "停止监控"
 };
 
 const tokenInput = document.getElementById("token");
@@ -51,7 +52,7 @@ function esc(value) {
 function badge(value) {
   const text = statusText[value] || value || "未知";
   const cls = ["healthy", "completed", "running", "success"].includes(value) ? "good" :
-    ["pending", "processing", "paused", "partial", "partial_success", "completed_with_failures"].includes(value) ? "warn" :
+    ["pending", "processing", "paused", "partial", "partial_success", "completed_with_failures", "wait_timeout", "monitoring_stopped"].includes(value) ? "warn" :
     ["failed", "unhealthy", "unavailable", "cancelled", "interrupted"].includes(value) ? "bad" : "";
   return `<span class="badge ${cls}">${esc(text)}</span>`;
 }
@@ -312,6 +313,7 @@ const phaseText = {
   vlm_inference: "VLM 正在识别页面",
   completed: "处理完成",
   failed: "处理失败",
+  monitoring_stopped: "控制台已停止监控，后台任务可能仍在运行",
   unknown: "等待进度信息",
 };
 
@@ -351,14 +353,26 @@ function renderPageTimingSummary(summary) {
   return `<div class="task-timing-summary">${cards.map(([label, value]) => `<div><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`).join("")}</div>`;
 }
 
+function renderAttemptDetails(attempts) {
+  if (!Array.isArray(attempts) || !attempts.length) return "-";
+  const outcomeText = {completed: "成功", retry: "失败后重试", skipped: "跳过", failed: "失败", batch_fallback: "批处理失败，转逐页"};
+  const rows = attempts.map(attempt => {
+    const outcome = outcomeText[attempt.outcome] || attempt.outcome || "未知";
+    const retryWait = formatPageSeconds(attempt.retry_wait_before_seconds);
+    const error = attempt.error_type ? ` · ${esc(attempt.error_type)}${attempt.error ? `: ${esc(attempt.error)}` : ""}` : "";
+    return `<li><strong>第 ${esc(attempt.attempt_no ?? "-")} 次</strong> · ${esc(outcome)} · 请求 ${formatPageSeconds(attempt.request_seconds)} · 重试前等待 ${retryWait} · 超时上限 ${formatPageSeconds(attempt.timeout_seconds)} · batch ${esc(attempt.batch_size ?? 1)}${error}</li>`;
+  }).join("");
+  return `<details><summary>${attempts.length} 条记录</summary><ol class="attempt-detail-list">${rows}</ol></details>`;
+}
+
 function renderPageTimingTable(payload, taskId) {
   const status = state.taskTimingStatus;
   const sort = state.taskTimingSort;
   const order = state.taskTimingOrder;
   const items = payload?.items || [];
   const statusOptions = [["all", "全部"], ["completed", "完成"], ["skipped", "跳过"], ["failed", "失败"]];
-  const rows = items.map(page => `<tr><td>${esc(page.file_name)} 第 ${esc(page.page_number)} 页</td><td>${badge(page.status)}</td><td>${formatPageSeconds(page.queue_seconds)}</td><td>${formatPageSeconds(page.vlm_request_seconds ?? page.inference_seconds)}</td><td>${formatPageSeconds(page.retry_wait_seconds)}</td><td>${formatPageSeconds(page.total_seconds ?? page.elapsed_seconds)}</td><td>${esc(page.attempts ?? "-")}</td><td>${esc(page.error || "-")}</td></tr>`).join("");
-  return `<section class="task-timing-panel"><div class="task-timing-heading"><h3>页面耗时</h3><div class="task-timing-controls"><label>状态 <select data-task-timing-status>${statusOptions.map(([value, label]) => `<option value="${value}" ${status === value ? "selected" : ""}>${label}</option>`).join("")}</select></label><label>排序 <select data-task-timing-sort><option value="page_number" ${sort === "page_number" ? "selected" : ""}>页码</option><option value="total_seconds" ${sort === "total_seconds" ? "selected" : ""}>总耗时</option><option value="vlm_request_seconds" ${sort === "vlm_request_seconds" ? "selected" : ""}>VLM 请求</option></select></label><label>顺序 <select data-task-timing-order><option value="asc" ${order === "asc" ? "selected" : ""}>升序</option><option value="desc" ${order === "desc" ? "selected" : ""}>降序</option></select></label></div></div>${renderPageTimingSummary(payload?.summary)}<div class="task-timing-table-wrap"><table class="task-timing-table"><thead><tr><th>页面</th><th>状态</th><th>排队</th><th>VLM 请求</th><th>重试等待</th><th>总耗时</th><th>尝试</th><th>错误</th></tr></thead><tbody>${rows || `<tr><td colspan="8" class="muted">暂无符合条件的页面记录</td></tr>`}</tbody></table></div><div class="task-timing-pagination"><button type="button" class="text-button" data-task-timing-prev ${payload?.offset ? "" : "disabled"}>上一页</button><span>${items.length ? `${payload.offset + 1}-${payload.offset + items.length} / ${payload.total}` : "0 / 0"}</span><button type="button" class="text-button" data-task-timing-next ${payload && payload.offset + items.length < payload.total ? "" : "disabled"}>下一页</button></div></section>`;
+  const rows = items.map(page => `<tr><td>${esc(page.file_name)} 第 ${esc(page.page_number)} 页</td><td>${badge(page.status)}</td><td>${formatPageSeconds(page.queue_seconds)}</td><td>${formatPageSeconds(page.successful_attempt_seconds)}</td><td>${formatPageSeconds(page.failed_attempt_seconds)}</td><td>${formatPageSeconds(page.retry_overhead_seconds ?? page.retry_wait_seconds)}</td><td>${formatPageSeconds(page.total_seconds ?? page.elapsed_seconds)}</td><td>${esc(page.attempts ?? "-")}</td><td>${renderAttemptDetails(page.attempt_details)}</td><td>${esc(page.error || "-")}</td></tr>`).join("");
+  return `<section class="task-timing-panel"><div class="task-timing-heading"><h3>页面耗时</h3><div class="task-timing-controls"><label>状态 <select data-task-timing-status>${statusOptions.map(([value, label]) => `<option value="${value}" ${status === value ? "selected" : ""}>${label}</option>`).join("")}</select></label><label>排序 <select data-task-timing-sort><option value="page_number" ${sort === "page_number" ? "selected" : ""}>页码</option><option value="total_seconds" ${sort === "total_seconds" ? "selected" : ""}>含重试总耗时</option><option value="vlm_request_seconds" ${sort === "vlm_request_seconds" ? "selected" : ""}>VLM 请求累计</option></select></label><label>顺序 <select data-task-timing-order><option value="asc" ${order === "asc" ? "selected" : ""}>升序</option><option value="desc" ${order === "desc" ? "selected" : ""}>降序</option></select></label></div></div>${renderPageTimingSummary(payload?.summary)}<div class="task-timing-table-wrap"><table class="task-timing-table"><thead><tr><th>页面</th><th>状态</th><th>排队</th><th>最终成功尝试</th><th>失败尝试累计</th><th>重试等待</th><th>含重试总耗时</th><th>尝试次数</th><th>逐次记录</th><th>错误</th></tr></thead><tbody>${rows || `<tr><td colspan="10" class="muted">暂无符合条件的页面记录</td></tr>`}</tbody></table></div><div class="task-timing-pagination"><button type="button" class="text-button" data-task-timing-prev ${payload?.offset ? "" : "disabled"}>上一页</button><span>${items.length ? `${payload.offset + 1}-${payload.offset + items.length} / ${payload.total}` : "0 / 0"}</span><button type="button" class="text-button" data-task-timing-next ${payload && payload.offset + items.length < payload.total ? "" : "disabled"}>下一页</button></div></section>`;
 }
 
 function currentTaskPosition(task, progress, pages) {
@@ -480,7 +494,7 @@ function compactBatchRows(items, limit = 100) {
   return `<table><thead><tr><th>目录</th><th>状态</th><th>PDF</th><th>开始时间</th><th>记录</th><th>操作</th></tr></thead><tbody>${items.slice(0, limit).map(run => {
     const active = ["pending", "running", "paused", "cancelling"].includes(run.status);
     const previewText = run.input_preview_ready || run.result_preview_ready ? "可预览" : "";
-    return `<tr><td><strong>${esc(run.settings?.input_path || run.input_path)}</strong><div class="mono muted">${esc(run.run_id)}</div></td><td>${badge(run.status)}${previewText ? `<div class="muted">${previewText}</div>` : ""}</td><td>${run.settings?.pdf_count || "-"}</td><td>${esc(formatDate(run.started_at || run.created_at))}</td><td><button class="text-button" data-batch-detail="${run.run_id}">查看记录</button></td><td><div class="actions">${active ? `<button class="action-button" data-batch="${run.run_id}" data-batch-action="${run.status === "paused" ? "resume" : "pause"}">${run.status === "paused" ? "继续" : "暂停"}</button><button class="action-button danger" data-batch="${run.run_id}" data-batch-action="cancel">取消</button>` : `<button class="action-button" data-batch="${run.run_id}" data-batch-action="retry">重试</button><button class="action-button danger" data-batch="${run.run_id}" data-batch-action="delete">删除</button>`}</div></td></tr>`;
+    return `<tr><td><strong>${esc(run.settings?.input_path || run.input_path)}</strong><div class="mono muted">${esc(run.run_id)}</div></td><td>${badge(run.status)}${previewText ? `<div class="muted">${previewText}</div>` : ""}</td><td>${run.settings?.pdf_count || "-"}</td><td>${esc(formatDate(run.started_at || run.created_at))}</td><td><button class="text-button" data-batch-detail="${run.run_id}">查看记录</button></td><td><div class="actions">${active ? `<button class="action-button" data-batch="${run.run_id}" data-batch-action="${run.status === "paused" ? "resume" : "pause"}">${run.status === "paused" ? "继续" : "暂停"}</button><button class="action-button danger" data-batch="${run.run_id}" data-batch-action="cancel">停止批次脚本</button>` : `<button class="action-button" data-batch="${run.run_id}" data-batch-action="retry">重试</button><button class="action-button danger" data-batch="${run.run_id}" data-batch-action="delete">删除</button>`}</div></td></tr>`;
   }).join("")}</tbody></table>`;
 }
 
@@ -616,7 +630,11 @@ document.getElementById("batch-form").addEventListener("submit", async event => 
   const submitButton = document.getElementById("batch-submit");
   const payload = {
     input_path: form.get("input_path"), backend: form.get("backend"), lang: form.get("lang"),
-    task_timeout: Number(form.get("task_timeout")), server_url: form.get("server_url") || null,
+    task_timeout: Number(form.get("task_timeout")),
+    page_timeout_seconds: Number(form.get("page_timeout_seconds")),
+    page_connect_max_retries: Number(form.get("page_connect_max_retries")),
+    vlm_batch_size: Number(form.get("vlm_batch_size")),
+    server_url: form.get("server_url") || null,
     recursive: form.get("recursive") === "on", effort: "medium", parse_method: "auto", pause_seconds: 2
   };
   try {
@@ -627,6 +645,9 @@ document.getElementById("batch-form").addEventListener("submit", async event => 
       upload.append("backend", payload.backend);
       upload.append("lang", payload.lang);
       upload.append("task_timeout", String(payload.task_timeout));
+      upload.append("page_timeout_seconds", String(payload.page_timeout_seconds));
+      upload.append("page_connect_max_retries", String(payload.page_connect_max_retries));
+      upload.append("vlm_batch_size", String(payload.vlm_batch_size));
       upload.append("server_url", payload.server_url || "");
       upload.append("recursive", String(payload.recursive || state.uploadItems.some(item => item.path.includes("/"))));
       submitButton.textContent = `正在上传 0%`;
@@ -651,6 +672,7 @@ document.getElementById("batch-form").addEventListener("submit", async event => 
 
 function exportFilename(runId, format) {
   if (format === "zip") return `mineru-batch-${runId}.zip`;
+  if (format === "problem_pages") return `mineru-problem-pages-${runId}.zip`;
   if (format === "process_markdown") return `PROCESS_LOG-${runId}.md`;
   return `BATCH_DIAGNOSIS-${runId}.md`;
 }
@@ -670,7 +692,11 @@ async function handleBatchTableClick(event) {
   }
   const button = event.target.closest("[data-batch-action]");
   if (!button) return;
-  if (["cancel", "retry", "delete"].includes(button.dataset.batchAction) && !confirm(`确认${button.textContent}该批次？`)) return;
+  const action = button.dataset.batchAction;
+  const prompt = action === "cancel"
+    ? "确认停止这个批次诊断脚本？这不会取消已经提交到 MinerU Router/API 的后台任务，后台处理可能继续运行。"
+    : `确认${button.textContent}该批次？`;
+  if (["cancel", "retry", "delete"].includes(action) && !confirm(prompt)) return;
   try {
     await api(`/api/batch-runs/${button.dataset.batch}/${button.dataset.batchAction}`, {method: "POST"});
     await loadBatches();

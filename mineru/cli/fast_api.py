@@ -165,6 +165,9 @@ class AsyncParseTask:
     client_side_output_generation: bool
     start_page_id: int
     end_page_id: int
+    page_timeout_seconds: float
+    page_connect_max_retries: int
+    vlm_batch_size: int
     upload_names: list[str]
     uploads: list[str]
     submit_order: int = 0
@@ -947,6 +950,9 @@ async def run_parse_job(
             False,
         ),
         task_id=getattr(request_options, "task_id", None),
+        page_timeout_seconds=getattr(request_options, "page_timeout_seconds", 600.0),
+        page_connect_max_retries=getattr(request_options, "page_connect_max_retries", 1),
+        vlm_batch_size=getattr(request_options, "vlm_batch_size", 1),
         **config,
     )
 
@@ -1056,6 +1062,9 @@ async def create_async_parse_task(
             client_side_output_generation=request_options.client_side_output_generation,
             start_page_id=request_options.start_page_id,
             end_page_id=request_options.end_page_id,
+            page_timeout_seconds=request_options.page_timeout_seconds,
+            page_connect_max_retries=request_options.page_connect_max_retries,
+            vlm_batch_size=request_options.vlm_batch_size,
             upload_names=[upload.original_name for upload in uploads],
             uploads=[upload.path for upload in uploads],
         )

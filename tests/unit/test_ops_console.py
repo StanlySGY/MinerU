@@ -1,5 +1,7 @@
 import asyncio
+import json
 import struct
+import zipfile
 from pathlib import Path
 from tempfile import SpooledTemporaryFile
 
@@ -57,6 +59,32 @@ def test_ops_store_persists_and_summarizes_page_timings(tmp_path: Path):
             "error": "page timed out",
         }
     )
+    pages[0]["attempts"] = 2
+    pages[0]["retry_wait_seconds"] = 1.25
+    pages[0]["attempt_details"] = [
+        {
+            "attempt_no": 1,
+            "started_at": "2026-08-19T00:00:00+00:00",
+            "completed_at": "2026-08-19T00:00:03+00:00",
+            "outcome": "retry",
+            "error_type": "ConnectError",
+            "error": "temporary connection failure",
+            "request_seconds": 3.0,
+            "retry_wait_before_seconds": 0.0,
+            "timeout_seconds": 600.0,
+            "batch_size": 1,
+        },
+        {
+            "attempt_no": 2,
+            "started_at": "2026-08-19T00:00:04+00:00",
+            "completed_at": "2026-08-19T00:00:11+00:00",
+            "outcome": "completed",
+            "request_seconds": 7.0,
+            "retry_wait_before_seconds": 1.25,
+            "timeout_seconds": 600.0,
+            "batch_size": 1,
+        },
+    ]
     payload = {
         "task_id": "timing-task",
         "status": "completed",
@@ -79,6 +107,19 @@ def test_ops_store_persists_and_summarizes_page_timings(tmp_path: Path):
     assert result["total"] == 5
     assert result["items"][0]["page_number"] == 5
     assert result["items"][0]["vlm_request_seconds"] == 600.0
+    first_page = next(item for item in result["items"] if item["page_number"] == 1)
+    assert [item["outcome"] for item in first_page["attempt_details"]] == [
+        "retry",
+        "completed",
+    ]
+    assert first_page["successful_attempt_seconds"] == 7.0
+    assert first_page["failed_attempt_seconds"] == 3.0
+    assert first_page["retry_overhead_seconds"] == 1.25
+    with store.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM task_page_attempts WHERE task_id = ?",
+            ("timing-task",),
+        ).fetchone()[0] == 2
     assert summary["recorded_pages"] == 5
     assert summary["completed_pages"] == 4
     assert summary["skipped_pages"] == 1
@@ -120,6 +161,32 @@ def _seed_report_task(store: OpsStore, *, page_count: int = 3) -> dict:
             "attempts": 3,
             "error_type": "TimeoutError",
             "error": "page | timed out\nafter retries",
+            "attempt_details": [
+                {
+                    "attempt_no": 1,
+                    "outcome": "retry",
+                    "request_seconds": 100.0,
+                    "retry_wait_before_seconds": 0.0,
+                    "timeout_seconds": 600.0,
+                    "batch_size": 1,
+                },
+                {
+                    "attempt_no": 2,
+                    "outcome": "retry",
+                    "request_seconds": 100.0,
+                    "retry_wait_before_seconds": 2.0,
+                    "timeout_seconds": 600.0,
+                    "batch_size": 1,
+                },
+                {
+                    "attempt_no": 3,
+                    "outcome": "failed",
+                    "request_seconds": 100.0,
+                    "retry_wait_before_seconds": 3.0,
+                    "timeout_seconds": 600.0,
+                    "batch_size": 1,
+                },
+            ],
         }
     )
     payload = {
@@ -192,8 +259,10 @@ def test_task_report_csv_contains_full_page_rows(tmp_path: Path) -> None:
         "page_idx",
         "status",
         "queue_seconds",
+        "successful_attempt_seconds",
+        "failed_attempt_seconds",
         "vlm_request_seconds",
-        "retry_wait_seconds",
+        "retry_overhead_seconds",
         "total_seconds",
         "attempts",
         "error_type",
@@ -203,8 +272,11 @@ def test_task_report_csv_contains_full_page_rows(tmp_path: Path) -> None:
     assert [row[1] for row in rows[1:]] == ["1", "2", "3", "4"]
     failed_row = rows[-1]
     assert failed_row[3] == "failed"
-    assert failed_row[8] == "3"
-    assert failed_row[9] == "TimeoutError"
+    assert failed_row[5] == "0"
+    assert failed_row[6] == "300.0"
+    assert failed_row[8] == "5.0"
+    assert failed_row[10] == "3"
+    assert failed_row[11] == "TimeoutError"
 
 
 def test_all_page_timings_filters_by_status(tmp_path: Path) -> None:
@@ -215,6 +287,178 @@ def test_all_page_timings_filters_by_status(tmp_path: Path) -> None:
     assert len(store.all_page_timings("report-task", status="failed")) == 1
     with pytest.raises(ValueError):
         store.all_page_timings("report-task", status="bogus")
+
+
+def test_synthetic_timeout_progress_does_not_create_failed_page_timings(tmp_path: Path) -> None:
+    store = OpsStore(tmp_path / "ops.db")
+    store.upsert_tasks(
+        [
+            {
+                "task_id": "synthetic-timeout-task",
+                "status": "wait_timeout",
+                "progress": {
+                    "synthetic": True,
+                    "total_pages": 2,
+                    "unknown_pages": 2,
+                    "failed_pages": 0,
+                    "files": [
+                        {
+                            "file_name": "sample.pdf",
+                            "pages": [
+                                {"page_idx": 0, "page_number": 1, "status": "unknown"},
+                                {"page_idx": 1, "page_number": 2, "status": "unknown"},
+                            ],
+                        }
+                    ],
+                },
+            }
+        ]
+    )
+
+    assert store.page_timings("synthetic-timeout-task")["items"] == []
+    with store.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM task_page_attempts WHERE task_id = ?",
+            ("synthetic-timeout-task",),
+        ).fetchone()[0] == 0
+
+
+def test_fallback_batch_progress_keeps_wait_timeout_pages_unknown(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
+    runtime = OpsRuntime()
+    run_dir = runtime.report_dir / "run-timeout"
+    input_pdf = run_dir / "input/sample.pdf"
+    input_pdf.parent.mkdir(parents=True)
+    input_pdf.write_bytes(build_smoke_test_pdf())
+    record = runtime.store.create_batch_run(
+        "run-timeout",
+        run_dir / "input",
+        {"input_path": "browser upload", "pdf_count": 1},
+        run_dir / "BATCH_DIAGNOSIS.md",
+        run_dir / "raw",
+        run_dir / "batch.log",
+    )
+    preview = {
+        "file_name": "sample.pdf",
+        "relative_path": "sample.pdf",
+        "task_status": "wait_timeout",
+        "classification": "monitoring_stopped",
+        "failed_pages": [],
+    }
+
+    progress = runtime._fallback_batch_progress(
+        record,
+        preview,
+        runtime.batch_artifacts(record),
+    )
+
+    assert progress["phase"] == "monitoring_stopped"
+    assert progress["synthetic"] is True
+    assert progress["total_pages"] == 1
+    assert progress["unknown_pages"] == 1
+    assert progress["failed_pages"] == 0
+    assert progress["files"][0]["pages"][0]["status"] == "unknown"
+    asyncio.run(runtime.close())
+
+
+def test_problem_pages_archive_exports_original_page_numbers(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
+    runtime = OpsRuntime()
+    run_dir = runtime.report_dir / "run-problem-pages"
+    input_pdf = run_dir / "input/folder/sample.pdf"
+    input_pdf.parent.mkdir(parents=True)
+    input_pdf.write_bytes(b"%PDF-original")
+    result_dir = run_dir / "results/0001-sample"
+    result_dir.mkdir(parents=True)
+    (result_dir / "preview.json").write_text(
+        json.dumps(
+            {
+                "task_id": "task-problem-pages",
+                "file_name": "sample.pdf",
+                "relative_path": "folder/sample.pdf",
+                "task_status": "completed",
+                "classification": "partial",
+                "progress": {
+                    "files": [
+                        {
+                            "file_name": "sample.pdf",
+                            "pages": [
+                                {"page_idx": 0, "page_number": 1, "status": "completed"},
+                                {
+                                    "page_idx": 1,
+                                    "page_number": 2,
+                                    "status": "skipped",
+                                    "error_type": "TimeoutError",
+                                    "error": "page timed out",
+                                },
+                                {
+                                    "page_idx": 3,
+                                    "page_number": 4,
+                                    "status": "failed",
+                                    "error_type": "RuntimeError",
+                                    "error": "model failed",
+                                },
+                            ],
+                        }
+                    ]
+                },
+                "failed_pages": [
+                    {
+                        "page_idx": 1,
+                        "page_number": 2,
+                        "status": "skipped",
+                        "error_type": "TimeoutError",
+                        "error": "page timed out",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    record = runtime.store.create_batch_run(
+        "run-problem-pages",
+        run_dir / "input",
+        {"input_path": "browser upload", "pdf_count": 1},
+        run_dir / "BATCH_DIAGNOSIS.md",
+        run_dir / "raw",
+        run_dir / "batch.log",
+    )
+    selected_indices = []
+
+    def fake_rewrite(source_bytes: bytes, *, page_indices: list[int]) -> bytes:
+        assert source_bytes == b"%PDF-original"
+        selected_indices.append(page_indices)
+        return b"%PDF-problem-pages"
+
+    monkeypatch.setattr(
+        "mineru.cli.ops.rewrite_pdf_bytes_with_pdfium",
+        fake_rewrite,
+    )
+
+    archive_path = runtime.build_problem_pages_archive(record)
+
+    assert selected_indices == [[1, 3]]
+    with zipfile.ZipFile(archive_path) as archive:
+        assert set(archive.namelist()) == {
+            "problem-pages/0001-sample-problem-pages.pdf",
+            "manifest.json",
+            "manifest.csv",
+        }
+        assert archive.read("problem-pages/0001-sample-problem-pages.pdf") == b"%PDF-problem-pages"
+        manifest = json.loads(archive.read("manifest.json"))
+        assert manifest["files"][0]["original_page_numbers"] == [2, 4]
+        assert manifest["files"][0]["exported_page_count"] == 2
+        assert "2,4" in archive.read("manifest.csv").decode("utf-8")
+    asyncio.run(runtime.close())
 
 
 def test_ops_runtime_background_sync_persists_router_tasks(tmp_path: Path, monkeypatch):

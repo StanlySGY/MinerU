@@ -538,6 +538,9 @@ async def aio_doc_analyze(
 ):
     task_id = kwargs.pop("task_id", None)
     source_file_name = kwargs.pop("source_file_name", None)
+    page_timeout_seconds = kwargs.pop("page_timeout_seconds", None)
+    page_connect_max_retries = kwargs.pop("page_connect_max_retries", None)
+    vlm_batch_size = kwargs.pop("vlm_batch_size", 1)
     client_side_output_generation = bool(
         kwargs.pop("client_side_output_generation", False)
     )
@@ -604,6 +607,9 @@ async def aio_doc_analyze(
                                     image_analysis=image_analysis,
                                     task_id=task_id,
                                     source_file_name=source_file_name,
+                                    timeout_seconds=page_timeout_seconds,
+                                    connect_max_retries=page_connect_max_retries,
+                                    batch_size=vlm_batch_size,
                                 )
                             )
                         else:
