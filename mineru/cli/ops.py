@@ -8,6 +8,7 @@ import csv
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import secrets
@@ -816,6 +817,13 @@ class BatchRunRequest(BaseModel):
     pause_seconds: float = Field(default=2.0, ge=0, le=300)
 
 
+class ProblemPagesRetryRequest(BaseModel):
+    task_timeout: int = Field(default=7200, ge=60, le=86400)
+    page_timeout_seconds: float = Field(default=1200.0, ge=1, le=7200)
+    page_connect_max_retries: int = Field(default=0, ge=0, le=3)
+    vlm_batch_size: int = Field(default=1, ge=1, le=16)
+
+
 class OpsRuntime:
     def __init__(self) -> None:
         self.data_dir = Path(os.getenv("MINERU_OPS_DATA_DIR", DEFAULT_DATA_DIR)).resolve()
@@ -1176,7 +1184,13 @@ class OpsRuntime:
             add_page(page, default_status="skipped")
         return [by_page_number[number] for number in sorted(by_page_number)]
 
-    def build_problem_pages_archive(self, record: dict[str, Any]) -> Path:
+    def _write_problem_pages(
+        self,
+        record: dict[str, Any],
+        output_dir: Path,
+        *,
+        output_prefix: str,
+    ) -> dict[str, Any]:
         artifacts = self.batch_artifacts(record)
         originals_by_path = {
             str(item.get("path") or ""): item
@@ -1190,8 +1204,6 @@ class OpsRuntime:
         if not problem_sources:
             raise HTTPException(status_code=404, detail="no skipped or failed pages are available")
 
-        run_dir = self.run_dir_for_record(record)
-        output_dir = run_dir / "problem-pages"
         shutil.rmtree(output_dir, ignore_errors=True)
         output_dir.mkdir(parents=True, exist_ok=True)
         manifest_rows: list[dict[str, Any]] = []
@@ -1249,7 +1261,11 @@ class OpsRuntime:
                 output_path = output_dir / output_name
                 output_path.write_bytes(output_bytes)
                 row["exported_page_count"] = len(page_numbers)
-                row["output_file"] = f"problem-pages/{output_name}"
+                row["output_file"] = (
+                    f"{output_prefix.rstrip('/')}/{output_name}"
+                    if output_prefix
+                    else output_name
+                )
             except Exception as exc:
                 row["export_error"] = f"{type(exc).__name__}: {exc}"
             manifest_rows.append(row)
@@ -1289,6 +1305,30 @@ class OpsRuntime:
                 row.get("export_error") or "",
             ])
 
+        manifest_json = json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
+        manifest_csv = csv_buffer.getvalue()
+        (output_dir / "manifest.json").write_text(manifest_json, encoding="utf-8")
+        (output_dir / "manifest.csv").write_text(manifest_csv, encoding="utf-8")
+        return {
+            "manifest": manifest,
+            "manifest_json": manifest_json,
+            "manifest_csv": manifest_csv,
+            "exported_pdf_count": sum(
+                1 for row in manifest_rows if int(row["exported_page_count"]) > 0
+            ),
+            "exported_page_count": sum(
+                int(row["exported_page_count"]) for row in manifest_rows
+            ),
+        }
+
+    def build_problem_pages_archive(self, record: dict[str, Any]) -> Path:
+        run_dir = self.run_dir_for_record(record)
+        output_dir = run_dir / "problem-pages"
+        result = self._write_problem_pages(
+            record,
+            output_dir,
+            output_prefix="problem-pages",
+        )
         zip_path = run_dir / f"mineru-problem-pages-{record['run_id']}.zip"
         temporary_zip = zip_path.with_suffix(".zip.tmp")
         temporary_zip.unlink(missing_ok=True)
@@ -1297,11 +1337,80 @@ class OpsRuntime:
                 archive.write(output_path, f"problem-pages/{output_path.name}")
             archive.writestr(
                 "manifest.json",
-                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                result["manifest_json"],
             )
-            archive.writestr("manifest.csv", csv_buffer.getvalue())
+            archive.writestr("manifest.csv", result["manifest_csv"])
         temporary_zip.replace(zip_path)
         return zip_path
+
+    async def retry_problem_pages(
+        self,
+        record: dict[str, Any],
+        overrides: ProblemPagesRetryRequest,
+    ) -> dict[str, Any]:
+        source_status = str(record.get("status") or "")
+        if source_status not in TERMINAL_BATCH_STATES:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "wait for the source batch run to reach a terminal state before "
+                    "retrying problem pages"
+                ),
+            )
+        source_settings = dict(record.get("settings") or {})
+        inherited_settings = {
+            name: source_settings[name]
+            for name in BatchRunRequest.model_fields
+            if name in source_settings
+        }
+        inherited_settings.update(
+            {
+                "input_path": ".",
+                "recursive": True,
+                "task_timeout": max(
+                    overrides.task_timeout,
+                    math.ceil(overrides.page_timeout_seconds) + 60,
+                ),
+                "page_timeout_seconds": overrides.page_timeout_seconds,
+                "page_connect_max_retries": overrides.page_connect_max_retries,
+                "vlm_batch_size": overrides.vlm_batch_size,
+            }
+        )
+        retry_request = BatchRunRequest(**inherited_settings)
+        staging_dir = self.upload_dir / f"problem-pages-retry-{uuid.uuid4()}"
+        try:
+            extraction = self._write_problem_pages(
+                record,
+                staging_dir,
+                output_prefix="",
+            )
+            if extraction["exported_pdf_count"] == 0:
+                errors = [
+                    str(item.get("export_error"))
+                    for item in extraction["manifest"]["files"]
+                    if item.get("export_error")
+                ]
+                detail = "failed to extract any skipped or failed pages"
+                if errors:
+                    detail += f": {'; '.join(errors[:3])}"
+                raise HTTPException(status_code=409, detail=detail)
+            display_path = str(source_settings.get("input_path") or record["run_id"])
+            return await self.start_batch_path(
+                staging_dir,
+                retry_request,
+                f"异常页重试：{display_path}",
+                source_type="problem_page_retry",
+                preserve_input="move",
+                settings_extra={
+                    "retry_of_run_id": record["run_id"],
+                    "problem_page_count": extraction["exported_page_count"],
+                    "problem_file_count": extraction["exported_pdf_count"],
+                    "problem_pages_manifest_path": "manifest.json",
+                },
+            )
+        except Exception:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
 
     def task_preview_artifacts(self, task_id: str) -> dict[str, Any]:
         for record in self.store.list_batch_runs(limit=10000):
@@ -1801,7 +1910,7 @@ class OpsRuntime:
         if not target.is_file():
             raise HTTPException(status_code=404, detail="artifact not found")
         allowed_suffixes = {
-            "input": {".pdf"},
+            "input": {".pdf", ".json", ".csv"},
             "source": {".pdf"},
             "results": {".md", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".json", ".zip"},
         }
@@ -1981,6 +2090,7 @@ class OpsRuntime:
         *,
         source_type: str,
         preserve_input: str | None = None,
+        settings_extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not self.batch_script.is_file():
             raise HTTPException(status_code=503, detail="batch diagnosis script is unavailable")
@@ -2013,6 +2123,8 @@ class OpsRuntime:
         settings["input_path"] = display_path
         settings["pdf_count"] = pdf_count
         settings["source_type"] = source_type
+        if settings_extra:
+            settings.update(settings_extra)
         record = self.store.create_batch_run(
             run_id,
             effective_input_path,
@@ -2760,6 +2872,37 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="batch run not found")
         path = runtime.resolve_artifact(record, kind, artifact_path)
         return FileResponse(path)
+
+    @app.post("/api/batch-runs/{run_id}/retry-problem-pages", status_code=202)
+    async def retry_problem_pages(
+        run_id: str,
+        payload: ProblemPagesRetryRequest,
+        request: Request,
+    ):
+        authorize(request, write=True)
+        record = runtime.store.get_batch_run(run_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="batch run not found")
+        process = runtime.batch_processes.get(run_id)
+        if process is not None and process.returncode is None:
+            raise HTTPException(
+                status_code=409,
+                detail="wait for the source batch run to stop before retrying problem pages",
+            )
+        result = await runtime.retry_problem_pages(record, payload)
+        runtime.store.audit(
+            "batch_retry_problem_pages",
+            result.get("run_id", "unknown"),
+            True,
+            json.dumps(
+                {
+                    "retry_of_run_id": run_id,
+                    **payload.model_dump(),
+                },
+                ensure_ascii=False,
+            ),
+        )
+        return result
 
     @app.post("/api/batch-runs/{run_id}/{action}")
     async def batch_action(run_id: str, action: str, request: Request):

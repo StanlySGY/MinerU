@@ -158,11 +158,31 @@
       </div>
       <div class="actions">
         <button id="export-current-batch-document" type="button" class="secondary-button">导出当前内容</button>
+        <button type="button" class="primary-button" data-active-problem-pages-retry>重试异常页</button>
         <button type="button" class="secondary-button" data-dialog-export="problem_pages">导出异常页 PDF</button>
         <button type="button" class="secondary-button" data-dialog-export="zip">导出完整 ZIP</button>
       </div>
     </div>
     <article id="batch-document-preview" class="markdown-preview batch-document-preview"><div class="empty-state">正在读取...</div></article>
+  </dialog>
+
+  <dialog id="problem-pages-retry-dialog" class="problem-pages-retry-dialog">
+    <header class="dialog-header">
+      <div><h2>重试异常页</h2><p id="problem-pages-retry-meta" class="muted"></p></div>
+      <button id="close-problem-pages-retry" type="button" class="secondary-button">关闭</button>
+    </header>
+    <form id="problem-pages-retry-form" class="problem-pages-retry-form">
+      <input name="run_id" type="hidden">
+      <p class="retry-explanation">系统会从原 PDF 中截取状态为“跳过”或“失败”的页面，创建一个新的批次。原批次和原文件不会被修改。</p>
+      <label><span>VLM 单次请求超时（秒）</span><input name="page_timeout_seconds" type="number" value="1200" min="1" max="7200" step="1" required><small>例如原来 600 秒超时，可改成 1200 秒继续测试；不能超过底层 HTTP 硬超时。</small></label>
+      <label><span>控制台等待上限（秒）</span><input name="task_timeout" type="number" value="7200" min="60" max="86400" step="1" required><small>提交时会自动保证至少比单页超时多 60 秒；达到上限不会取消 MinerU 后台任务。</small></label>
+      <label><span>连接错误重试次数</span><input name="page_connect_max_retries" type="number" value="0" min="0" max="3" step="1" required><small>测量这一页真实处理时间时建议保持 0，避免重试耗时干扰结果。</small></label>
+      <label><span>VLM micro-batch 页数</span><input name="vlm_batch_size" type="number" value="1" min="1" max="16" step="1" required><small>异常页专项测试建议保持 1，以便准确观察每一页耗时。</small></label>
+      <div class="retry-dialog-actions">
+        <button id="cancel-problem-pages-retry" type="button" class="secondary-button">取消</button>
+        <button id="submit-problem-pages-retry" type="submit" class="primary-button">截取并开始重试</button>
+      </div>
+    </form>
   </dialog>
 
   <dialog id="task-preview-dialog" class="batch-dialog task-preview-dialog">

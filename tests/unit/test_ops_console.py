@@ -14,6 +14,7 @@ from mineru.cli.ops import (
     BatchRunRequest,
     OpsRuntime,
     OpsStore,
+    ProblemPagesRetryRequest,
     apply_service_runtime_health,
     build_smoke_test_pdf,
     create_app,
@@ -461,6 +462,157 @@ def test_problem_pages_archive_exports_original_page_numbers(
     asyncio.run(runtime.close())
 
 
+def test_retry_problem_pages_requires_terminal_source_batch(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
+    runtime = OpsRuntime()
+    source_record = {
+        "run_id": "running-source",
+        "status": "running",
+        "settings": {},
+    }
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            runtime.retry_problem_pages(
+                source_record,
+                ProblemPagesRetryRequest(),
+            )
+        )
+
+    assert exc_info.value.status_code == 409
+    assert "terminal state" in str(exc_info.value.detail)
+    asyncio.run(runtime.close())
+
+
+def test_retry_problem_pages_creates_linked_batch_with_timeout_override(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
+    runtime = OpsRuntime()
+    runtime.batch_script = tmp_path / "batch.py"
+    runtime.batch_script.write_text("pass\n", encoding="utf-8")
+    source_run_dir = runtime.report_dir / "source-run"
+    input_pdf = source_run_dir / "input/sample.pdf"
+    input_pdf.parent.mkdir(parents=True)
+    input_pdf.write_bytes(b"%PDF-original")
+    result_dir = source_run_dir / "results/0001-sample"
+    result_dir.mkdir(parents=True)
+    (result_dir / "preview.json").write_text(
+        json.dumps(
+            {
+                "task_id": "source-task",
+                "file_name": "sample.pdf",
+                "relative_path": "sample.pdf",
+                "progress": {
+                    "files": [
+                        {
+                            "file_name": "sample.pdf",
+                            "pages": [
+                                {"page_number": 1, "status": "completed"},
+                                {
+                                    "page_number": 2,
+                                    "status": "skipped",
+                                    "error_type": "TimeoutError",
+                                    "error": "page timed out",
+                                },
+                            ],
+                        }
+                    ]
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    source_record = runtime.store.create_batch_run(
+        "source-run",
+        source_run_dir / "input",
+        {
+            "input_path": "浏览器上传（1 个 PDF）",
+            "source_type": "browser_upload",
+            "pdf_count": 1,
+            "backend": "vlm-http-client",
+            "effort": "medium",
+            "parse_method": "auto",
+            "lang": "ch",
+            "server_url": "http://vlm:30000",
+            "recursive": True,
+            "task_timeout": 7200,
+            "page_timeout_seconds": 600,
+            "page_connect_max_retries": 1,
+            "vlm_batch_size": 4,
+            "pause_seconds": 2,
+        },
+        source_run_dir / "BATCH_DIAGNOSIS.md",
+        source_run_dir / "raw",
+        source_run_dir / "batch.log",
+    )
+    runtime.store.update_batch_run("source-run", status="completed_with_failures")
+    source_record = runtime.store.get_batch_run("source-run")
+    assert source_record is not None
+
+    def fake_rewrite(source_bytes: bytes, *, page_indices: list[int]) -> bytes:
+        assert source_bytes == b"%PDF-original"
+        assert page_indices == [1]
+        return b"%PDF-retry-page"
+
+    async def fake_batch_process(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "mineru.cli.ops.rewrite_pdf_bytes_with_pdfium",
+        fake_rewrite,
+    )
+    monkeypatch.setattr(runtime, "_run_batch_process", fake_batch_process)
+
+    async def run_test():
+        result = await runtime.retry_problem_pages(
+            source_record,
+            ProblemPagesRetryRequest(
+                page_timeout_seconds=1200,
+                task_timeout=900,
+                page_connect_max_retries=0,
+                vlm_batch_size=1,
+            ),
+        )
+        await asyncio.sleep(0)
+        return result
+
+    retry_record = asyncio.run(run_test())
+
+    assert retry_record["settings"]["source_type"] == "problem_page_retry"
+    assert retry_record["settings"]["retry_of_run_id"] == "source-run"
+    assert retry_record["settings"]["page_timeout_seconds"] == 1200
+    assert retry_record["settings"]["task_timeout"] == 1260
+    assert retry_record["settings"]["page_connect_max_retries"] == 0
+    assert retry_record["settings"]["vlm_batch_size"] == 1
+    assert retry_record["settings"]["problem_page_count"] == 1
+    assert retry_record["settings"]["problem_pages_manifest_path"] == "manifest.json"
+    assert "problem_pages_manifest" not in retry_record["settings"]
+    retry_input = Path(retry_record["input_path"])
+    assert (retry_input / "0001-sample-problem-pages.pdf").read_bytes() == b"%PDF-retry-page"
+    assert json.loads((retry_input / "manifest.json").read_text(encoding="utf-8"))[
+        "files"
+    ][0]["original_page_numbers"] == [2]
+    assert runtime.resolve_artifact(
+        retry_record,
+        "input",
+        "manifest.json",
+    ) == retry_input / "manifest.json"
+    assert runtime.resolve_artifact(
+        retry_record,
+        "input",
+        "manifest.csv",
+    ) == retry_input / "manifest.csv"
+    asyncio.run(runtime.close())
+
+
 def test_ops_runtime_background_sync_persists_router_tasks(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
@@ -579,6 +731,7 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "/api/tasks/{task_id}/preview/pages/{page_number}" in paths
     assert "/api/batch-runs" in paths
     assert "/api/batch-runs/upload" in paths
+    assert "/api/batch-runs/{run_id}/retry-problem-pages" in paths
     assert "/api/batch-runs/{run_id}/artifacts/{kind}/{artifact_path:path}" in paths
     assert "/" in paths
     dashboard_html = (static_dir / "index.html").read_text(encoding="utf-8")
@@ -590,6 +743,8 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "task-preview-dialog" in dashboard_html
     assert "同步滚动" in dashboard_html
     assert "导出当前内容" in dashboard_html
+    assert "problem-pages-retry-dialog" in dashboard_html
+    assert "重试异常页" in dashboard_html
     assert "log-live" in dashboard_html
     assert "log-follow" in dashboard_html
     assert "markdown-table-wrap" in dashboard_js
@@ -606,6 +761,8 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "data-task-report" in dashboard_js
     assert "导出 Markdown 报告" in dashboard_js
     assert "导出 CSV" in dashboard_js
+    assert "retry-problem-pages" in dashboard_js
+    assert "data-problem-pages-retry" in dashboard_js
     assert "task-timing-table" in dashboard_css
     assert "width: calc(100vw - 24px)" in dashboard_css
 

@@ -494,7 +494,10 @@ function compactBatchRows(items, limit = 100) {
   return `<table><thead><tr><th>目录</th><th>状态</th><th>PDF</th><th>开始时间</th><th>记录</th><th>操作</th></tr></thead><tbody>${items.slice(0, limit).map(run => {
     const active = ["pending", "running", "paused", "cancelling"].includes(run.status);
     const previewText = run.input_preview_ready || run.result_preview_ready ? "可预览" : "";
-    return `<tr><td><strong>${esc(run.settings?.input_path || run.input_path)}</strong><div class="mono muted">${esc(run.run_id)}</div></td><td>${badge(run.status)}${previewText ? `<div class="muted">${previewText}</div>` : ""}</td><td>${run.settings?.pdf_count || "-"}</td><td>${esc(formatDate(run.started_at || run.created_at))}</td><td><button class="text-button" data-batch-detail="${run.run_id}">查看记录</button></td><td><div class="actions">${active ? `<button class="action-button" data-batch="${run.run_id}" data-batch-action="${run.status === "paused" ? "resume" : "pause"}">${run.status === "paused" ? "继续" : "暂停"}</button><button class="action-button danger" data-batch="${run.run_id}" data-batch-action="cancel">停止批次脚本</button>` : `<button class="action-button" data-batch="${run.run_id}" data-batch-action="retry">重试</button><button class="action-button danger" data-batch="${run.run_id}" data-batch-action="delete">删除</button>`}</div></td></tr>`;
+    const retrySource = run.settings?.source_type === "problem_page_retry" && run.settings?.retry_of_run_id
+      ? `<div class="muted">异常页重试 · 来源 ${esc(run.settings.retry_of_run_id)}</div>`
+      : "";
+    return `<tr><td><strong>${esc(run.settings?.input_path || run.input_path)}</strong>${retrySource}<div class="mono muted">${esc(run.run_id)}</div></td><td>${badge(run.status)}${previewText ? `<div class="muted">${previewText}</div>` : ""}</td><td>${run.settings?.pdf_count || "-"}</td><td>${esc(formatDate(run.started_at || run.created_at))}</td><td><button class="text-button" data-batch-detail="${run.run_id}">查看记录</button></td><td><div class="actions">${active ? `<button class="action-button" data-batch="${run.run_id}" data-batch-action="${run.status === "paused" ? "resume" : "pause"}">${run.status === "paused" ? "继续" : "暂停"}</button><button class="action-button danger" data-batch="${run.run_id}" data-batch-action="cancel">停止批次脚本</button>` : `<button class="action-button" data-problem-pages-retry="${run.run_id}">重试异常页</button><button class="action-button" data-batch="${run.run_id}" data-batch-action="retry">重试全部</button><button class="action-button danger" data-batch="${run.run_id}" data-batch-action="delete">删除</button>`}</div></td></tr>`;
   }).join("")}</tbody></table>`;
 }
 
@@ -685,6 +688,11 @@ async function exportBatch(runId, format) {
 }
 
 async function handleBatchTableClick(event) {
+  const problemRetryButton = event.target.closest("[data-problem-pages-retry]");
+  if (problemRetryButton) {
+    await openProblemPagesRetry(problemRetryButton.dataset.problemPagesRetry);
+    return;
+  }
   const detailButton = event.target.closest("[data-batch-detail]");
   if (detailButton) {
     await loadBatchDetail(detailButton.dataset.batchDetail);
@@ -705,6 +713,81 @@ async function handleBatchTableClick(event) {
 
 document.getElementById("batch-table").addEventListener("click", handleBatchTableClick);
 document.getElementById("overview-batches").addEventListener("click", handleBatchTableClick);
+
+const problemPagesRetryDialog = document.getElementById("problem-pages-retry-dialog");
+const problemPagesRetryForm = document.getElementById("problem-pages-retry-form");
+
+function closeProblemPagesRetry() {
+  if (problemPagesRetryDialog.open) problemPagesRetryDialog.close();
+}
+
+async function openProblemPagesRetry(runId) {
+  try {
+    const detail = state.activeBatchId === runId && state.activeBatchDetail
+      ? state.activeBatchDetail
+      : await api(`/api/batch-runs/${encodeURIComponent(runId)}`);
+    if (["pending", "running", "paused", "cancelling"].includes(detail.status)) {
+      throw new Error("请等待原批次停止后再重试异常页");
+    }
+    const settings = detail.settings || {};
+    const previousTimeout = Number(settings.page_timeout_seconds) || 600;
+    const suggestedTimeout = Math.min(7200, Math.max(1200, previousTimeout * 2));
+    problemPagesRetryForm.elements.run_id.value = runId;
+    problemPagesRetryForm.elements.page_timeout_seconds.value = String(suggestedTimeout);
+    problemPagesRetryForm.elements.task_timeout.value = String(Math.max(
+      Number(settings.task_timeout) || 7200,
+      Math.ceil(suggestedTimeout) + 60,
+    ));
+    problemPagesRetryForm.elements.page_connect_max_retries.value = "0";
+    problemPagesRetryForm.elements.vlm_batch_size.value = "1";
+    document.getElementById("problem-pages-retry-meta").textContent = `${settings.input_path || runId} · 原超时 ${previousTimeout} 秒 · 来源批次 ${runId}`;
+    if (!problemPagesRetryDialog.open) problemPagesRetryDialog.showModal();
+  } catch (error) {
+    notice(error.message);
+  }
+}
+
+problemPagesRetryForm.elements.page_timeout_seconds.addEventListener("change", () => {
+  const timeout = Number(problemPagesRetryForm.elements.page_timeout_seconds.value) || 1;
+  const taskTimeout = Number(problemPagesRetryForm.elements.task_timeout.value) || 60;
+  if (taskTimeout < Math.ceil(timeout) + 60) {
+    problemPagesRetryForm.elements.task_timeout.value = String(Math.ceil(timeout) + 60);
+  }
+});
+
+problemPagesRetryForm.addEventListener("submit", async event => {
+  event.preventDefault();
+  const runId = problemPagesRetryForm.elements.run_id.value;
+  const submitButton = document.getElementById("submit-problem-pages-retry");
+  const payload = {
+    page_timeout_seconds: Number(problemPagesRetryForm.elements.page_timeout_seconds.value),
+    task_timeout: Number(problemPagesRetryForm.elements.task_timeout.value),
+    page_connect_max_retries: Number(problemPagesRetryForm.elements.page_connect_max_retries.value),
+    vlm_batch_size: Number(problemPagesRetryForm.elements.vlm_batch_size.value),
+  };
+  try {
+    submitButton.disabled = true;
+    submitButton.textContent = "正在截取异常页";
+    const result = await api(`/api/batch-runs/${encodeURIComponent(runId)}/retry-problem-pages`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    closeProblemPagesRetry();
+    notice(`异常页重试批次已开始：${result.run_id}`, false);
+    await loadBatches();
+  } catch (error) {
+    notice(error.message);
+  } finally {
+    submitButton.disabled = false;
+    submitButton.textContent = "截取并开始重试";
+  }
+});
+
+document.getElementById("close-problem-pages-retry").addEventListener("click", closeProblemPagesRetry);
+document.getElementById("cancel-problem-pages-retry").addEventListener("click", closeProblemPagesRetry);
+document.querySelector("[data-active-problem-pages-retry]").addEventListener("click", () => {
+  if (state.activeBatchId) openProblemPagesRetry(state.activeBatchId);
+});
 
 function renderInlineMarkdown(value) {
   const tokens = [];
@@ -926,12 +1009,20 @@ async function loadBatchDetail(runId) {
     state.activeBatchId = runId;
     state.activeBatchDetail = detail;
     document.getElementById("batch-detail-title").textContent = detail.settings?.input_path || "批量任务详情";
-    document.getElementById("batch-detail-meta").textContent = `${runId} · ${statusText[detail.status] || detail.status} · ${detail.settings?.pdf_count || 0} 个 PDF · 产物 ${formatBytes(detail.artifacts?.storage_bytes || 0)} · 保留 ${detail.artifacts?.retention_days ?? "-"} 天`;
+    document.getElementById("batch-detail-meta").textContent = batchDetailMeta(detail);
+    document.querySelector("[data-active-problem-pages-retry]").disabled = ["pending", "running", "paused", "cancelling"].includes(detail.status);
     const reportButton = document.querySelector('[data-batch-document="markdown"]');
     reportButton.disabled = !detail.report_ready;
     if (!dialog.open) dialog.showModal();
     await showBatchDocument(detail.report_ready ? "markdown" : "process_markdown");
   } catch (error) { notice(error.message); }
+}
+
+function batchDetailMeta(detail) {
+  const source = detail.settings?.source_type === "problem_page_retry" && detail.settings?.retry_of_run_id
+    ? ` · 异常页来源 ${detail.settings.retry_of_run_id}`
+    : "";
+  return `${detail.run_id} · ${statusText[detail.status] || detail.status} · ${detail.settings?.pdf_count || 0} 个 PDF${source} · 产物 ${formatBytes(detail.artifacts?.storage_bytes || 0)} · 保留 ${detail.artifacts?.retention_days ?? "-"} 天`;
 }
 
 document.getElementById("batch-document-tabs").addEventListener("click", event => {
@@ -976,7 +1067,7 @@ async function refreshActiveBatchDocument() {
     const detail = await api(`/api/batch-runs/${encodeURIComponent(runId)}`);
     if (state.activeBatchId !== runId) return;
     state.activeBatchDetail = detail;
-    document.getElementById("batch-detail-meta").textContent = `${detail.run_id} · ${statusText[detail.status] || detail.status} · ${detail.settings?.pdf_count || 0} 个 PDF · 产物 ${formatBytes(detail.artifacts?.storage_bytes || 0)} · 保留 ${detail.artifacts?.retention_days ?? "-"} 天`;
+    document.getElementById("batch-detail-meta").textContent = batchDetailMeta(detail);
     const reportButton = document.querySelector('[data-batch-document="markdown"]');
     reportButton.disabled = !detail.report_ready;
     if (state.activeBatchDocument === "process_markdown") await showBatchDocument("process_markdown", {preserveScroll: true});
