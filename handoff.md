@@ -1,8 +1,59 @@
 # Session handoff — 2026-08-20
 
+## 追加功能：异常页可调超时重试
+
+本轮在 `dev` 上新增“重试异常页”功能，功能提交为 `5636efb2`（`feat: retry failed pages with custom VLM timeout`）。本轮提交范围如下；不要把本地 `.gitignore` 或运行数据带入后续提交：
+
+```text
+mineru/cli/ops.py
+mineru/ops/static/index.html
+mineru/ops/static/ops.css
+mineru/ops/static/ops.js
+tests/unit/test_ops_console.py
+docker/multi/env.multi.example
+handoff.md
+```
+
+功能行为：
+
+- 批次结束后，列表和详情页都提供“重试异常页”。
+- 弹窗可单独填写 `page_timeout_seconds`、`task_timeout`、`page_connect_max_retries` 和 `vlm_batch_size`。
+- 默认建议值会把原单页超时加倍，最低建议为 1200 秒、最大 7200 秒；连接重试默认 0、micro-batch 默认 1。
+- 后端只提取真实终态为 `skipped` / `failed` 的页，生成新的问题页 PDF 并直接创建新批次，不会修改原 PDF 或在原 Router task 内续跑。
+- 新批次 `settings` 记录 `source_type=problem_page_retry`、`retry_of_run_id`、问题页数量和 `problem_pages_manifest_path=manifest.json`；完整原始页码映射保存在新批次输入目录的 `manifest.json` / `manifest.csv`，避免批次列表接口因大量异常页而膨胀。
+- `task_timeout` 在后端至少自动提升到 `page_timeout_seconds + 60`，避免诊断脚本比单页 soft timeout 更早停止等待。
+- 原始 PDF 已被清理、移走或超出允许测试目录时，接口会明确报错，不能凭现有结果重建问题页。
+
+新增接口：
+
+```http
+POST /api/batch-runs/{run_id}/retry-problem-pages
+Content-Type: application/json
+
+{
+  "page_timeout_seconds": 1200,
+  "task_timeout": 7200,
+  "page_connect_max_retries": 0,
+  "vlm_batch_size": 1
+}
+```
+
+已执行验证：
+
+```text
+python -m py_compile mineru/cli/ops.py
+node --check mineru/ops/static/ops.js
+python -m pytest -o addopts='' tests/unit/test_ops_console.py tests/unit/test_task_progress.py -q
+git diff --check
+结果：32 passed
+```
+
+现场使用 1200 秒重试前仍需确认 `env.multi` 中 `MINERU_VLM_CLIENT_HTTP_TIMEOUT` 不小于 1200；当前示例为 7200。修改 hard timeout 后必须重建 API 容器，仅重启旧容器不会更新启动参数。
+
 ## 本次交付状态
 
 - 当前分支：`dev`。
+- 异常页可调超时重试功能提交：`5636efb2`。
 - 已将最新 `origin/master`（`4fe4bde1`，MinerU `3.4.5`）合并到 `dev`，合并提交：`bab95584878e4f231240c70c332d8548598ba472`。
 - 本次运维控制台与 VLM 基准测试改动提交：`5807835d`（`feat: improve ops timeout diagnostics and VLM benchmarks`）。
 - 上一轮 handoff 已提交为 `1efb0a53`；本次补充现场既有目录、`ops-ui7` 镜像命名和 `env.multi.example` 易读注释后，再次提交并推送 `dev`。
