@@ -13,6 +13,10 @@ from mineru.cli.backend_options import (
     validate_effort as validate_public_effort,
 )
 from mineru.cli.public_http_client_policy import validate_public_http_client_request
+from mineru.utils.config_reader import (
+    get_vlm_connect_max_retries,
+    get_vlm_page_timeout_seconds,
+)
 from mineru.utils.ocr_language import (
     PUBLIC_OCR_LANGUAGE_SCHEMA_EXTRA,
     format_public_ocr_lang_description,
@@ -90,6 +94,57 @@ def validate_parse_lang_list(lang_list: list[str]) -> list[str]:
         return validate_public_ocr_lang_list(lang_list)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def resolve_vlm_request_controls(
+    page_timeout_seconds: Optional[float],
+    page_connect_max_retries: Optional[int],
+) -> tuple[float, int]:
+    """按“请求参数 > 环境配置 > 内置默认”解析 VLM 单页控制项。"""
+    effective_timeout = (
+        get_vlm_page_timeout_seconds(default=600.0)
+        if page_timeout_seconds is None
+        else page_timeout_seconds
+    )
+    effective_retries = (
+        get_vlm_connect_max_retries(default=1)
+        if page_connect_max_retries is None
+        else page_connect_max_retries
+    )
+
+    if not 1.0 <= effective_timeout <= 7200.0:
+        raise HTTPException(
+            status_code=400,
+            detail="page_timeout_seconds must be between 1 and 7200",
+        )
+    if not 0 <= effective_retries <= 3:
+        raise HTTPException(
+            status_code=400,
+            detail="page_connect_max_retries must be between 0 and 3",
+        )
+    return float(effective_timeout), int(effective_retries)
+
+
+def apply_effective_vlm_request_controls(
+    fields: list[tuple[str, str]],
+    request_options: ParseRequestOptions,
+) -> None:
+    """把最终 VLM 控制值补入缺失的 multipart 字段，保留请求显式值。"""
+    existing_names = {name for name, _value in fields}
+    if "page_timeout_seconds" not in existing_names:
+        fields.append(
+            (
+                "page_timeout_seconds",
+                str(request_options.page_timeout_seconds),
+            )
+        )
+    if "page_connect_max_retries" not in existing_names:
+        fields.append(
+            (
+                "page_connect_max_retries",
+                str(request_options.page_connect_max_retries),
+            )
+        )
 
 
 async def parse_request_form(
@@ -213,13 +268,23 @@ async def parse_request_form(
         Form(description="The ending page for PDF parsing, beginning from 0"),
     ] = 99999,
     page_timeout_seconds: Annotated[
-        float,
-        Form(description="Soft timeout in seconds for one VLM request (1-7200)"),
-    ] = 600.0,
+        Optional[float],
+        Form(
+            description=(
+                "Soft timeout in seconds for one VLM request (1-7200). "
+                "When omitted, use MINERU_VLM_PAGE_TIMEOUT_SECONDS."
+            )
+        ),
+    ] = None,
     page_connect_max_retries: Annotated[
-        int,
-        Form(description="Retries for transient VLM connection errors (0-3)"),
-    ] = 1,
+        Optional[int],
+        Form(
+            description=(
+                "Retries for transient VLM connection errors (0-3). "
+                "When omitted, use MINERU_VLM_CONNECT_MAX_RETRIES."
+            )
+        ),
+    ] = None,
     vlm_batch_size: Annotated[
         int,
         Form(description="Pages per VLM micro-batch (1-16)"),
@@ -245,10 +310,10 @@ async def parse_request_form(
         return_content_list = False
         return_images = True
 
-    if not 1.0 <= page_timeout_seconds <= 7200.0:
-        raise HTTPException(status_code=400, detail="page_timeout_seconds must be between 1 and 7200")
-    if not 0 <= page_connect_max_retries <= 3:
-        raise HTTPException(status_code=400, detail="page_connect_max_retries must be between 0 and 3")
+    page_timeout_seconds, page_connect_max_retries = resolve_vlm_request_controls(
+        page_timeout_seconds,
+        page_connect_max_retries,
+    )
     if not 1 <= vlm_batch_size <= 16:
         raise HTTPException(status_code=400, detail="vlm_batch_size must be between 1 and 16")
 

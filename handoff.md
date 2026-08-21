@@ -1,5 +1,62 @@
 # Session handoff — 2026-08-20
 
+## 2026-08-21 完成：外部 Router/API 继承配置中心 VLM 超时设置
+
+修复了外部系统直接调用 MinerU Router 或 API 时，未传超时参数便固定使用 `600 秒 / 1 次重试`、无法继承运维控制台配置中心设置的问题。
+
+### 生效规则
+
+`POST /tasks` 和 `POST /file_parse` 现在统一按以下优先级解析：
+
+```text
+请求显式参数 > 配置中心环境值 > 内置默认值
+```
+
+对应参数与环境变量：
+
+```text
+page_timeout_seconds       -> MINERU_VLM_PAGE_TIMEOUT_SECONDS       -> 默认 600
+page_connect_max_retries   -> MINERU_VLM_CONNECT_MAX_RETRIES        -> 默认 1
+```
+
+- 外部调用方不传字段时，API 直接读取自身环境配置；Router 读取自身环境配置后，把最终值补入转发给上游 API 的 multipart 请求。
+- 外部调用方显式传入字段时，Router 不覆盖该值，因此单次请求仍可做独立实验。
+- `docker/multi/compose-multi.yaml` 已把这两个变量同时注入 `mineru-api-1` 和 `mineru-router`。
+- 在运维控制台执行“保存并应用”并成功重建受影响的 API/Router 后，后续外部调用会使用新配置；正在运行中的旧请求不会被动态修改。
+
+### 超时边界说明
+
+这里不是无限等待：
+
+- 单页 soft timeout 允许范围为 `1-7200` 秒；
+- `MINERU_VLM_CLIENT_HTTP_TIMEOUT` / API `--http-timeout` 是另一层 HTTP hard timeout，配置中心当前允许到 `14400` 秒；
+- 最终实际可等待时长仍取决于整条链路中最短的超时，包括页面 soft timeout、MinerU HTTP client、VLM 服务、Nginx/负载均衡和外部调用方自己的 HTTP client timeout。
+
+因此现场若设置 `page_timeout_seconds=1200`，还应确保 HTTP hard timeout、网关及调用方超时均不小于 1200 秒。
+
+### 涉及文件
+
+```text
+mineru/cli/api_request.py
+mineru/cli/router.py
+docker/multi/compose-multi.yaml
+tests/unit/test_api_request.py
+handoff.md
+```
+
+### 验证结果
+
+```text
+python -m py_compile mineru/cli/api_request.py mineru/cli/router.py                         # 通过
+python -m pytest -o addopts='' tests/unit/test_api_request.py -q                          # 8 passed
+python -m pytest -o addopts='' tests/unit/test_vlm_resilience.py -q                       # 9 passed
+python -m pytest -o addopts='' tests/unit/test_ops_agent_config.py tests/unit/test_ops_console.py tests/unit/test_batch_router_diagnose.py -q  # 48 passed
+docker compose --env-file docker/multi/env.multi.example -f docker/multi/compose-multi.yaml config --quiet  # 通过
+git diff --check                                                                            # 通过
+```
+
+共 65 个相关测试通过。
+
 ## 2026-08-21 完成：UI8 配置安全应用、回滚与界面升级
 
 本节是配置中心的最新状态，覆盖下方 UI7“第一阶段只读”的旧记录。目标分支为 `dev`，提交标题为 `feat: enable safe ops configuration apply workflow`。

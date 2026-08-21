@@ -41,7 +41,11 @@ from mineru.cli.api_client import (
     response_detail,
 )
 from mineru.cli.api_protocol import API_PROTOCOL_VERSION
-from mineru.cli.api_request import ParseRequestOptions, parse_request_form
+from mineru.cli.api_request import (
+    ParseRequestOptions,
+    apply_effective_vlm_request_controls,
+    parse_request_form,
+)
 from mineru.cli.common import normalize_upload_filename
 from mineru.cli.public_http_client_policy import (
     configure_public_http_client_policy,
@@ -1494,8 +1498,8 @@ def create_app(settings: RouterSettings | None = None) -> FastAPI:
             ParseRequestOptions, Depends(parse_request_form)
         ],
     ):
-        del request_options
         payload = await stage_multipart_request(http_request)
+        apply_effective_vlm_request_controls(payload.fields, request_options)
         try:
             router_task = await submit_router_task(http_request, payload)
         finally:
@@ -1610,8 +1614,8 @@ def create_app(settings: RouterSettings | None = None) -> FastAPI:
             ParseRequestOptions, Depends(parse_request_form)
         ],
     ):
-        del request_options
         payload = await stage_multipart_request(request)
+        apply_effective_vlm_request_controls(payload.fields, request_options)
         try:
             router_task = await submit_router_task(request, payload)
         finally:

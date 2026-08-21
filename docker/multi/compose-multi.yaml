@@ -135,6 +135,10 @@ services:
       - "${ROUTER_PORT:-8002}:8002"
     environment:
       PYTHONPATH: /app
+      # 外部调用未显式传单页超时时，由 Router 使用配置中心的值并转发给 API。
+      MINERU_VLM_PAGE_TIMEOUT_SECONDS: ${MINERU_VLM_PAGE_TIMEOUT_SECONDS:-600}
+      # 外部调用未显式传连接重试次数时，由 Router 使用配置中心的值并转发给 API。
+      MINERU_VLM_CONNECT_MAX_RETRIES: ${MINERU_VLM_CONNECT_MAX_RETRIES:-1}
     volumes:
       - mineru-code:/app:ro
     entrypoint: ["python", "-m"]
