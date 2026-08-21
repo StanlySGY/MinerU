@@ -24,10 +24,24 @@ const state = {
   serviceFilter: "all",
   logRequestId: 0,
   logLoading: false,
+  config: null,
+  configSchema: null,
+  configHistory: [],
+  configDraft: {},
+  configValidationErrors: {},
+  labSubmitting: false,
   token: sessionStorage.getItem("mineruOpsToken") || "",
 };
 
-const titles = {overview: "总览", services: "服务", tasks: "任务", batch: "批量测试", logs: "日志"};
+const titles = {
+  overview: "总览",
+  services: "服务",
+  tasks: "任务",
+  batch: "批量测试",
+  lab: "性能实验室",
+  config: "配置中心",
+  logs: "日志",
+};
 const statusText = {
   pending: "等待中", queued: "等待处理", processing: "处理中", completed: "已完成", failed: "失败",
   partial_success: "部分成功", running: "运行中", paused: "已暂停", cancelled: "已取消",
@@ -1257,6 +1271,184 @@ document.getElementById("log-follow").addEventListener("change", event => {
   }
 });
 
+function labRunSettings(run) {
+  return run.settings || run.config || {};
+}
+
+function labRunElapsed(run) {
+  return formatElapsed(
+    run.started_at || run.created_at,
+    run.completed_at || (run.status === "running" ? null : run.updated_at || null),
+  );
+}
+
+function renderLabRuns() {
+  const status = document.getElementById("lab-status");
+  const table = document.getElementById("lab-table");
+  status.textContent = `${state.batches.length} 条实验记录`;
+  if (!state.batches.length) {
+    table.innerHTML = `<div class="empty-state">还没有性能实验。填写服务器目录后开始第一组基线测试。</div>`;
+    return;
+  }
+  table.innerHTML = `<table><thead><tr><th>测试目录</th><th>micro-batch</th><th>单页超时</th><th>连接重试</th><th>等待上限</th><th>状态</th><th>创建时间</th><th>耗时</th><th>记录</th></tr></thead><tbody>${state.batches.map(run => {
+    const settings = labRunSettings(run);
+    return `<tr><td><strong>${esc(settings.input_path || run.input_path || "-")}</strong><div class="mono muted">${esc(run.run_id || "")}</div></td><td>${esc(settings.vlm_batch_size ?? "-")} 页</td><td>${esc(settings.page_timeout_seconds ?? "-")} 秒</td><td>${esc(settings.page_connect_max_retries ?? "-")}</td><td>${esc(settings.task_timeout ?? "-")} 秒</td><td>${badge(run.status)}${run.failed_pages ? `<div class="bad-text">失败页 ${esc(run.failed_pages)}</div>` : ""}</td><td>${esc(formatDate(run.created_at || run.started_at))}</td><td class="mono">${esc(labRunElapsed(run))}</td><td><button class="text-button" data-batch-detail="${esc(run.run_id)}">查看记录</button></td></tr>`;
+  }).join("")}</tbody></table>`;
+}
+
+async function loadLab() {
+  const data = await api("/api/batch-runs");
+  state.batches = data.items || [];
+  renderLabRuns();
+}
+
+async function startLabExperiment(event) {
+  event.preventDefault();
+  if (state.labSubmitting) return;
+  const form = new FormData(event.currentTarget);
+  const inputPath = String(form.get("input_path") || "").trim();
+  if (!inputPath) {
+    notice("请填写服务器测试目录");
+    return;
+  }
+  const submitButton = document.getElementById("lab-submit");
+  const payload = {
+    input_path: inputPath,
+    backend: form.get("backend"),
+    lang: String(form.get("lang") || "ch").trim() || "ch",
+    task_timeout: Number(form.get("task_timeout")),
+    page_timeout_seconds: Number(form.get("page_timeout_seconds")),
+    page_connect_max_retries: Number(form.get("page_connect_max_retries")),
+    vlm_batch_size: Number(form.get("vlm_batch_size")),
+    server_url: String(form.get("server_url") || "").trim() || null,
+    recursive: form.get("recursive") === "on",
+    effort: "medium",
+    parse_method: "auto",
+    pause_seconds: 2,
+  };
+  state.labSubmitting = true;
+  submitButton.disabled = true;
+  submitButton.textContent = "正在启动实验";
+  try {
+    await api("/api/batch-runs", {method: "POST", body: JSON.stringify(payload)});
+    notice("性能实验已开始", false);
+    await loadLab();
+  } catch (error) {
+    notice(error.message);
+  } finally {
+    state.labSubmitting = false;
+    submitButton.disabled = false;
+    submitButton.textContent = "开始性能实验";
+  }
+}
+
+document.getElementById("lab-form").addEventListener("submit", startLabExperiment);
+document.getElementById("lab-table").addEventListener("click", handleBatchTableClick);
+
+function configItemValue(item) {
+  if (item.sensitive || item.type === "secret") return "";
+  return item.value ?? item.display_value ?? "";
+}
+
+function configControl(item) {
+  const key = esc(item.key);
+  const current = configItemValue(item);
+  const draftExists = Object.prototype.hasOwnProperty.call(state.configDraft, item.key);
+  const candidate = draftExists ? state.configDraft[item.key] : current;
+  const error = state.configValidationErrors[item.key];
+  const readonly = item.editable === false;
+  let control = `<span class="config-value">${esc(item.display_value ?? current ?? "-")}</span>`;
+  if (!readonly) {
+    if (item.type === "enum" && Array.isArray(item.choices)) {
+      control = `<select data-config-key="${key}"><option value="">请选择候选值</option>${item.choices.map(choice => `<option value="${esc(choice)}"${candidate === choice ? " selected" : ""}>${esc(choice)}</option>`).join("")}</select>`;
+    } else {
+      const type = item.type === "integer" ? "number" : item.type === "secret" ? "password" : "text";
+      const bounds = item.type === "integer" ? ` min="${esc(item.minimum ?? "")}" max="${esc(item.maximum ?? "")}" step="1"` : "";
+      const placeholder = item.type === "secret" ? "留空表示不参与校验" : current;
+      const value = item.type === "secret" ? candidate : candidate;
+      control = `<input type="${type}" data-config-key="${key}" value="${esc(value || "")}" placeholder="${esc(placeholder || "")}"${bounds}>`;
+    }
+  }
+  return `<div class="config-item${error ? " has-error" : ""}"><div class="config-key">${key}<span>${readonly ? "只读" : "可校验"}</span></div><div class="config-control">${control}</div><p class="config-description">${esc(item.description || "")}</p>${error ? `<p class="config-error">${esc(error)}</p>` : ""}</div>`;
+}
+
+function renderConfig() {
+  const config = state.config || {};
+  const items = config.items || [];
+  document.getElementById("config-mode").textContent = config.mode === "read_validate_only" ? "只读与校验" : (config.mode || "-" );
+  document.getElementById("config-agent-status").innerHTML = config.ok === false ? badge("unavailable") : badge("healthy");
+  document.getElementById("config-env-file").textContent = config.env_file || "-";
+  document.getElementById("config-modified-at").textContent = formatDate(config.modified_at);
+  const groups = new Map();
+  for (const item of items) groups.set(item.category || "其他配置", [...(groups.get(item.category || "其他配置") || []), item]);
+  document.getElementById("config-groups").innerHTML = [...groups.entries()].map(([category, group]) => `<section class="panel config-group"><div class="section-heading"><h2>${esc(category)}</h2><span>${group.length} 项</span></div>${group.map(configItemValue => configControl(configItemValue)).join("")}</section>`).join("") || `<div class="empty-state">没有可显示的配置。</div>`;
+}
+
+function renderConfigHistory() {
+  const target = document.getElementById("config-history");
+  if (!state.configHistory.length) {
+    target.innerHTML = `<div class="empty-state">暂无备份记录</div>`;
+    return;
+  }
+  target.innerHTML = state.configHistory.map(item => `<div class="config-history-item"><strong>${esc(item.name)}</strong><span>${esc(formatDate(item.created_at))}</span><small>${esc(item.size_bytes || 0)} bytes · 仅查看</small></div>`).join("");
+}
+
+async function loadConfig() {
+  state.configDraft = {};
+  state.configValidationErrors = {};
+  const [schema, config, history] = await Promise.all([
+    api("/api/config/schema"),
+    api("/api/config"),
+    api("/api/config/history"),
+  ]);
+  state.configSchema = schema;
+  state.config = config;
+  state.configHistory = history.items || [];
+  renderConfig();
+  renderConfigHistory();
+  const status = document.getElementById("config-validation-status");
+  status.textContent = "修改输入框后进行校验；不会写入 env 文件。";
+  status.classList.remove("bad-text");
+}
+
+async function validateConfig() {
+  if (!Object.keys(state.configDraft).length) {
+    notice("请先修改至少一个候选值");
+    return;
+  }
+  const status = document.getElementById("config-validation-status");
+  status.textContent = "正在校验候选配置...";
+  try {
+    const result = await api("/api/config/validate", {method: "POST", body: JSON.stringify({values: state.configDraft})});
+    state.configValidationErrors = result.errors || {};
+    renderConfig();
+    status.textContent = result.valid ? "校验通过；本阶段不会写入 env 文件。" : (result.message || "候选配置存在错误。");
+    status.classList.toggle("bad-text", !result.valid);
+  } catch (error) {
+    status.textContent = `校验失败：${error.message}`;
+    status.classList.add("bad-text");
+  }
+}
+
+document.getElementById("config-reload").addEventListener("click", loadConfig);
+document.getElementById("config-validate").addEventListener("click", validateConfig);
+document.getElementById("config-groups").addEventListener("input", event => {
+  const input = event.target.closest("[data-config-key]");
+  if (!input) return;
+  state.configDraft[input.dataset.configKey] = input.value;
+  delete state.configValidationErrors[input.dataset.configKey];
+  document.getElementById("config-validation-status").textContent = "已有候选修改，点击“校验候选配置”。";
+  document.getElementById("config-validation-status").classList.remove("bad-text");
+});
+
+document.getElementById("config-groups").addEventListener("change", event => {
+  const input = event.target.closest("[data-config-key]");
+  if (input) {
+    state.configDraft[input.dataset.configKey] = input.value;
+    delete state.configValidationErrors[input.dataset.configKey];
+  }
+});
+
 async function refreshCurrent() {
   notice("");
   try {
@@ -1264,6 +1456,8 @@ async function refreshCurrent() {
     else if (state.view === "services") await loadServices();
     else if (state.view === "tasks") await refreshTasksView();
     else if (state.view === "batch") await loadBatches();
+    else if (state.view === "lab") await loadLab();
+    else if (state.view === "config") await loadConfig();
     else if (state.view === "logs") {
       if (!state.services.length) await loadServices();
       else updateLogServices();
@@ -1277,7 +1471,7 @@ async function refreshCurrent() {
 }
 
 setInterval(() => {
-  if (["overview", "services", "batch"].includes(state.view)) refreshCurrent();
+  if (["overview", "services", "batch", "lab"].includes(state.view)) refreshCurrent();
   if (state.activeBatchId) refreshActiveBatchDocument();
 }, 5000);
 setInterval(() => {

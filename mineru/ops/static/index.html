@@ -18,6 +18,8 @@
         <button class="nav-item" data-view="services">服务</button>
         <button class="nav-item" data-view="tasks">任务</button>
         <button class="nav-item" data-view="batch">批量测试</button>
+        <button class="nav-item" data-view="lab">性能实验室</button>
+        <button class="nav-item" data-view="config">配置中心</button>
         <button class="nav-item" data-view="logs">日志</button>
       </nav>
       <div class="sidebar-foot">
@@ -130,6 +132,80 @@
         </section>
         <div class="section-heading"><h2>测试记录</h2><span id="batch-storage">默认串行提交 PDF</span></div>
         <div id="batch-table" class="table-wrap panel"></div>
+      </section>
+
+      <section id="view-lab" class="view">
+        <section class="feature-hero lab-hero">
+          <div>
+            <span class="feature-kicker">吞吐与稳定性基准测试</span>
+            <h2>性能实验室</h2>
+            <p>用相同 PDF 对比不同 VLM micro-batch、单页超时和连接重试策略，快速找出现场设备的吞吐甜点。</p>
+          </div>
+          <div class="feature-tags"><span>1 / 2 / 4 / 8 / 16 页</span><span>失败自动逐页隔离</span><span>复用批量任务报告</span></div>
+        </section>
+        <div class="lab-layout">
+          <section class="panel lab-form-panel">
+            <div class="section-heading"><h2>新建实验</h2><span class="muted">服务器目录</span></div>
+            <form id="lab-form" class="lab-form">
+              <label class="lab-wide"><span>服务器测试目录</span><input name="input_path" value="."><small>相对于控制台允许的测试根目录；如需浏览器上传，请使用“批量测试”。</small></label>
+              <label><span>后端</span><select name="backend"><option value="vlm-http-client">vlm-http-client</option><option value="hybrid-http-client">hybrid-http-client</option><option value="pipeline">pipeline</option></select></label>
+              <label><span>语言</span><input name="lang" value="ch"></label>
+              <fieldset class="lab-wide lab-batch-options">
+                <legend>VLM micro-batch 页数</legend>
+                <div class="lab-option-row">
+                  <label class="lab-option"><input type="radio" name="vlm_batch_size" value="1" checked><span>1</span></label>
+                  <label class="lab-option"><input type="radio" name="vlm_batch_size" value="2"><span>2</span></label>
+                  <label class="lab-option"><input type="radio" name="vlm_batch_size" value="4"><span>4</span></label>
+                  <label class="lab-option"><input type="radio" name="vlm_batch_size" value="8"><span>8</span></label>
+                  <label class="lab-option"><input type="radio" name="vlm_batch_size" value="16"><span>16</span></label>
+                </div>
+                <small>这是一次 VLM 请求处理的页数，不是 Router 同时处理的任务数；整批失败或返回页数异常时会自动回退逐页隔离。</small>
+              </fieldset>
+              <label><span>单页请求超时（秒）</span><input name="page_timeout_seconds" type="number" value="600" min="1" max="7200" required></label>
+              <label><span>任务等待上限（秒）</span><input name="task_timeout" type="number" value="7200" min="60" max="86400" required></label>
+              <label><span>连接错误重试次数</span><input name="page_connect_max_retries" type="number" value="0" min="0" max="3" required></label>
+              <label><span>VLM Server URL</span><input name="server_url" placeholder="可选"></label>
+              <label class="lab-wide check-label"><input name="recursive" type="checkbox" checked><span>包含子目录</span></label>
+              <div class="lab-wide lab-submit-row"><p>做耗时基准时建议先保持重试为 0，避免失败尝试污染结果。</p><button id="lab-submit" type="submit" class="primary-button">开始性能实验</button></div>
+            </form>
+          </section>
+          <aside class="panel lab-guide">
+            <div class="section-heading"><h2>推荐测试顺序</h2></div>
+            <ol><li><strong>基线</strong><span>micro-batch 1，重试 0。</span></li><li><strong>提高吞吐</strong><span>依次测试 2、4、8。</span></li><li><strong>观察拐点</strong><span>比较总耗时、失败页和单页请求耗时。</span></li><li><strong>谨慎测试 16</strong><span>确认显存、上下文和队列没有成为瓶颈。</span></li></ol>
+          </aside>
+        </div>
+        <div class="section-heading"><h2>最近实验</h2><span id="lab-status" class="muted">读取中</span></div>
+        <div id="lab-table" class="table-wrap panel"></div>
+      </section>
+
+      <section id="view-config" class="view">
+        <section class="feature-hero config-hero">
+          <div>
+            <span class="feature-kicker">安全、可解释的现场配置</span>
+            <h2>配置中心</h2>
+            <p>从宿主机 Agent 读取当前 env 配置，并在写入之前检查候选值是否符合白名单和范围约束。</p>
+          </div>
+          <div class="feature-tags"><span>Agent 安全通道</span><span>敏感值脱敏</span><span>只读 + 候选校验</span></div>
+        </section>
+        <div class="readonly-banner"><strong>当前为只读阶段</strong><span>可以读取配置并校验候选值；保存、应用、重启和回滚将在下一阶段开放。</span></div>
+        <div class="config-summary">
+          <div><span>工作模式</span><strong id="config-mode">只读与校验</strong></div>
+          <div><span>Agent 通道</span><strong id="config-agent-status">读取中</strong></div>
+          <div><span>Env 文件</span><strong id="config-env-file">-</strong></div>
+          <div><span>修改时间</span><strong id="config-modified-at">-</strong></div>
+        </div>
+        <div class="toolbar config-toolbar">
+          <button id="config-reload" type="button" class="secondary-button">重新读取</button>
+          <button id="config-validate" type="button" class="primary-button">校验候选配置</button>
+          <span id="config-validation-status" class="muted">修改输入框后进行校验；不会写入 env 文件。</span>
+        </div>
+        <div class="config-layout">
+          <div id="config-groups" class="config-groups"><div class="empty-state">正在读取配置...</div></div>
+          <aside class="panel config-history-panel">
+            <div class="section-heading"><h2>配置历史</h2><span class="muted">只读</span></div>
+            <div id="config-history" class="config-history"><div class="empty-state">正在读取...</div></div>
+          </aside>
+        </div>
       </section>
 
       <section id="view-logs" class="view">

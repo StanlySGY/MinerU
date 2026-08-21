@@ -1,5 +1,109 @@
 # Session handoff — 2026-08-20
 
+## 2026-08-21 完成：运维控制台配置中心与性能实验室（第一阶段）
+
+用户已确认实施“配置中心 + 性能实验室 + UI 产品化”。本轮已直接完成第一阶段代码，不再受此前 Spec Workflow `pending` 文案限制。
+
+### 可见入口
+
+运维控制台左侧导航新增两个入口，源码位于 `mineru/ops/static/index.html`：
+
+```text
+性能实验室
+配置中心
+```
+
+现场若看不到这两个按钮，说明运行中的 `mineru-ops` 仍使用旧代码镜像/旧代码 volume，或浏览器仍缓存旧页面；并非按钮需要额外开关。升级到本次 `dev` 构建的 `mineru-code:v3.4.2-ops-ui7` 后再强制刷新浏览器。
+
+### 性能实验室
+
+- 汇总现有批次结果，展示批次状态、PDF 数、页面数、成功/异常页、总耗时、有效处理耗时和重试开销。
+- 新建实验时可选择 VLM micro-batch `1 / 2 / 4 / 8 / 16`。
+- 可按实验设置单页 soft timeout、任务等待上限和连接重试次数。
+- 保留浏览器上传与服务端测试目录两种输入方式，复用现有批量测试接口。
+- 第一阶段不开放 batch 32，也不把一个 PDF 人工拆成 8/32 个独立 Router task；batch 大于 1 仍使用现有失败回退逐页隔离逻辑。
+
+### 配置中心
+
+- Ops Web 通过 Unix Socket 调用宿主机 `docker/multi/mineru-ops-agent.py`，不向 Web 容器挂载 Docker Socket。
+- Agent 读取部署目录中的 `env.multi`，按白名单 Schema 分类展示配置。
+- Token、Password、Secret 类字段只返回脱敏值；不在白名单的字段只读。
+- 页面可编辑候选值并执行类型、枚举、数值范围和换行符校验。
+- 页面展示 `env.multi.bak-*` 历史记录，但第一阶段仅查看，不恢复。
+- **安全边界：第一阶段是 `read_validate_only`，不会直接写回 `env.multi`，也不会自动重建容器。** 后续若开放“应用配置”，必须补原子写入、注释保留、Compose config 校验、差异确认、备份、选择性重建、健康检查、失败回滚和审计。
+
+### 本轮涉及文件
+
+```text
+docker/multi/mineru-ops-agent.py
+mineru/cli/ops.py
+mineru/ops/static/index.html
+mineru/ops/static/ops.css
+mineru/ops/static/ops.js
+tests/unit/test_ops_console.py
+tests/unit/test_ops_agent_config.py
+handoff.md
+```
+
+提交时必须逐文件暂存，不提交 `.gitignore`、诊断结果、运行数据库、测试 PDF、`.codegraph/`、`.mimocode/`、`.spec-workflow/` 等本地文件。
+
+### 验证结果
+
+```text
+python -m py_compile docker/multi/mineru-ops-agent.py mineru/cli/ops.py
+node --check mineru/ops/static/ops.js
+python -m pytest -o addopts='' tests/unit/test_ops_agent_config.py -q   # 6 passed
+python -m pytest -o addopts='' tests/unit/test_ops_console.py -q        # 27 passed
+python -m pytest -o addopts='' tests/unit/test_batch_router_diagnose.py -q  # 11 passed
+git diff --check
+```
+
+总计 44 个相关测试通过。
+
+## 现场诊断脚本：multi 部署健康检查与本地模型排查
+
+新增只读脚本：`docker/multi/diagnose-multi-deployment.sh`。
+
+用途：由现场在实际 `docker/multi` 部署目录执行，收集以下信息后回传：
+
+- 实际部署目录、Git 版本、Docker / Compose 版本；
+- 脱敏后的 `env.multi` 关键配置；
+- 根据 `MINERU_DEVICE_MODE` 自动选择 CPU/NPU/CUDA Compose 文件，并输出 `docker compose config` 关键展开结果；
+- `mineru-api-1`、`mineru-router`、`mineru-ops`、`mineru-code-sync-multi` 的容器状态、Health、网络、挂载和镜像版本；
+- API 容器实际收到的本地模型配置；
+- `/etc/mineru/mineru.json` 和 `/models/pipeline` 内容；
+- API 关键本地模型路径是否存在；
+- Ops 容器到 `mineru-api-1:8000/health` 的 DNS/HTTP 检查；
+- API 容器自身、宿主机映射端口的 `/health` 检查；
+- Ops 实际使用的 `/config/compose-config.yaml`；
+- API、Ops 和宿主机 Ops agent 的近期日志。
+
+脚本不会启动、停止、重启或重建容器，不修改 `env.multi`、Compose 文件和 Docker volume，不下载模型，也不会主动访问 ModelScope。默认报告同时打印到终端并保存到 `/tmp/mineru-multi-diagnosis-时间.txt`，敏感字段会做脱敏处理。
+
+现场默认执行：
+
+```bash
+bash diagnose-multi-deployment.sh
+```
+
+如果脚本不在实际部署目录，显式指定目录：
+
+```bash
+bash diagnose-multi-deployment.sh --project-dir /path/to/MinerU/docker/multi
+```
+
+如果现场启动时手工指定了 Compose overlay，必须按相同顺序传入：
+
+```bash
+bash diagnose-multi-deployment.sh \\
+  --project-dir /path/to/MinerU/docker/multi \\
+  --env-file env.multi \\
+  --compose-file compose-multi.yaml \\
+  --compose-file compose-multi.npu.yaml
+```
+
+本地验证：`bash -n docker/multi/diagnose-multi-deployment.sh` 和帮助输出均通过。该脚本目前尚未提交；不要将现场生成的报告、`env.multi` 或运行数据提交到 Git。
+
 ## 追加功能：异常页可调超时重试
 
 本轮在 `dev` 上新增“重试异常页”功能，功能提交为 `5636efb2`（`feat: retry failed pages with custom VLM timeout`）。本轮提交范围如下；不要把本地 `.gitignore` 或运行数据带入后续提交：

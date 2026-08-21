@@ -274,6 +274,62 @@ tbody tr[data-task].selected { background: #edf7f3; box-shadow: inset 3px 0 0 va
 .muted { color: var(--muted); }
 .bad-text { color: var(--bad); margin-top: 5px; overflow-wrap: anywhere; }
 .mono { font-family: "SFMono-Regular", Consolas, monospace; font-size: 12px; }
+.feature-hero { display: flex; align-items: flex-end; justify-content: space-between; gap: 28px; margin-bottom: 18px; padding: 24px 26px; border: 1px solid #cbded7; border-radius: 10px; background: linear-gradient(135deg, #f9fcfb 0%, #e8f4ef 100%); box-shadow: 0 10px 28px rgba(32, 73, 61, .06); }
+.feature-hero h2 { margin-top: 6px; font-size: 25px; color: var(--accent-dark); }
+.feature-hero p { max-width: 760px; margin-top: 9px; color: #526269; line-height: 1.7; }
+.feature-kicker { color: var(--accent); font-size: 12px; font-weight: 750; letter-spacing: .08em; }
+.feature-tags { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; min-width: 240px; }
+.feature-tags span { padding: 6px 9px; border: 1px solid #bad8cd; border-radius: 999px; background: rgba(255,255,255,.75); color: var(--accent-dark); font-size: 12px; white-space: nowrap; }
+.readonly-banner { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; padding: 11px 14px; border: 1px solid #ead293; border-radius: 7px; background: #fff9e9; color: #6e5110; }
+.readonly-banner strong { white-space: nowrap; }
+.readonly-banner span { font-size: 13px; line-height: 1.5; }
+.lab-layout { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 16px; align-items: start; }
+.lab-form-panel { padding: 0 16px 16px; }
+.lab-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.lab-form > label { display: grid; align-content: start; gap: 6px; color: #344148; font-size: 13px; }
+.lab-form small { color: var(--muted); line-height: 1.45; }
+.lab-wide { grid-column: 1 / -1; }
+.lab-batch-options { margin: 0; padding: 12px; border: 1px solid var(--line); border-radius: 7px; }
+.lab-batch-options legend { padding: 0 6px; color: #344148; font-size: 13px; }
+.lab-option-row { display: grid; grid-template-columns: repeat(5, minmax(54px, 1fr)); gap: 8px; margin-bottom: 8px; }
+.lab-option { position: relative; display: block; cursor: pointer; }
+.lab-option input { position: absolute; opacity: 0; pointer-events: none; }
+.lab-option span { display: grid; min-height: 40px; place-items: center; border: 1px solid var(--line); border-radius: 6px; background: #fafbfb; font-weight: 700; transition: .15s ease; }
+.lab-option input:checked + span { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-dark); box-shadow: inset 0 0 0 1px var(--accent); }
+.lab-submit-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-top: 4px; }
+.lab-submit-row p { color: var(--muted); font-size: 13px; line-height: 1.5; }
+.lab-submit-row button { min-width: 150px; }
+.lab-guide { padding: 0 16px 16px; }
+.lab-guide ol { display: grid; gap: 12px; margin: 4px 0 0; padding: 0; list-style: none; counter-reset: lab-step; }
+.lab-guide li { position: relative; min-height: 44px; padding-left: 42px; counter-increment: lab-step; }
+.lab-guide li::before { content: counter(lab-step); position: absolute; left: 0; top: 0; width: 29px; height: 29px; display: grid; place-items: center; border-radius: 50%; background: var(--accent-soft); color: var(--accent-dark); font-weight: 750; }
+.lab-guide strong, .lab-guide span { display: block; }
+.lab-guide span { margin-top: 3px; color: var(--muted); font-size: 13px; line-height: 1.45; }
+.config-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: 14px; overflow: hidden; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
+.config-summary > div { min-width: 0; padding: 13px 15px; border-right: 1px solid var(--line); }
+.config-summary > div:last-child { border-right: 0; }
+.config-summary span, .config-summary strong { display: block; }
+.config-summary span { color: var(--muted); font-size: 12px; }
+.config-summary strong { margin-top: 5px; overflow: hidden; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.config-toolbar { margin-bottom: 14px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
+.config-toolbar #config-validation-status { margin-left: auto; font-size: 13px; }
+.config-layout { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 16px; align-items: start; }
+.config-groups { display: grid; gap: 14px; }
+.config-group { padding: 0 16px 10px; overflow: hidden; }
+.config-item { display: grid; grid-template-columns: minmax(230px, .8fr) minmax(260px, 1fr); gap: 7px 16px; padding: 13px 0; border-top: 1px solid var(--line); }
+.config-item.has-error { margin: 0 -10px; padding-right: 10px; padding-left: 10px; border-left: 3px solid var(--bad); background: #fff8f7; }
+.config-key { display: flex; align-items: center; align-self: center; gap: 8px; min-width: 0; overflow-wrap: anywhere; font: 12px/1.5 "SFMono-Regular", Consolas, monospace; font-weight: 650; }
+.config-key span { flex: none; padding: 2px 6px; border-radius: 999px; background: var(--surface-alt); color: var(--muted); font-family: inherit; font-size: 10px; font-weight: 500; }
+.config-control { min-width: 0; }
+.config-control input, .config-control select { width: 100%; }
+.config-value { display: block; min-height: 36px; padding: 8px 10px; overflow: hidden; border: 1px solid transparent; border-radius: 5px; background: #f5f7f7; color: #516068; text-overflow: ellipsis; white-space: nowrap; }
+.config-description { grid-column: 1 / -1; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.config-error { grid-column: 1 / -1; color: var(--bad); font-size: 12px; }
+.config-history-panel { position: sticky; top: 100px; padding: 0 14px 14px; }
+.config-history { display: grid; gap: 8px; }
+.config-history-item { display: grid; gap: 4px; padding: 10px; border: 1px solid var(--line); border-radius: 6px; background: #fafbfb; }
+.config-history-item strong { overflow-wrap: anywhere; font-size: 12px; }
+.config-history-item span, .config-history-item small { color: var(--muted); font-size: 11px; }
 
 @media (max-width: 1080px) {
   .summary-strip { grid-template-columns: repeat(3, 1fr); }

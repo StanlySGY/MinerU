@@ -824,6 +824,10 @@ class ProblemPagesRetryRequest(BaseModel):
     vlm_batch_size: int = Field(default=1, ge=1, le=16)
 
 
+class ConfigValidateRequest(BaseModel):
+    values: dict[str, str] = Field(default_factory=dict)
+
+
 class OpsRuntime:
     def __init__(self) -> None:
         self.data_dir = Path(os.getenv("MINERU_OPS_DATA_DIR", DEFAULT_DATA_DIR)).resolve()
@@ -2424,6 +2428,18 @@ def create_app() -> FastAPI:
                 detail="service control is disabled until MINERU_OPS_AUTH_TOKEN is configured",
             )
 
+    async def config_agent_call(action: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        request_payload: dict[str, Any] = {"action": action}
+        if payload:
+            request_payload.update(payload)
+        result = await runtime.agent_call(request_payload, timeout=30)
+        if not result.get("ok") and "valid" not in result:
+            raise HTTPException(
+                status_code=502,
+                detail=result.get("error", "operations agent configuration request failed"),
+            )
+        return result
+
     async def query_service(service: dict[str, Any]) -> dict[str, Any]:
         result = dict(service)
         endpoint = service.get("endpoint")
@@ -2472,6 +2488,26 @@ def create_app() -> FastAPI:
             "batch_runs": runtime.store.list_batch_runs(limit=10),
             "updated_at": utc_now_iso(),
         }
+
+    @app.get("/api/config")
+    async def config_view(request: Request):
+        authorize(request)
+        return await config_agent_call("config_read")
+
+    @app.get("/api/config/schema")
+    async def config_schema_view(request: Request):
+        authorize(request)
+        return await config_agent_call("config_schema")
+
+    @app.post("/api/config/validate")
+    async def config_validate_view(payload: ConfigValidateRequest, request: Request):
+        authorize(request, write=True)
+        return await config_agent_call("config_validate", {"values": payload.values})
+
+    @app.get("/api/config/history")
+    async def config_history_view(request: Request):
+        authorize(request)
+        return await config_agent_call("config_history")
 
     @app.get("/api/services")
     async def services_view(request: Request):

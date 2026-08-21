@@ -732,6 +732,10 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "/api/batch-runs" in paths
     assert "/api/batch-runs/upload" in paths
     assert "/api/batch-runs/{run_id}/retry-problem-pages" in paths
+    assert "/api/config" in paths
+    assert "/api/config/schema" in paths
+    assert "/api/config/validate" in paths
+    assert "/api/config/history" in paths
     assert "/api/batch-runs/{run_id}/artifacts/{kind}/{artifact_path:path}" in paths
     assert "/" in paths
     dashboard_html = (static_dir / "index.html").read_text(encoding="utf-8")
@@ -745,6 +749,10 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "导出当前内容" in dashboard_html
     assert "problem-pages-retry-dialog" in dashboard_html
     assert "重试异常页" in dashboard_html
+    assert 'data-view="lab"' in dashboard_html
+    assert 'data-view="config"' in dashboard_html
+    assert "性能实验室" in dashboard_html
+    assert "配置中心" in dashboard_html
     assert "log-live" in dashboard_html
     assert "log-follow" in dashboard_html
     assert "markdown-table-wrap" in dashboard_js
