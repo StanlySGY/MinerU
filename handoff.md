@@ -1,5 +1,85 @@
 # Session handoff — 2026-08-20
 
+## 2026-08-21 完成：UI8 配置安全应用、回滚与界面升级
+
+本节是配置中心的最新状态，覆盖下方 UI7“第一阶段只读”的旧记录。目标分支为 `dev`，提交标题为 `feat: enable safe ops configuration apply workflow`。
+
+### 用户可见入口与按钮
+
+进入 **运维控制台 → 左侧“配置中心”**，可看到：
+
+```text
+重新读取
+校验候选配置
+预览变更
+保存并应用
+回滚到此版本（配置历史每条记录内）
+```
+
+页面静态资源使用 `ops.css?v=ui8`、`ops.js?v=ui8`，首页响应增加 `Cache-Control: no-store`。现场若看不到按钮，说明仍在使用旧代码镜像、旧共享 code volume、旧 `mineru-ops` 容器或浏览器缓存，并非功能开关未打开。
+
+### 配置写入与回滚安全机制
+
+- `预览变更` 只生成 old → new 差异、Compose 校验结果、受影响服务和执行计划，不修改 `env.multi`。
+- `保存并应用` 必须先确认计划，写操作要求设置 `MINERU_OPS_AUTH_TOKEN`，前端使用 `X-MinerU-Ops-Token`；未配置 Token 时读取、校验和预览可用，应用与回滚返回 403。
+- 写入时保留原有注释、空行、未知变量、变量顺序和可选 `export` 前缀；新增白名单变量会附带易懂中文注释。
+- 使用同目录临时文件原子替换 `env.multi`，应用前自动生成 `env.multi.bak-*` 备份。
+- Token、Password、Secret 等敏感项在读取、预览、响应与审计中均脱敏；敏感输入留空表示保留原值。
+- 候选配置先执行类型、枚举、范围和换行校验，再执行 `docker compose ... config --quiet`。
+- 只对受影响的 API/Router 服务执行 `up -d --no-deps --force-recreate`；只修改 `MINERU_OPS_*` 时不会错误重建 API/Router。
+- `mineru-ops` 不自行重建自身。计划和结果会明确提示现场手动重建 Ops，使端口、Token 等 Ops 配置生效。
+- 服务重建失败时恢复原 `env.multi`，并尝试按旧配置恢复相关服务；响应明确标记 `rolled_back`。
+- 配置历史可点击 `回滚到此版本`。Agent 只允许恢复当前 `env.multi` 同目录、符合备份命名规则的文件，避免路径穿越。
+- 无实际变化时按 no-op 处理，不生成备份、不重建服务。
+- `MINERU_VLM_FAILURE_POLICY` 可选值与实际实现保持一致：`fail_fast` / `skip_page`。
+
+### UI8 涉及文件
+
+```text
+docker/multi/mineru-ops-agent.py
+mineru/cli/ops.py
+mineru/ops/static/index.html
+mineru/ops/static/ops.css
+mineru/ops/static/ops.js
+tests/unit/test_ops_agent_config.py
+tests/unit/test_ops_console.py
+handoff.md
+```
+
+### UI8 验证结果
+
+```text
+python -m py_compile docker/multi/mineru-ops-agent.py mineru/cli/ops.py                    # 通过
+node --check mineru/ops/static/ops.js                                                    # 通过
+python -m pytest -o addopts='' tests/unit/test_ops_agent_config.py -q                    # 10 passed
+python -m pytest -o addopts='' tests/unit/test_ops_console.py -q                         # 27 passed
+python -m pytest -o addopts='' tests/unit/test_batch_router_diagnose.py -q               # 11 passed
+git diff --check                                                                          # 通过
+```
+
+共 48 个相关测试通过。
+
+### UI8 现场升级重点
+
+代码镜像固定为：
+
+```text
+mineru-code:v3.4.2-ops-ui8
+```
+
+导出文件固定为：
+
+```text
+/data/maas/sgy_arm/gd-dev/MinerU/docker/base/export/mineru-code-v3.4.2-ops-ui8.tar.gz
+```
+
+现场必须同时更新两部分：
+
+1. 导入 UI8 代码镜像并设置 `MINERU_CODE_IMAGE=mineru-code:v3.4.2-ops-ui8`，让 `mineru-code-sync-multi` 把新代码写入共享 code volume。
+2. 更新部署宿主机上的 `docker/multi/mineru-ops-agent.py`，随后通过 `start-multi.sh` 重建/启动业务服务和 `mineru-ops`。
+
+只更新镜像但未刷新共享 code volume，或只更新 Web 容器但未更新宿主机 Agent，都会导致按钮或应用配置能力不完整。升级后重建 `mineru-ops` 并在浏览器执行 `Ctrl+F5`。
+
 ## 2026-08-21 完成：运维控制台配置中心与性能实验室（第一阶段）
 
 用户已确认实施“配置中心 + 性能实验室 + UI 产品化”。本轮已直接完成第一阶段代码，不再受此前 Spec Workflow `pending` 文案限制。

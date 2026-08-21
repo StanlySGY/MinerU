@@ -29,6 +29,8 @@ const state = {
   configHistory: [],
   configDraft: {},
   configValidationErrors: {},
+  configPlan: null,
+  configApplying: false,
   labSubmitting: false,
   token: sessionStorage.getItem("mineruOpsToken") || "",
 };
@@ -71,6 +73,15 @@ function badge(value) {
   return `<span class="badge ${cls}">${esc(text)}</span>`;
 }
 
+function apiErrorMessage(payload, fallback) {
+  const detail = payload?.detail;
+  if (typeof detail === "string") return detail;
+  if (detail && typeof detail === "object") {
+    return detail.error || detail.message || JSON.stringify(detail);
+  }
+  return payload?.error || payload?.message || fallback;
+}
+
 async function api(path, options = {}) {
   const headers = {...(options.headers || {})};
   if (state.token) headers["X-MinerU-Ops-Token"] = state.token;
@@ -78,7 +89,7 @@ async function api(path, options = {}) {
   const response = await fetch(path, {...options, headers});
   let payload;
   try { payload = await response.json(); } catch { payload = {detail: await response.text()}; }
-  if (!response.ok) throw new Error(payload.detail || `HTTP ${response.status}`);
+  if (!response.ok) throw new Error(apiErrorMessage(payload, `HTTP ${response.status}`));
   return payload;
 }
 
@@ -87,12 +98,9 @@ async function authorizedFetch(path, options = {}) {
   if (state.token) headers["X-MinerU-Ops-Token"] = state.token;
   const response = await fetch(path, {...options, headers});
   if (!response.ok) {
-    let detail = `HTTP ${response.status}`;
-    try {
-      const payload = await response.json();
-      detail = payload.detail || detail;
-    } catch {}
-    throw new Error(detail);
+    let payload = {};
+    try { payload = await response.json(); } catch {}
+    throw new Error(apiErrorMessage(payload, `HTTP ${response.status}`));
   }
   return response;
 }
@@ -1364,24 +1372,50 @@ function configControl(item) {
     } else {
       const type = item.type === "integer" ? "number" : item.type === "secret" ? "password" : "text";
       const bounds = item.type === "integer" ? ` min="${esc(item.minimum ?? "")}" max="${esc(item.maximum ?? "")}" step="1"` : "";
-      const placeholder = item.type === "secret" ? "留空表示不参与校验" : current;
-      const value = item.type === "secret" ? candidate : candidate;
-      control = `<input type="${type}" data-config-key="${key}" value="${esc(value || "")}" placeholder="${esc(placeholder || "")}"${bounds}>`;
+      const placeholder = item.type === "secret" ? "留空表示保留当前敏感值" : current;
+      control = `<input type="${type}" data-config-key="${key}" value="${esc(candidate || "")}" placeholder="${esc(placeholder || "")}"${bounds}>`;
     }
   }
-  return `<div class="config-item${error ? " has-error" : ""}"><div class="config-key">${key}<span>${readonly ? "只读" : "可校验"}</span></div><div class="config-control">${control}</div><p class="config-description">${esc(item.description || "")}</p>${error ? `<p class="config-error">${esc(error)}</p>` : ""}</div>`;
+  return `<div class="config-item${error ? " has-error" : ""}"><div class="config-key">${key}<span>${readonly ? "只读" : "可编辑"}</span></div><div class="config-control">${control}</div><p class="config-description">${esc(item.description || "")}</p>${error ? `<p class="config-error">${esc(error)}</p>` : ""}</div>`;
 }
 
 function renderConfig() {
   const config = state.config || {};
   const items = config.items || [];
-  document.getElementById("config-mode").textContent = config.mode === "read_validate_only" ? "只读与校验" : (config.mode || "-" );
+  const modeText = {safe_apply: "安全应用", read_validate_only: "只读与校验"};
+  document.getElementById("config-mode").textContent = modeText[config.mode] || config.mode || "-";
   document.getElementById("config-agent-status").innerHTML = config.ok === false ? badge("unavailable") : badge("healthy");
   document.getElementById("config-env-file").textContent = config.env_file || "-";
   document.getElementById("config-modified-at").textContent = formatDate(config.modified_at);
   const groups = new Map();
   for (const item of items) groups.set(item.category || "其他配置", [...(groups.get(item.category || "其他配置") || []), item]);
-  document.getElementById("config-groups").innerHTML = [...groups.entries()].map(([category, group]) => `<section class="panel config-group"><div class="section-heading"><h2>${esc(category)}</h2><span>${group.length} 项</span></div>${group.map(configItemValue => configControl(configItemValue)).join("")}</section>`).join("") || `<div class="empty-state">没有可显示的配置。</div>`;
+  document.getElementById("config-groups").innerHTML = [...groups.entries()].map(([category, group]) => `<section class="panel config-group"><div class="section-heading"><h2>${esc(category)}</h2><span>${group.length} 项</span></div>${group.map(item => configControl(item)).join("")}</section>`).join("") || `<div class="empty-state">没有可显示的配置。</div>`;
+}
+
+function configChangeHtml(change) {
+  if (change.sensitive) {
+    return `<div class="config-diff-item"><strong>${esc(change.key)}</strong><div class="config-diff-values"><span class="muted">当前敏感值</span><span class="config-diff-arrow">→</span><span>敏感值已修改</span></div></div>`;
+  }
+  return `<div class="config-diff-item"><strong>${esc(change.key)}</strong><div class="config-diff-values"><code>${esc(change.old_value ?? "(未设置)")}</code><span class="config-diff-arrow">→</span><code>${esc(change.new_value ?? "(未设置)")}</code></div></div>`;
+}
+
+function renderConfigPlan() {
+  const panel = document.getElementById("config-plan-panel");
+  const plan = state.configPlan;
+  if (!plan) {
+    panel.innerHTML = "";
+    panel.classList.add("hidden");
+    return;
+  }
+  const valid = plan.ok && plan.valid !== false && plan.compose_valid !== false;
+  const services = plan.affected_services || [];
+  const errors = plan.errors || {};
+  panel.classList.remove("hidden");
+  panel.innerHTML = `<div class="config-plan-header"><div><span class="config-plan-status ${valid ? "good" : "bad"}">${valid ? "预览通过" : "预览未通过"}</span><h3>${esc(plan.message || plan.error || (valid ? "候选配置可以安全应用。" : "候选配置不可应用。"))}</h3></div><span>${(plan.changes || []).length} 项变更</span></div>
+    ${Object.keys(errors).length ? `<div class="config-plan-errors">${Object.entries(errors).map(([key, value]) => `<p><strong>${esc(key)}</strong>：${esc(value)}</p>`).join("")}</div>` : ""}
+    ${plan.no_changes ? `<div class="empty-state">没有实际变更，不会写入 env，也不会重建服务。</div>` : `<div class="config-diff">${(plan.changes || []).map(configChangeHtml).join("")}</div>`}
+    <div class="config-dialog-meta"><div><span>Compose 校验</span><strong>${plan.compose_valid === false ? "失败" : "通过"}</strong></div><div><span>受影响服务</span><strong>${esc(services.join("、") || "无")}</strong></div><div><span>失败保护</span><strong>自动回滚</strong></div></div>
+    ${plan.requires_ops_restart ? `<p class="config-plan-warning">涉及 mineru-ops 自身配置：业务服务应用后，请现场手工重启 mineru-ops。</p>` : ""}`;
 }
 
 function renderConfigHistory() {
@@ -1390,12 +1424,24 @@ function renderConfigHistory() {
     target.innerHTML = `<div class="empty-state">暂无备份记录</div>`;
     return;
   }
-  target.innerHTML = state.configHistory.map(item => `<div class="config-history-item"><strong>${esc(item.name)}</strong><span>${esc(formatDate(item.created_at))}</span><small>${esc(item.size_bytes || 0)} bytes · 仅查看</small></div>`).join("");
+  target.innerHTML = state.configHistory.map(item => `<div class="config-history-item"><strong>${esc(item.name)}</strong><span>${esc(formatDate(item.created_at))}</span><small>${esc(item.size_bytes || 0)} bytes · 可恢复</small><button type="button" class="secondary-button" data-config-restore="${esc(item.name)}">回滚到此版本</button></div>`).join("");
+}
+
+function setConfigBusy(busy, label = "") {
+  state.configApplying = busy;
+  for (const id of ["config-reload", "config-validate", "config-plan", "config-apply", "config-confirm-apply"]) {
+    const button = document.getElementById(id);
+    if (button) button.disabled = busy;
+  }
+  document.getElementById("config-groups").classList.toggle("loading", busy);
+  if (label) document.getElementById("config-validation-status").textContent = label;
 }
 
 async function loadConfig() {
   state.configDraft = {};
   state.configValidationErrors = {};
+  state.configPlan = null;
+  state.configApplying = false;
   const [schema, config, history] = await Promise.all([
     api("/api/config/schema"),
     api("/api/config"),
@@ -1406,8 +1452,10 @@ async function loadConfig() {
   state.configHistory = history.items || [];
   renderConfig();
   renderConfigHistory();
+  renderConfigPlan();
+  setConfigBusy(false);
   const status = document.getElementById("config-validation-status");
-  status.textContent = "修改输入框后进行校验；不会写入 env 文件。";
+  status.textContent = "修改输入框后先预览变更；确认后才会写入并重建受影响服务。";
   status.classList.remove("bad-text");
 }
 
@@ -1422,7 +1470,7 @@ async function validateConfig() {
     const result = await api("/api/config/validate", {method: "POST", body: JSON.stringify({values: state.configDraft})});
     state.configValidationErrors = result.errors || {};
     renderConfig();
-    status.textContent = result.valid ? "校验通过；本阶段不会写入 env 文件。" : (result.message || "候选配置存在错误。");
+    status.textContent = result.valid ? "候选值校验通过，可继续预览 Compose 变更。" : (result.message || "候选配置存在错误。");
     status.classList.toggle("bad-text", !result.valid);
   } catch (error) {
     status.textContent = `校验失败：${error.message}`;
@@ -1430,23 +1478,130 @@ async function validateConfig() {
   }
 }
 
-document.getElementById("config-reload").addEventListener("click", loadConfig);
-document.getElementById("config-validate").addEventListener("click", validateConfig);
-document.getElementById("config-groups").addEventListener("input", event => {
-  const input = event.target.closest("[data-config-key]");
-  if (!input) return;
+async function planConfig() {
+  if (!Object.keys(state.configDraft).length) {
+    notice("请先修改至少一个候选值");
+    return null;
+  }
+  const status = document.getElementById("config-validation-status");
+  setConfigBusy(true, "正在生成变更预览并校验 Compose...");
+  try {
+    const result = await api("/api/config/plan", {method: "POST", body: JSON.stringify({values: state.configDraft})});
+    state.configPlan = result;
+    state.configValidationErrors = result.errors || {};
+    renderConfig();
+    renderConfigPlan();
+    const valid = result.ok && result.valid !== false && result.compose_valid !== false;
+    status.textContent = result.message || result.error || (valid ? "预览通过。" : "预览失败。");
+    status.classList.toggle("bad-text", !valid);
+    return result;
+  } catch (error) {
+    state.configPlan = {ok: false, error: error.message, changes: [], affected_services: []};
+    renderConfigPlan();
+    status.textContent = `预览失败：${error.message}`;
+    status.classList.add("bad-text");
+    return null;
+  } finally {
+    setConfigBusy(false);
+  }
+}
+
+function configConfirmationHtml(plan) {
+  const changes = plan.changes || [];
+  return `<div class="config-confirm-intro">即将写入 <strong>${changes.length}</strong> 项配置，并选择性重建受影响服务。</div>
+    <div class="config-diff">${changes.map(configChangeHtml).join("")}</div>
+    <div class="config-dialog-meta"><div><span>Compose 校验</span><strong>${plan.compose_valid ? "已通过" : "未通过"}</strong></div><div><span>重建服务</span><strong>${esc((plan.affected_services || []).join("、") || "无")}</strong></div><div><span>失败保护</span><strong>恢复 env + 尝试恢复服务</strong></div></div>
+    ${plan.requires_ops_restart ? `<p class="config-plan-warning">应用完成后还需现场手工重启 mineru-ops，避免当前请求把自己中断。</p>` : ""}`;
+}
+
+async function openConfigApplyDialog() {
+  if (state.configApplying) return;
+  let plan = state.configPlan;
+  if (!plan) plan = await planConfig();
+  if (!plan || !plan.ok || plan.valid === false || plan.compose_valid === false) {
+    notice(plan?.error || plan?.message || "请先修正配置并通过预览");
+    return;
+  }
+  if (plan.no_changes) {
+    notice("候选值与当前配置一致，无需应用。", false);
+    return;
+  }
+  document.getElementById("config-apply-summary").innerHTML = configConfirmationHtml(plan);
+  document.getElementById("config-apply-dialog").showModal();
+}
+
+async function applyConfig() {
+  if (state.configApplying) return;
+  const dialog = document.getElementById("config-apply-dialog");
+  setConfigBusy(true, "正在写入配置并重建受影响服务，请勿关闭页面...");
+  try {
+    const result = await api("/api/config/apply", {method: "POST", body: JSON.stringify({values: state.configDraft})});
+    if (!result.ok) {
+      const prefix = result.rolled_back ? "应用失败，已自动回滚" : "应用失败";
+      throw new Error(`${prefix}：${result.error || result.message || "未知错误"}`);
+    }
+    dialog.close();
+    const restartHint = result.requires_ops_restart ? "；请现场手工重启 mineru-ops" : "";
+    notice(`配置已安全应用${restartHint}`, false);
+    await loadConfig();
+  } catch (error) {
+    document.getElementById("config-validation-status").textContent = error.message;
+    document.getElementById("config-validation-status").classList.add("bad-text");
+    notice(error.message);
+  } finally {
+    setConfigBusy(false);
+  }
+}
+
+async function restoreConfig(name) {
+  if (state.configApplying) return;
+  if (!window.confirm(`确认回滚到 ${name}？系统会校验备份并重建受影响服务。`)) return;
+  setConfigBusy(true, `正在回滚到 ${name}...`);
+  try {
+    const result = await api("/api/config/restore", {method: "POST", body: JSON.stringify({name})});
+    if (!result.ok) {
+      const prefix = result.rolled_back ? "回滚失败，已恢复回滚前配置" : "回滚失败";
+      throw new Error(`${prefix}：${result.error || result.message || "未知错误"}`);
+    }
+    const restartHint = result.requires_ops_restart ? "；请现场手工重启 mineru-ops" : "";
+    notice(`已回滚到 ${name}${restartHint}`, false);
+    await loadConfig();
+  } catch (error) {
+    document.getElementById("config-validation-status").textContent = error.message;
+    document.getElementById("config-validation-status").classList.add("bad-text");
+    notice(error.message);
+  } finally {
+    setConfigBusy(false);
+  }
+}
+
+function markConfigDraft(input) {
   state.configDraft[input.dataset.configKey] = input.value;
   delete state.configValidationErrors[input.dataset.configKey];
-  document.getElementById("config-validation-status").textContent = "已有候选修改，点击“校验候选配置”。";
-  document.getElementById("config-validation-status").classList.remove("bad-text");
-});
+  state.configPlan = null;
+  renderConfigPlan();
+  const status = document.getElementById("config-validation-status");
+  status.textContent = "已有候选修改，请重新预览变更。";
+  status.classList.remove("bad-text");
+}
 
+document.getElementById("config-reload").addEventListener("click", loadConfig);
+document.getElementById("config-validate").addEventListener("click", validateConfig);
+document.getElementById("config-plan").addEventListener("click", planConfig);
+document.getElementById("config-apply").addEventListener("click", openConfigApplyDialog);
+document.getElementById("config-confirm-apply").addEventListener("click", applyConfig);
+document.getElementById("config-cancel-apply").addEventListener("click", () => document.getElementById("config-apply-dialog").close());
+document.getElementById("config-groups").addEventListener("input", event => {
+  const input = event.target.closest("[data-config-key]");
+  if (input) markConfigDraft(input);
+});
 document.getElementById("config-groups").addEventListener("change", event => {
   const input = event.target.closest("[data-config-key]");
-  if (input) {
-    state.configDraft[input.dataset.configKey] = input.value;
-    delete state.configValidationErrors[input.dataset.configKey];
-  }
+  if (input) markConfigDraft(input);
+});
+document.getElementById("config-history").addEventListener("click", event => {
+  const button = event.target.closest("[data-config-restore]");
+  if (button) restoreConfig(button.dataset.configRestore);
 });
 
 async function refreshCurrent() {

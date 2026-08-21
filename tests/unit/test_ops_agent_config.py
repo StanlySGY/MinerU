@@ -113,7 +113,7 @@ def test_config_path_must_remain_inside_project_directory(tmp_path: Path) -> Non
         agent.config_path()
 
 
-def test_config_history_is_read_only_and_limited_to_latest_twenty(tmp_path: Path) -> None:
+def test_config_history_is_restorable_and_limited_to_latest_twenty(tmp_path: Path) -> None:
     env_file = tmp_path / "env.multi"
     env_file.write_text("MINERU_MODEL_SOURCE=local\n", encoding="utf-8")
     for index in range(25):
@@ -124,16 +124,16 @@ def test_config_history_is_read_only_and_limited_to_latest_twenty(tmp_path: Path
     result = agent.config_history()
 
     assert result["ok"] is True
-    assert result["mode"] == "read_only"
+    assert result["mode"] == "safe_apply"
     assert len(result["items"]) == 20
-    assert all(item["restorable"] is False for item in result["items"])
+    assert all(item["restorable"] is True for item in result["items"])
 
 
 def test_config_actions_are_dispatched_by_agent_handle(tmp_path: Path) -> None:
     (tmp_path / "env.multi").write_text("MINERU_MODEL_SOURCE=local\n", encoding="utf-8")
     agent = make_agent(tmp_path)
 
-    assert agent.handle({"action": "config_schema"})["mode"] == "read_validate_only"
+    assert agent.handle({"action": "config_schema"})["mode"] == "safe_apply"
     assert agent.handle({"action": "config_read"})["ok"] is True
     assert agent.handle(
         {
@@ -141,4 +141,94 @@ def test_config_actions_are_dispatched_by_agent_handle(tmp_path: Path) -> None:
             "values": {"MINERU_VLM_PAGE_TIMEOUT_SECONDS": "1200"},
         }
     )["valid"] is True
-    assert agent.handle({"action": "config_history"})["mode"] == "read_only"
+    assert agent.handle({"action": "config_history"})["mode"] == "safe_apply"
+
+
+def test_render_env_file_preserves_comments_order_export_and_adds_descriptions(tmp_path: Path) -> None:
+    env_file = tmp_path / "env.multi"
+    env_file.write_text(
+        "# header\n\nexport MINERU_MODEL_SOURCE=local\nUNKNOWN=value\n",
+        encoding="utf-8",
+    )
+
+    rendered = ops_agent._render_env_file(
+        env_file,
+        {
+            "MINERU_MODEL_SOURCE": "modelscope",
+            "MINERU_VLM_PAGE_TIMEOUT_SECONDS": "1200",
+        },
+    )
+
+    assert rendered.index("# header") < rendered.index("MINERU_MODEL_SOURCE")
+    assert "export MINERU_MODEL_SOURCE=modelscope" in rendered
+    assert "UNKNOWN=value" in rendered
+    assert "单页 VLM 请求的软超时时间" in rendered
+    assert "MINERU_VLM_PAGE_TIMEOUT_SECONDS=1200" in rendered
+
+
+def test_config_plan_validates_compose_without_writing_or_leaking_secret(tmp_path: Path, monkeypatch) -> None:
+    env_file = tmp_path / "env.multi"
+    env_file.write_text(
+        "MINERU_MODEL_SOURCE=local\nMINERU_OPS_AUTH_TOKEN=old-secret\n",
+        encoding="utf-8",
+    )
+    agent = make_agent(tmp_path)
+    calls = []
+
+    def fake_run(command, cwd, timeout=180):
+        calls.append((command, timeout))
+        return {"ok": True, "output": "", "error": None}
+
+    monkeypatch.setattr(ops_agent, "run_command", fake_run)
+    result = agent.config_plan(
+        {
+            "MINERU_MODEL_SOURCE": "local",
+            "MINERU_OPS_AUTH_TOKEN": "new-secret",
+        }
+    )
+
+    assert result["ok"] is True
+    assert result["compose_valid"] is True
+    assert result["changes"] == [{"key": "MINERU_OPS_AUTH_TOKEN", "sensitive": True, "changed": True}]
+    assert "new-secret" not in repr(result)
+    assert env_file.read_text(encoding="utf-8") == "MINERU_MODEL_SOURCE=local\nMINERU_OPS_AUTH_TOKEN=old-secret\n"
+    assert calls and calls[0][0][-2:] == ["config", "--quiet"]
+    assert "--env-file" in calls[0][0]
+
+
+def test_config_apply_recreates_services_and_rolls_back_on_failure(tmp_path: Path, monkeypatch) -> None:
+    env_file = tmp_path / "env.multi"
+    env_file.write_text("MINERU_MODEL_SOURCE=local\n", encoding="utf-8")
+    agent = make_agent(tmp_path)
+    commands = []
+    recreate_results = iter([{"ok": False, "error": "recreate failed"}, {"ok": True, "output": ""}])
+
+    def fake_run(command, cwd, timeout=180):
+        commands.append(command)
+        if "config" in command:
+            return {"ok": True, "output": "", "error": None}
+        return {"ok": True, "output": "", "error": None}
+
+    monkeypatch.setattr(ops_agent, "run_command", fake_run)
+    monkeypatch.setattr(agent, "configured_services", lambda: {"mineru-api-1", "mineru-router", "mineru-ops"})
+    monkeypatch.setattr(agent, "_recreate_services", lambda services: next(recreate_results))
+
+    result = agent.config_apply({"MINERU_VLM_PAGE_TIMEOUT_SECONDS": "1200"})
+
+    assert result["ok"] is False
+    assert result["rolled_back"] is True
+    assert "MINERU_VLM_PAGE_TIMEOUT_SECONDS=600" not in env_file.read_text(encoding="utf-8")
+    assert "MINERU_MODEL_SOURCE=local" in env_file.read_text(encoding="utf-8")
+
+
+def test_ops_only_config_does_not_recreate_api_services(tmp_path: Path, monkeypatch) -> None:
+    env_file = tmp_path / "env.multi"
+    env_file.write_text("MINERU_OPS_PORT=19000\n", encoding="utf-8")
+    agent = make_agent(tmp_path)
+    monkeypatch.setattr(ops_agent, "run_command", lambda *args, **kwargs: {"ok": True, "output": "", "error": None})
+    monkeypatch.setattr(agent, "configured_services", lambda: {"mineru-api-1", "mineru-router", "mineru-ops"})
+
+    services, requires_ops_restart = agent._affected_services(["MINERU_OPS_PORT"])
+
+    assert services == []
+    assert requires_ops_restart is True

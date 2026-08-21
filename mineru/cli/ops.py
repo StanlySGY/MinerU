@@ -828,6 +828,14 @@ class ConfigValidateRequest(BaseModel):
     values: dict[str, str] = Field(default_factory=dict)
 
 
+class ConfigValuesRequest(BaseModel):
+    values: dict[str, str] = Field(default_factory=dict)
+
+
+class ConfigRestoreRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+
+
 class OpsRuntime:
     def __init__(self) -> None:
         self.data_dir = Path(os.getenv("MINERU_OPS_DATA_DIR", DEFAULT_DATA_DIR)).resolve()
@@ -2428,17 +2436,22 @@ def create_app() -> FastAPI:
                 detail="service control is disabled until MINERU_OPS_AUTH_TOKEN is configured",
             )
 
-    async def config_agent_call(action: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def config_agent_call(
+        action: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        timeout: float = 30,
+    ) -> dict[str, Any]:
         request_payload: dict[str, Any] = {"action": action}
         if payload:
             request_payload.update(payload)
-        result = await runtime.agent_call(request_payload, timeout=30)
-        if not result.get("ok") and "valid" not in result:
+        try:
+            return await runtime.agent_call(request_payload, timeout=timeout)
+        except Exception as exc:
             raise HTTPException(
                 status_code=502,
-                detail=result.get("error", "operations agent configuration request failed"),
-            )
-        return result
+                detail=f"operations agent unavailable: {exc}",
+            ) from exc
 
     async def query_service(service: dict[str, Any]) -> dict[str, Any]:
         result = dict(service)
@@ -2501,8 +2514,63 @@ def create_app() -> FastAPI:
 
     @app.post("/api/config/validate")
     async def config_validate_view(payload: ConfigValidateRequest, request: Request):
-        authorize(request, write=True)
+        authorize(request)
         return await config_agent_call("config_validate", {"values": payload.values})
+
+    @app.post("/api/config/plan")
+    async def config_plan_view(payload: ConfigValuesRequest, request: Request):
+        authorize(request)
+        return await config_agent_call(
+            "config_plan",
+            {"values": payload.values},
+            timeout=60,
+        )
+
+    @app.post("/api/config/apply")
+    async def config_apply_view(payload: ConfigValuesRequest, request: Request):
+        authorize(request, write=True)
+        result = await config_agent_call(
+            "config_apply",
+            {"values": payload.values},
+            timeout=300,
+        )
+        runtime.store.audit(
+            "config_apply",
+            ",".join(sorted(payload.values)),
+            bool(result.get("ok")),
+            json.dumps(
+                {
+                    "keys": sorted(payload.values),
+                    "affected_services": result.get("affected_services", []),
+                    "rolled_back": result.get("rolled_back"),
+                },
+                ensure_ascii=False,
+            ),
+        )
+        return result
+
+    @app.post("/api/config/restore")
+    async def config_restore_view(payload: ConfigRestoreRequest, request: Request):
+        authorize(request, write=True)
+        result = await config_agent_call(
+            "config_restore",
+            {"name": payload.name},
+            timeout=300,
+        )
+        runtime.store.audit(
+            "config_restore",
+            payload.name,
+            bool(result.get("ok")),
+            json.dumps(
+                {
+                    "source": payload.name,
+                    "affected_services": result.get("affected_services", []),
+                    "rolled_back": result.get("rolled_back"),
+                },
+                ensure_ascii=False,
+            ),
+        )
+        return result
 
     @app.get("/api/config/history")
     async def config_history_view(request: Request):
@@ -3041,7 +3109,10 @@ def create_app() -> FastAPI:
 
         @app.get("/")
         async def index():
-            return FileResponse(static_dir / "index.html")
+            return FileResponse(
+                static_dir / "index.html",
+                headers={"Cache-Control": "no-store"},
+            )
 
     return app
 

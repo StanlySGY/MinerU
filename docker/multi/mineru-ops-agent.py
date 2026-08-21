@@ -10,6 +10,7 @@ import re
 import shutil
 import socketserver
 import subprocess
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -62,7 +63,7 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
         "category": "VLM 超时与重试",
         "description": "VLM 失败时的处理策略。",
         "type": "enum",
-        "choices": ["skip", "fail", "retry"],
+        "choices": ["fail_fast", "skip_page"],
         "editable": True,
     },
     {
@@ -183,6 +184,77 @@ def _masked_value(key: str, value: str) -> str:
     return "••••••••" if _is_sensitive_config_key(key) and value else value
 
 
+def _quote_env_value(value: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9_./:@+,-]*", value):
+        return value
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`")
+    return f'"{escaped}"'
+
+
+def _render_env_file(path: Path, updates: dict[str, str]) -> str:
+    original = path.read_text(encoding="utf-8")
+    lines = original.splitlines(keepends=True)
+    remaining = dict(updates)
+    rendered: list[str] = []
+    assignment_pattern = re.compile(
+        r"^(?P<indent>\s*)(?P<export>export\s+)?(?P<key>[A-Za-z_][A-Za-z0-9_]*)\s*=.*?(?P<newline>\r?\n)?$"
+    )
+    for raw_line in lines:
+        match = assignment_pattern.match(raw_line)
+        key = match.group("key") if match else None
+        if key not in remaining:
+            rendered.append(raw_line)
+            continue
+        newline = match.group("newline") or ""
+        export_prefix = "export " if match.group("export") else ""
+        rendered.append(
+            f"{match.group('indent')}{export_prefix}{key}={_quote_env_value(remaining.pop(key))}{newline}"
+        )
+    if remaining:
+        if rendered and not rendered[-1].endswith(("\n", "\r")):
+            rendered[-1] += "\n"
+        if rendered and rendered[-1].strip():
+            rendered.append("\n")
+        rendered.append("# 以下配置由 MinerU 运维控制台安全写入；可继续手工维护。\n")
+        for key, value in remaining.items():
+            description = str(CONFIG_SCHEMA_BY_KEY[key].get("description") or key)
+            rendered.append(f"# {description}\n{key}={_quote_env_value(value)}\n")
+    return "".join(rendered)
+
+
+def _write_atomic(path: Path, content: str, mode: int | None = None) -> None:
+    descriptor, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        if mode is not None:
+            os.chmod(temp_path, mode)
+        os.replace(temp_path, path)
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
+    finally:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _redact_text(text: str, secret_values: list[str], limit: int = 4000) -> str:
+    redacted = text
+    for value in sorted((item for item in secret_values if item), key=len, reverse=True):
+        redacted = redacted.replace(value, "••••••••")
+    return redacted[:limit]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--socket", required=True, type=Path)
@@ -269,11 +341,15 @@ class Agent:
         else:
             raise SystemExit("Docker Compose is unavailable")
 
-    def compose_command(self, *arguments: str) -> list[str]:
+    def compose_command(
+        self,
+        *arguments: str,
+        env_file: str | Path | None = None,
+    ) -> list[str]:
         command = list(self.compose_prefix)
         for compose_file in self.compose_files:
             command.extend(["-f", compose_file])
-        command.extend(["--env-file", self.env_file])
+        command.extend(["--env-file", str(env_file or self.env_file)])
         command.extend(arguments)
         return command
 
@@ -303,7 +379,9 @@ class Agent:
             "ok": True,
             "items": CONFIG_SCHEMA,
             "categories": list(dict.fromkeys(item["category"] for item in CONFIG_SCHEMA)),
-            "mode": "read_validate_only",
+            "mode": "safe_apply",
+            "write_requires_auth": True,
+            "rollback_supported": True,
         }
 
     def config_read(self) -> dict[str, Any]:
@@ -369,7 +447,7 @@ class Agent:
             "modified_at": modified_at,
             "items": items,
             "unknown_keys": sorted(unknown_keys),
-            "mode": "read_validate_only",
+            "mode": "safe_apply",
         }
 
     def config_validate(self, values: Any) -> dict[str, Any]:
@@ -414,8 +492,214 @@ class Agent:
             "valid": not errors,
             "errors": errors,
             "values": normalized,
-            "message": "候选配置校验通过；本阶段不会写入 env 文件。" if not errors else "候选配置存在错误。",
+            "message": "候选配置校验通过，可继续预览并安全应用。" if not errors else "候选配置存在错误。",
         }
+
+    def _config_updates(self, values: Any) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+        validation = self.config_validate(values)
+        if not validation.get("valid"):
+            return {}, validation.get("errors", {}), {}
+        updates = dict(validation.get("values", {}))
+        try:
+            current = _parse_env_file(self.config_path())
+        except (OSError, ValueError):
+            current = {}
+        # A blank secret means “leave the existing secret unchanged”, never clear it by accident.
+        for key in list(updates):
+            if _is_sensitive_config_key(key) and updates[key] == "":
+                updates.pop(key)
+        return updates, {}, current
+
+    def _affected_services(self, keys: list[str]) -> tuple[list[str], bool]:
+        requires_ops_restart = any(key.startswith("MINERU_OPS_") for key in keys)
+        api_keys_changed = any(not key.startswith("MINERU_OPS_") for key in keys)
+        if not api_keys_changed:
+            return [], requires_ops_restart
+        services = sorted(
+            service for service in self.configured_services()
+            if service.startswith("mineru-api-") or service == "mineru-router"
+        )
+        return services, requires_ops_restart
+
+    @staticmethod
+    def _build_config_changes(
+        updates: dict[str, str],
+        current: dict[str, str],
+    ) -> list[dict[str, Any]]:
+        changes: list[dict[str, Any]] = []
+        for key, new_value in updates.items():
+            old_value = current.get(key, "")
+            if old_value == new_value:
+                continue
+            if _is_sensitive_config_key(key):
+                changes.append({"key": key, "sensitive": True, "changed": True})
+            else:
+                changes.append({
+                    "key": key,
+                    "sensitive": False,
+                    "old_value": old_value,
+                    "new_value": new_value,
+                })
+        return changes
+
+    def _compose_validate(self, env_file: Path, secret_values: list[str] | None = None) -> dict[str, Any]:
+        result = run_command(
+            self.compose_command("config", "--quiet", env_file=env_file),
+            self.project_dir,
+            timeout=60,
+        )
+        secrets = secret_values or []
+        return {
+            "ok": result.get("ok", False),
+            "error": _redact_text(str(result.get("error") or ""), secrets),
+        }
+
+    def _backup_config(self, path: Path) -> Path:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+        backup = path.parent / f"{path.name}.bak-{stamp}"
+        shutil.copy2(path, backup)
+        return backup
+
+    def _recreate_services(self, services: list[str]) -> dict[str, Any]:
+        if not services:
+            return {"ok": True, "services": [], "output": ""}
+        result = run_command(
+            self.compose_command("up", "-d", "--no-deps", "--force-recreate", *services),
+            self.project_dir,
+            timeout=300,
+        )
+        return {"ok": result.get("ok", False), "services": services, "output": result.get("output", ""), "error": result.get("error")}
+
+    def config_plan(self, values: Any) -> dict[str, Any]:
+        try:
+            path = self.config_path()
+            if not path.is_file():
+                return {"ok": False, "error": f"configured env file does not exist: {path.name}"}
+            updates, errors, current = self._config_updates(values)
+            if errors:
+                return {"ok": False, "valid": False, "errors": errors, "message": "候选配置存在错误。"}
+            changes = self._build_config_changes(updates, current)
+            if not changes:
+                return {
+                    "ok": True,
+                    "valid": True,
+                    "compose_valid": True,
+                    "no_changes": True,
+                    "changes": [],
+                    "affected_services": [],
+                    "requires_ops_restart": False,
+                    "message": "候选值与当前配置一致，无需应用。",
+                }
+            candidate_content = _render_env_file(path, updates)
+            candidate = path.parent / f".{path.name}.plan-{os.getpid()}-{datetime.now(timezone.utc).timestamp():.6f}"
+            secret_values = [
+                value
+                for key in updates
+                if _is_sensitive_config_key(key)
+                for value in (current.get(key, ""), updates.get(key, ""))
+            ]
+            try:
+                candidate.write_text(candidate_content, encoding="utf-8")
+                compose = self._compose_validate(candidate, secret_values)
+            finally:
+                candidate.unlink(missing_ok=True)
+            if not compose["ok"]:
+                return {"ok": False, "valid": True, "compose_valid": False, "error": compose["error"] or "Compose 配置校验失败"}
+            changed_keys = [item["key"] for item in changes]
+            services, requires_ops_restart = self._affected_services(changed_keys)
+            return {
+                "ok": True,
+                "valid": True,
+                "compose_valid": True,
+                "no_changes": False,
+                "changes": changes,
+                "affected_services": services,
+                "requires_ops_restart": requires_ops_restart,
+                "message": "候选配置已通过 Compose 校验，可以安全应用。",
+            }
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def config_apply(self, values: Any) -> dict[str, Any]:
+        try:
+            path = self.config_path()
+            if not path.is_file():
+                return {"ok": False, "error": f"configured env file does not exist: {path.name}"}
+            updates, errors, current = self._config_updates(values)
+            if errors:
+                return {"ok": False, "valid": False, "errors": errors, "message": "候选配置存在错误。"}
+            changes = self._build_config_changes(updates, current)
+            if not changes:
+                return {"ok": True, "applied": False, "no_changes": True, "changes": [], "affected_services": [], "requires_ops_restart": False}
+            candidate_content = _render_env_file(path, updates)
+            candidate = path.parent / f".{path.name}.apply-{os.getpid()}-{datetime.now(timezone.utc).timestamp():.6f}"
+            secret_values = [
+                value
+                for key in updates
+                if _is_sensitive_config_key(key)
+                for value in (current.get(key, ""), updates.get(key, ""))
+            ]
+            try:
+                candidate.write_text(candidate_content, encoding="utf-8")
+                compose = self._compose_validate(candidate, secret_values)
+                if not compose["ok"]:
+                    return {"ok": False, "valid": True, "compose_valid": False, "error": compose["error"] or "Compose 配置校验失败"}
+                backup = self._backup_config(path)
+                _write_atomic(path, candidate_content, path.stat().st_mode & 0o777)
+                changed_keys = [item["key"] for item in changes]
+                services, requires_ops_restart = self._affected_services(changed_keys)
+                recreated = self._recreate_services(services)
+                if not recreated["ok"]:
+                    _write_atomic(path, backup.read_text(encoding="utf-8"), backup.stat().st_mode & 0o777)
+                    self._recreate_services(services)
+                    return {"ok": False, "applied": False, "rolled_back": True, "backup": backup.name, "error": _redact_text(str(recreated.get("error") or "服务重建失败"), secret_values)}
+                return {"ok": True, "applied": True, "no_changes": False, "rolled_back": False, "backup": backup.name, "changes": changes, "affected_services": services, "requires_ops_restart": requires_ops_restart}
+            finally:
+                candidate.unlink(missing_ok=True)
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def config_restore(self, name: str) -> dict[str, Any]:
+        try:
+            path = self.config_path()
+            if Path(name).name != name or not re.fullmatch(
+                re.escape(path.name) + r"\.bak-\d{8}-\d{6}-\d{6}",
+                name,
+            ):
+                return {"ok": False, "error": "invalid configuration backup name"}
+            backup = (path.parent / name).resolve()
+            backup.relative_to(path.parent.resolve())
+            if not backup.is_file():
+                return {"ok": False, "error": "configuration backup does not exist"}
+            current = _parse_env_file(path)
+            target = _parse_env_file(backup)
+            changed_keys = sorted(
+                key for key in set(current) | set(target)
+                if current.get(key) != target.get(key)
+            )
+            if not changed_keys:
+                return {"ok": True, "restored": False, "no_changes": True, "source": name, "affected_services": [], "requires_ops_restart": False}
+            secret_values = [
+                value
+                for key in changed_keys
+                if _is_sensitive_config_key(key)
+                for value in (current.get(key, ""), target.get(key, ""))
+            ]
+            compose = self._compose_validate(backup, secret_values)
+            if not compose["ok"]:
+                return {"ok": False, "compose_valid": False, "error": compose["error"] or "Compose 配置校验失败"}
+            safety_backup = self._backup_config(path)
+            content = backup.read_text(encoding="utf-8")
+            _write_atomic(path, content, safety_backup.stat().st_mode & 0o777)
+            services, requires_ops_restart = self._affected_services(changed_keys)
+            recreated = self._recreate_services(services)
+            if not recreated["ok"]:
+                _write_atomic(path, safety_backup.read_text(encoding="utf-8"), safety_backup.stat().st_mode & 0o777)
+                self._recreate_services(services)
+                return {"ok": False, "restored": False, "rolled_back": True, "backup": safety_backup.name, "error": _redact_text("服务重建失败，已恢复当前配置", secret_values)}
+            return {"ok": True, "restored": True, "no_changes": False, "backup": safety_backup.name, "source": name, "changed_keys": changed_keys, "affected_services": services, "requires_ops_restart": requires_ops_restart}
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
 
     def config_history(self) -> dict[str, Any]:
         try:
@@ -433,10 +717,10 @@ class Agent:
                     "name": candidate.name,
                     "created_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
                     "size_bytes": stat.st_size,
-                    "restorable": False,
+                    "restorable": True,
                 }
             )
-        return {"ok": True, "items": history, "mode": "read_only"}
+        return {"ok": True, "items": history, "mode": "safe_apply"}
 
     def handle(self, request: dict[str, Any]) -> dict[str, Any]:
         action = request.get("action")
@@ -446,6 +730,12 @@ class Agent:
             return self.config_read()
         if action == "config_validate":
             return self.config_validate(request.get("values"))
+        if action == "config_plan":
+            return self.config_plan(request.get("values"))
+        if action == "config_apply":
+            return self.config_apply(request.get("values"))
+        if action == "config_restore":
+            return self.config_restore(str(request.get("name", "")))
         if action == "config_history":
             return self.config_history()
         if action == "services":

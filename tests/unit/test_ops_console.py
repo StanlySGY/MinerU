@@ -735,6 +735,9 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "/api/config" in paths
     assert "/api/config/schema" in paths
     assert "/api/config/validate" in paths
+    assert "/api/config/plan" in paths
+    assert "/api/config/apply" in paths
+    assert "/api/config/restore" in paths
     assert "/api/config/history" in paths
     assert "/api/batch-runs/{run_id}/artifacts/{kind}/{artifact_path:path}" in paths
     assert "/" in paths
@@ -753,6 +756,12 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert 'data-view="config"' in dashboard_html
     assert "性能实验室" in dashboard_html
     assert "配置中心" in dashboard_html
+    assert "UI8" in dashboard_html
+    assert "预览变更" in dashboard_html
+    assert "保存并应用" in dashboard_html
+    assert "config-apply-dialog" in dashboard_html
+    assert "ops.js?v=ui8" in dashboard_html
+    assert "ops.css?v=ui8" in dashboard_html
     assert "log-live" in dashboard_html
     assert "log-follow" in dashboard_html
     assert "markdown-table-wrap" in dashboard_js
@@ -771,8 +780,14 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "导出 CSV" in dashboard_js
     assert "retry-problem-pages" in dashboard_js
     assert "data-problem-pages-retry" in dashboard_js
+    assert "回滚到此版本" in dashboard_js
     assert "task-timing-table" in dashboard_css
     assert "width: calc(100vw - 24px)" in dashboard_css
+
+    index_route = next(route for route in app.routes if route.path == "/")
+    response = asyncio.run(index_route.endpoint())
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
 
 
 @pytest.mark.parametrize(

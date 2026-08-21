@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MinerU 运维控制台</title>
-  <link rel="stylesheet" href="/assets/ops.css">
+  <link rel="stylesheet" href="/assets/ops.css?v=ui8">
 </head>
 <body>
   <div class="shell">
@@ -181,28 +181,31 @@
       <section id="view-config" class="view">
         <section class="feature-hero config-hero">
           <div>
-            <span class="feature-kicker">安全、可解释的现场配置</span>
+            <span class="feature-kicker">安全、可解释的现场配置 <b class="ui8-badge">UI8</b></span>
             <h2>配置中心</h2>
-            <p>从宿主机 Agent 读取当前 env 配置，并在写入之前检查候选值是否符合白名单和范围约束。</p>
+            <p>从宿主机 Agent 读取当前 env 配置，先预览差异，再通过 Compose 校验安全应用；失败会自动回滚。</p>
           </div>
-          <div class="feature-tags"><span>Agent 安全通道</span><span>敏感值脱敏</span><span>只读 + 候选校验</span></div>
+          <div class="feature-tags"><span>安全应用模式</span><span>Compose 校验</span><span>失败自动回滚</span><span>需要管理令牌</span></div>
         </section>
-        <div class="readonly-banner"><strong>当前为只读阶段</strong><span>可以读取配置并校验候选值；保存、应用、重启和回滚将在下一阶段开放。</span></div>
+        <div class="config-safe-banner"><strong>安全应用模式</strong><span>修改会先生成预览并校验，保存后只重建受影响的业务服务；mineru-ops 自身不会自动重建。</span></div>
         <div class="config-summary">
-          <div><span>工作模式</span><strong id="config-mode">只读与校验</strong></div>
+          <div><span>工作模式</span><strong id="config-mode">安全应用</strong></div>
           <div><span>Agent 通道</span><strong id="config-agent-status">读取中</strong></div>
           <div><span>Env 文件</span><strong id="config-env-file">-</strong></div>
           <div><span>修改时间</span><strong id="config-modified-at">-</strong></div>
         </div>
         <div class="toolbar config-toolbar">
           <button id="config-reload" type="button" class="secondary-button">重新读取</button>
-          <button id="config-validate" type="button" class="primary-button">校验候选配置</button>
-          <span id="config-validation-status" class="muted">修改输入框后进行校验；不会写入 env 文件。</span>
+          <button id="config-validate" type="button" class="secondary-button">校验候选配置</button>
+          <button id="config-plan" type="button" class="secondary-button">预览变更</button>
+          <button id="config-apply" type="button" class="primary-button">保存并应用</button>
+          <span id="config-validation-status" class="muted">修改输入框后先预览变更；不会立即写入 env 文件。</span>
         </div>
+        <section id="config-plan-panel" class="config-plan hidden"></section>
         <div class="config-layout">
           <div id="config-groups" class="config-groups"><div class="empty-state">正在读取配置...</div></div>
           <aside class="panel config-history-panel">
-            <div class="section-heading"><h2>配置历史</h2><span class="muted">只读</span></div>
+            <div class="section-heading"><h2>配置历史</h2><span class="muted">可回滚</span></div>
             <div id="config-history" class="config-history"><div class="empty-state">正在读取...</div></div>
           </aside>
         </div>
@@ -284,6 +287,17 @@
       </section>
     </div>
   </dialog>
-  <script src="/assets/ops.js"></script>
+  <dialog id="config-apply-dialog" class="config-apply-dialog">
+    <header class="dialog-header">
+      <div><h2>确认保存并应用</h2><p class="muted">请确认以下变更，系统会先校验 Compose，失败时自动恢复原配置。</p></div>
+      <button id="config-cancel-apply" type="button" class="secondary-button">取消</button>
+    </header>
+    <div id="config-apply-summary" class="config-dialog-summary"></div>
+    <div class="dialog-actions config-dialog-actions">
+      <button id="config-confirm-apply" type="button" class="primary-button">确认应用</button>
+    </div>
+  </dialog>
+
+  <script src="/assets/ops.js?v=ui8"></script>
 </body>
 </html>
