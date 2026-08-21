@@ -46,7 +46,7 @@ const titles = {
 };
 const statusText = {
   pending: "等待中", queued: "等待处理", processing: "处理中", completed: "已完成", failed: "失败",
-  partial_success: "部分成功", running: "运行中", paused: "已暂停", cancelled: "已取消",
+  partial_success: "部分成功", running: "运行中", paused: "已暂停", cancelling: "正在停止", cancelled: "已取消",
   completed_with_failures: "完成（存在失败）", interrupted: "已中断", unhealthy: "异常",
   healthy: "健康", unavailable: "不可用", unknown: "未知", success: "成功", partial: "部分成功",
   client_error: "客户端错误", wait_timeout: "停止等待（后台可能仍在运行）",
@@ -68,7 +68,7 @@ function esc(value) {
 function badge(value) {
   const text = statusText[value] || value || "未知";
   const cls = ["healthy", "completed", "running", "success"].includes(value) ? "good" :
-    ["pending", "processing", "paused", "partial", "partial_success", "completed_with_failures", "wait_timeout", "monitoring_stopped"].includes(value) ? "warn" :
+    ["pending", "processing", "paused", "cancelling", "partial", "partial_success", "completed_with_failures", "wait_timeout", "monitoring_stopped"].includes(value) ? "warn" :
     ["failed", "unhealthy", "unavailable", "cancelled", "interrupted"].includes(value) ? "bad" : "";
   return `<span class="badge ${cls}">${esc(text)}</span>`;
 }
@@ -511,15 +511,31 @@ async function refreshTasksView() {
   }
 }
 
+function batchActions(run) {
+  const runId = esc(run.run_id);
+  if (run.status === "cancelling") {
+    return `<button class="action-button cancel-pending" disabled aria-disabled="true">正在停止…</button>`;
+  }
+  if (run.status === "running") {
+    return `<button class="action-button" data-batch="${runId}" data-batch-action="pause">暂停</button><button class="action-button danger" data-batch="${runId}" data-batch-action="cancel">停止批次脚本</button>`;
+  }
+  if (run.status === "paused") {
+    return `<button class="action-button" data-batch="${runId}" data-batch-action="resume">继续</button><button class="action-button danger" data-batch="${runId}" data-batch-action="cancel">停止批次脚本</button>`;
+  }
+  if (run.status === "pending") {
+    return `<button class="action-button danger" data-batch="${runId}" data-batch-action="cancel">停止批次脚本</button>`;
+  }
+  return `<button class="action-button" data-problem-pages-retry="${runId}">重试异常页</button><button class="action-button" data-batch="${runId}" data-batch-action="retry">重试全部</button><button class="action-button danger" data-batch="${runId}" data-batch-action="delete">删除</button>`;
+}
+
 function compactBatchRows(items, limit = 100) {
   if (!items.length) return `<div class="empty-state">暂无批量测试</div>`;
   return `<table><thead><tr><th>目录</th><th>状态</th><th>PDF</th><th>开始时间</th><th>记录</th><th>操作</th></tr></thead><tbody>${items.slice(0, limit).map(run => {
-    const active = ["pending", "running", "paused", "cancelling"].includes(run.status);
     const previewText = run.input_preview_ready || run.result_preview_ready ? "可预览" : "";
     const retrySource = run.settings?.source_type === "problem_page_retry" && run.settings?.retry_of_run_id
       ? `<div class="muted">异常页重试 · 来源 ${esc(run.settings.retry_of_run_id)}</div>`
       : "";
-    return `<tr><td><strong>${esc(run.settings?.input_path || run.input_path)}</strong>${retrySource}<div class="mono muted">${esc(run.run_id)}</div></td><td>${badge(run.status)}${previewText ? `<div class="muted">${previewText}</div>` : ""}</td><td>${run.settings?.pdf_count || "-"}</td><td>${esc(formatDate(run.started_at || run.created_at))}</td><td><button class="text-button" data-batch-detail="${run.run_id}">查看记录</button></td><td><div class="actions">${active ? `<button class="action-button" data-batch="${run.run_id}" data-batch-action="${run.status === "paused" ? "resume" : "pause"}">${run.status === "paused" ? "继续" : "暂停"}</button><button class="action-button danger" data-batch="${run.run_id}" data-batch-action="cancel">停止批次脚本</button>` : `<button class="action-button" data-problem-pages-retry="${run.run_id}">重试异常页</button><button class="action-button" data-batch="${run.run_id}" data-batch-action="retry">重试全部</button><button class="action-button danger" data-batch="${run.run_id}" data-batch-action="delete">删除</button>`}</div></td></tr>`;
+    return `<tr><td><strong>${esc(run.settings?.input_path || run.input_path)}</strong>${retrySource}<div class="mono muted">${esc(run.run_id)}</div></td><td>${badge(run.status)}${previewText ? `<div class="muted">${previewText}</div>` : ""}</td><td>${run.settings?.pdf_count || "-"}</td><td>${esc(formatDate(run.started_at || run.created_at))}</td><td><button class="text-button" data-batch-detail="${esc(run.run_id)}">查看记录</button></td><td><div class="actions">${batchActions(run)}</div></td></tr>`;
   }).join("")}</tbody></table>`;
 }
 
@@ -721,10 +737,10 @@ async function handleBatchTableClick(event) {
     return;
   }
   const button = event.target.closest("[data-batch-action]");
-  if (!button) return;
+  if (!button || button.disabled) return;
   const action = button.dataset.batchAction;
   const prompt = action === "cancel"
-    ? "确认停止这个批次诊断脚本？这不会取消已经提交到 MinerU Router/API 的后台任务，后台处理可能继续运行。"
+    ? "确认停止这个批次诊断脚本？\n\n这只会停止运维控制台本地的 batch-router-diagnose.py。\n已经提交到 MinerU Router/API 的远程任务不会被取消，可能继续运行。"
     : `确认${button.textContent}该批次？`;
   if (["cancel", "retry", "delete"].includes(action) && !confirm(prompt)) return;
   try {

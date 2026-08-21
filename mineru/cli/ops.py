@@ -46,6 +46,8 @@ TERMINAL_BATCH_STATES = {
     "cancelled",
     "interrupted",
 }
+ACTIVE_BATCH_STATES = {"pending", "running", "paused", "cancelling"}
+BATCH_PROCESS_TERMINATE_TIMEOUT_SECONDS = 5.0
 
 
 def utc_now_iso() -> str:
@@ -861,6 +863,9 @@ class OpsRuntime:
             )
         )
         self.batch_processes: dict[str, asyncio.subprocess.Process] = {}
+        self.batch_tasks: dict[str, asyncio.Task[Any]] = {}
+        self.batch_cancel_requested: set[str] = set()
+        self.batch_action_lock = asyncio.Lock()
         self.batch_task_sync_lock = asyncio.Lock()
         self.task_sync_lock = asyncio.Lock()
         self.task_sync_task: asyncio.Task[Any] | None = None
@@ -927,15 +932,143 @@ class OpsRuntime:
         except asyncio.CancelledError:
             raise
 
+    def _batch_cancellation_requested(self, run_id: str, record: dict[str, Any] | None = None) -> bool:
+        if run_id in self.batch_cancel_requested:
+            return True
+        current = record if record is not None else self.store.get_batch_run(run_id)
+        return str((current or {}).get("status") or "") in {"cancelling", "cancelled"}
+
+    async def _terminate_batch_process(
+        self,
+        run_id: str,
+        process: asyncio.subprocess.Process,
+        *,
+        resume_first: bool = False,
+        timeout: float | None = None,
+    ) -> int | None:
+        if timeout is None:
+            timeout = BATCH_PROCESS_TERMINATE_TIMEOUT_SECONDS
+        if process.returncode is not None:
+            return process.returncode
+        if resume_first:
+            with suppress(ProcessLookupError):
+                process.send_signal(signal.SIGCONT)
+        with suppress(ProcessLookupError):
+            process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            with suppress(ProcessLookupError):
+                process.kill()
+            await process.wait()
+        return process.returncode
+
+    async def _wait_for_batch_task(self, run_id: str, task: asyncio.Task[Any]) -> None:
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=BATCH_PROCESS_TERMINATE_TIMEOUT_SECONDS + 1.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Timed out waiting for batch runner to exit: {}", run_id)
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        except asyncio.CancelledError:
+            pass
+
+    async def cancel_batch(self, run_id: str) -> dict[str, Any]:
+        async with self.batch_action_lock:
+            record = self.store.get_batch_run(run_id)
+            if record is None:
+                raise HTTPException(status_code=404, detail="batch run not found")
+            status = str(record.get("status") or "")
+            if status in TERMINAL_BATCH_STATES:
+                raise HTTPException(status_code=409, detail="batch run is already finished")
+            if status == "cancelling":
+                raise HTTPException(status_code=409, detail="batch run is already stopping")
+            was_paused = status == "paused"
+            self.batch_cancel_requested.add(run_id)
+            self.store.update_batch_run(run_id, status="cancelling")
+            process = self.batch_processes.get(run_id)
+            task = self.batch_tasks.get(run_id)
+        if process is not None and process.returncode is None:
+            await self._terminate_batch_process(
+                run_id,
+                process,
+                resume_first=was_paused,
+            )
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            await self._wait_for_batch_task(run_id, task)
+        current = self.store.get_batch_run(run_id)
+        if current is not None and str(current.get("status") or "") in ACTIVE_BATCH_STATES:
+            self.store.update_batch_run(
+                run_id,
+                status="cancelled",
+                completed_at=utc_now_iso(),
+                exit_code=process.returncode if process is not None else None,
+            )
+        current = self.store.get_batch_run(run_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="batch run not found")
+        return current
+
     async def close(self) -> None:
         if self.task_sync_task is not None:
             self.task_sync_task.cancel()
             with suppress(asyncio.CancelledError):
                 await self.task_sync_task
             self.task_sync_task = None
-        for process in list(self.batch_processes.values()):
-            if process.returncode is None:
-                process.terminate()
+        process_entries: list[tuple[str, asyncio.subprocess.Process, bool]] = []
+        run_ids = set(self.batch_tasks) | set(self.batch_processes)
+        for run_id in run_ids:
+            record = self.store.get_batch_run(run_id) or {}
+            self.batch_cancel_requested.add(run_id)
+            self.store.update_batch_run(run_id, status="cancelling")
+            process = self.batch_processes.get(run_id)
+            if process is not None and process.returncode is None:
+                process_entries.append((run_id, process, record.get("status") == "paused"))
+        await asyncio.gather(
+            *(
+                self._terminate_batch_process(
+                    run_id,
+                    process,
+                    resume_first=was_paused,
+                )
+                for run_id, process, was_paused in process_entries
+            ),
+            return_exceptions=True,
+        )
+        task_entries = [
+            (run_id, task)
+            for run_id, task in self.batch_tasks.items()
+            if not task.done()
+        ]
+        if task_entries:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        *(asyncio.shield(task) for _, task in task_entries),
+                        return_exceptions=True,
+                    ),
+                    timeout=BATCH_PROCESS_TERMINATE_TIMEOUT_SECONDS + 2.0,
+                )
+            except asyncio.TimeoutError:
+                for _, task in task_entries:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(
+                    *(task for _, task in task_entries),
+                    return_exceptions=True,
+                )
+        for run_id in run_ids:
+            current = self.store.get_batch_run(run_id)
+            if current is not None and str(current.get("status") or "") in ACTIVE_BATCH_STATES:
+                self.store.update_batch_run(
+                    run_id,
+                    status="cancelled",
+                    completed_at=utc_now_iso(),
+                )
         await self.http_client.aclose()
 
     def compose_config(self) -> dict[str, Any]:
@@ -2145,7 +2278,7 @@ class OpsRuntime:
             raw_dir,
             log_path,
         )
-        asyncio.create_task(
+        task = asyncio.create_task(
             self._run_batch_process(
                 run_id,
                 effective_input_path,
@@ -2157,6 +2290,7 @@ class OpsRuntime:
             ),
             name=f"mineru-ops-batch-{run_id}",
         )
+        self.batch_tasks[run_id] = task
         return record
 
     @staticmethod
@@ -2314,14 +2448,27 @@ class OpsRuntime:
             command.append("--recursive")
         if request.server_url:
             command.extend(["--server-url", request.server_url])
-        self.store.update_batch_run(run_id, status="running", started_at=utc_now_iso())
+        process: asyncio.subprocess.Process | None = None
+        current_task = asyncio.current_task()
         try:
+            current = self.store.get_batch_run(run_id)
+            if self._batch_cancellation_requested(run_id, current):
+                self.store.update_batch_run(
+                    run_id,
+                    status="cancelled",
+                    completed_at=utc_now_iso(),
+                )
+                return
+
+            self.store.update_batch_run(run_id, status="running", started_at=utc_now_iso())
             process = await asyncio.create_subprocess_exec(
                 *command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
             self.batch_processes[run_id] = process
+            if self._batch_cancellation_requested(run_id):
+                await self._terminate_batch_process(run_id, process)
             with log_path.open("a", encoding="utf-8") as log_file:
                 if process.stdout is not None:
                     while True:
@@ -2331,9 +2478,13 @@ class OpsRuntime:
                         log_file.write(line.decode("utf-8", errors="replace"))
                         log_file.flush()
             exit_code = await process.wait()
-            await self._collect_batch_diagnostics(report_path.parent, report_path)
             current = self.store.get_batch_run(run_id) or {}
-            if current.get("status") == "cancelling":
+            cancelled = self._batch_cancellation_requested(run_id, current)
+            if not cancelled:
+                await self._collect_batch_diagnostics(report_path.parent, report_path)
+                current = self.store.get_batch_run(run_id) or {}
+                cancelled = self._batch_cancellation_requested(run_id, current)
+            if cancelled:
                 status = "cancelled"
             elif exit_code == 0:
                 status = "completed"
@@ -2347,15 +2498,37 @@ class OpsRuntime:
                 completed_at=utc_now_iso(),
                 exit_code=exit_code,
             )
-        except Exception as exc:
+        except asyncio.CancelledError:
+            if process is not None and process.returncode is None:
+                with suppress(Exception):
+                    await self._terminate_batch_process(run_id, process)
             self.store.update_batch_run(
                 run_id,
-                status="failed",
+                status="cancelled",
                 completed_at=utc_now_iso(),
-                error=str(exc),
             )
+            raise
+        except Exception as exc:
+            current = self.store.get_batch_run(run_id) or {}
+            if self._batch_cancellation_requested(run_id, current):
+                self.store.update_batch_run(
+                    run_id,
+                    status="cancelled",
+                    completed_at=utc_now_iso(),
+                    error=str(exc),
+                )
+            else:
+                self.store.update_batch_run(
+                    run_id,
+                    status="failed",
+                    completed_at=utc_now_iso(),
+                    error=str(exc),
+                )
         finally:
             self.batch_processes.pop(run_id, None)
+            self.batch_cancel_requested.discard(run_id)
+            if self.batch_tasks.get(run_id) is current_task:
+                self.batch_tasks.pop(run_id, None)
 
     async def _collect_batch_diagnostics(self, run_dir: Path, report_path: Path) -> None:
         diagnostics = await self.agent_call(
@@ -2987,8 +3160,7 @@ def create_app() -> FastAPI:
         record = runtime.store.get_batch_run(run_id)
         if record is None:
             raise HTTPException(status_code=404, detail="batch run not found")
-        process = runtime.batch_processes.get(run_id)
-        if process is not None and process.returncode is None:
+        if str(record.get("status") or "") in ACTIVE_BATCH_STATES:
             raise HTTPException(
                 status_code=409,
                 detail="wait for the source batch run to stop before retrying problem pages",
@@ -3014,23 +3186,38 @@ def create_app() -> FastAPI:
         record = runtime.store.get_batch_run(run_id)
         if record is None:
             raise HTTPException(status_code=404, detail="batch run not found")
-        process = runtime.batch_processes.get(run_id)
         if action == "cancel":
-            if process is None or process.returncode is not None:
-                raise HTTPException(status_code=409, detail="batch run is not active")
-            runtime.store.update_batch_run(run_id, status="cancelling")
-            process.terminate()
-        elif action == "pause":
-            if process is None or process.returncode is not None:
-                raise HTTPException(status_code=409, detail="batch run is not active")
-            process.send_signal(signal.SIGSTOP)
-            runtime.store.update_batch_run(run_id, status="paused")
-        elif action == "resume":
-            if process is None or process.returncode is not None:
-                raise HTTPException(status_code=409, detail="batch run is not active")
-            process.send_signal(signal.SIGCONT)
-            runtime.store.update_batch_run(run_id, status="running")
+            result = await runtime.cancel_batch(run_id)
+            runtime.store.audit("batch_cancel", run_id, True)
+            return result
+        if action in {"pause", "resume"}:
+            async with runtime.batch_action_lock:
+                record = runtime.store.get_batch_run(run_id)
+                if record is None:
+                    raise HTTPException(status_code=404, detail="batch run not found")
+                status = str(record.get("status") or "")
+                process = runtime.batch_processes.get(run_id)
+                if run_id in runtime.batch_cancel_requested or status == "cancelling":
+                    raise HTTPException(status_code=409, detail="batch run is stopping")
+                if process is None or process.returncode is not None:
+                    raise HTTPException(status_code=409, detail="batch process is not active")
+                if action == "pause":
+                    if status != "running":
+                        raise HTTPException(status_code=409, detail="batch run is not running")
+                    process.send_signal(signal.SIGSTOP)
+                    runtime.store.update_batch_run(run_id, status="paused")
+                else:
+                    if status != "paused":
+                        raise HTTPException(status_code=409, detail="batch run is not paused")
+                    process.send_signal(signal.SIGCONT)
+                    runtime.store.update_batch_run(run_id, status="running")
         elif action == "retry":
+            status = str(record.get("status") or "")
+            if status in ACTIVE_BATCH_STATES:
+                raise HTTPException(
+                    status_code=409,
+                    detail="wait for the active batch run to stop before retrying it",
+                )
             settings = dict(record["settings"])
             source_type = str(settings.pop("source_type", "server_directory"))
             settings.pop("pdf_count", None)
@@ -3054,7 +3241,11 @@ def create_app() -> FastAPI:
             retry_payload = BatchRunRequest(**settings)
             return await runtime.start_batch(retry_payload)
         elif action == "delete":
-            if process is not None and process.returncode is None:
+            status = str(record.get("status") or "")
+            process = runtime.batch_processes.get(run_id)
+            if status in ACTIVE_BATCH_STATES or runtime.batch_tasks.get(run_id) is not None or (
+                process is not None and process.returncode is None
+            ):
                 raise HTTPException(status_code=409, detail="cancel the active batch run before deleting it")
             run_dir = runtime.run_dir_for_record(record)
             shutil.rmtree(run_dir)

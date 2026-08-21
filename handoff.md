@@ -1,5 +1,66 @@
 # Session handoff — 2026-08-20
 
+## 2026-08-21 完成：UI9 批量测试可靠停止
+
+本轮完成运维控制台批量测试的可靠停止机制，目标是避免点击停止后页面状态与本地批量脚本实际状态不一致，也避免暂停中的脚本无法被终止。
+
+### 停止行为
+
+- 支持停止 `pending`、`running`、`paused` 批次。
+- 新增 `cancelling` 过渡状态；进入停止流程后，前端显示“正在停止…”并禁用重复停止。
+- 停止期间禁止暂停、继续、重试全部、重试异常页和删除，避免并发操作破坏批次记录。
+- `paused` 批次停止前先发送 `SIGCONT`，再发送 `terminate()`，确保被 `SIGSTOP` 挂起的子进程能够收到终止信号。
+- `terminate()` 默认等待 `5 秒`；超时后执行 `kill()`，避免批次脚本或其子进程卡死导致控制台一直等待。
+- 运维控制台 runner 在取消后不会再把状态覆盖成 `completed`、`completed_with_failures` 或其他成功状态。
+- 关闭 OpsRuntime 时也会停止活动批次，并对暂停中的批次执行恢复、终止和必要的强制杀死。
+
+### 重要边界
+
+这里停止的是运维控制台本地启动的：
+
+```text
+batch-router-diagnose.py
+```
+
+它不会取消已经提交到 MinerU Router/API 的远程任务。当前 MinerU 的远程任务取消能力不完整，因此点击“停止批次脚本”后，已经发给 Router/API 的任务仍可能继续运行；重新上传或重试前应确认现场资源状态。
+
+批量测试里的页面 soft timeout 与停止机制是两件事：
+
+- `page_timeout_seconds` / `MINERU_VLM_PAGE_TIMEOUT_SECONDS` 只控制单页请求等待上限；
+- `MINERU_VLM_CLIENT_HTTP_TIMEOUT`、API `--http-timeout`、网关和外部调用方 timeout 属于另一层 hard timeout；
+- 配置中心修改后必须重建受影响的 API/Router 容器，后续新请求才会读取新配置；正在运行的请求不会动态继承新值。
+
+### UI9 资源与版本
+
+- 首页显示 `UI9`。
+- 静态资源使用 `ops.js?v=ui9`、`ops.css?v=ui9`，并保留首页 `Cache-Control: no-store`；现场升级后建议浏览器执行 `Ctrl+F5`。
+- 目标代码镜像：`mineru-code:v3.4.2-ops-ui9`。
+- 目标导出文件：`/data/maas/sgy_arm/gd-dev/MinerU/docker/base/export/mineru-code-v3.4.2-ops-ui9.tar.gz`。
+- 若现场仍未同步 UI8 Agent，配置中心的“保存并应用/回滚”能力还需要同步宿主机上的 `docker/multi/mineru-ops-agent.py`；UI9 本轮只改批量停止相关控制台代码。
+
+### 本轮涉及文件
+
+```text
+mineru/cli/ops.py
+mineru/ops/static/ops.js
+mineru/ops/static/index.html
+mineru/ops/static/ops.css
+tests/unit/test_ops_console.py
+handoff.md
+```
+
+### 验证结果
+
+```text
+python -m pytest -o addopts='' tests/unit/test_ops_console.py -q  # 35 passed
+python -m pytest -o addopts='' tests/unit/test_ops_console.py tests/unit/test_task_progress.py tests/unit/test_api_request.py tests/unit/test_vlm_resilience.py tests/unit/test_batch_router_diagnose.py -q  # 68 passed
+node --check mineru/ops/static/ops.js                       # 通过
+python -m py_compile mineru/cli/ops.py                      # 通过
+git diff --check                                           # 通过
+```
+
+新增/覆盖的停止测试包括：pending 停止、running 终止、paused 先 SIGCONT、terminate 超时后 kill、runner 不覆盖 cancelled、重复停止返回 409、关闭 Runtime 时停止 paused 批次，以及活动状态禁止异常页重试。
+
 ## 2026-08-21 完成：外部 Router/API 继承配置中心 VLM 超时设置
 
 修复了外部系统直接调用 MinerU Router 或 API 时，未传超时参数便固定使用 `600 秒 / 1 次重试`、无法继承运维控制台配置中心设置的问题。

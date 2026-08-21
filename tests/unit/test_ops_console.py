@@ -1,5 +1,6 @@
 import asyncio
 import json
+import signal
 import struct
 import zipfile
 from pathlib import Path
@@ -10,6 +11,7 @@ import pytest
 import yaml
 from fastapi import HTTPException, UploadFile
 
+from mineru.cli import ops as ops_module
 from mineru.cli.ops import (
     BatchRunRequest,
     OpsRuntime,
@@ -19,6 +21,65 @@ from mineru.cli.ops import (
     build_smoke_test_pdf,
     create_app,
 )
+
+
+class FakeBatchProcess:
+    def __init__(self, *, wait_timeout: bool = False):
+        self.returncode = None
+        self.signals = []
+        self.events = []
+        self.terminate_calls = 0
+        self.kill_calls = 0
+        self.wait_timeout = wait_timeout
+        self.stdout = None
+        self._exit_event = asyncio.Event()
+
+    def send_signal(self, sig):
+        self.signals.append(sig)
+        self.events.append(("signal", sig))
+
+    def terminate(self):
+        self.terminate_calls += 1
+        self.events.append(("terminate", None))
+        if not self.wait_timeout:
+            self.returncode = -15
+            self._exit_event.set()
+
+    def kill(self):
+        self.kill_calls += 1
+        self.events.append(("kill", None))
+        self.returncode = -9
+        self._exit_event.set()
+
+    async def wait(self):
+        if self.returncode is None:
+            await self._exit_event.wait()
+        return self.returncode
+
+
+def _create_batch_record(
+    runtime: OpsRuntime,
+    tmp_path: Path,
+    run_id: str,
+    status: str,
+) -> dict:
+    run_dir = runtime.report_dir / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    runtime.store.create_batch_run(
+        run_id,
+        tmp_path,
+        {
+            "input_path": ".",
+            "pdf_count": 1,
+        },
+        run_dir / "BATCH_DIAGNOSIS.md",
+        run_dir / "raw",
+        run_dir / "batch.log",
+    )
+    runtime.store.update_batch_run(run_id, status=status)
+    record = runtime.store.get_batch_run(run_id)
+    assert record is not None
+    return record
 
 
 def test_ops_store_persists_task_snapshots(tmp_path: Path):
@@ -462,16 +523,173 @@ def test_problem_pages_archive_exports_original_page_numbers(
     asyncio.run(runtime.close())
 
 
-def test_retry_problem_pages_requires_terminal_source_batch(
+def test_cancel_pending_batch_marks_it_cancelled(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
+    runtime = OpsRuntime()
+    _create_batch_record(runtime, tmp_path, "pending-run", "pending")
+
+    result = asyncio.run(runtime.cancel_batch("pending-run"))
+
+    assert result["status"] == "cancelled"
+    assert result["completed_at"] is not None
+    assert "pending-run" in runtime.batch_cancel_requested
+    asyncio.run(runtime.close())
+
+
+def test_cancel_running_batch_terminates_process(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
+    runtime = OpsRuntime()
+    _create_batch_record(runtime, tmp_path, "running-run", "running")
+    process = FakeBatchProcess()
+    runtime.batch_processes["running-run"] = process
+
+    result = asyncio.run(runtime.cancel_batch("running-run"))
+
+    assert result["status"] == "cancelled"
+    assert result["exit_code"] == -15
+    assert process.terminate_calls == 1
+    assert process.kill_calls == 0
+    runtime.batch_processes.pop("running-run")
+    asyncio.run(runtime.close())
+
+
+def test_cancel_paused_batch_resumes_before_terminate(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
+    runtime = OpsRuntime()
+    _create_batch_record(runtime, tmp_path, "paused-run", "paused")
+    process = FakeBatchProcess()
+    runtime.batch_processes["paused-run"] = process
+
+    result = asyncio.run(runtime.cancel_batch("paused-run"))
+
+    assert result["status"] == "cancelled"
+    assert process.events[:2] == [
+        ("signal", signal.SIGCONT),
+        ("terminate", None),
+    ]
+    runtime.batch_processes.pop("paused-run")
+    asyncio.run(runtime.close())
+
+
+def test_terminate_batch_process_kills_after_timeout(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
+    runtime = OpsRuntime()
+    process = FakeBatchProcess(wait_timeout=True)
+
+    returncode = asyncio.run(
+        runtime._terminate_batch_process(
+            "timeout-run",
+            process,
+            timeout=0.01,
+        )
+    )
+
+    assert returncode == -9
+    assert process.events == [
+        ("terminate", None),
+        ("kill", None),
+    ]
+    asyncio.run(runtime.close())
+
+
+def test_batch_runner_does_not_overwrite_cancelled_status(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
     runtime = OpsRuntime()
+    _create_batch_record(runtime, tmp_path, "runner-cancelled", "pending")
+    run_dir = runtime.report_dir / "runner-cancelled"
+    process = FakeBatchProcess()
+    process.returncode = 0
+    diagnostics_collected = False
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        runtime.batch_cancel_requested.add("runner-cancelled")
+        return process
+
+    async def fake_collect_batch_diagnostics(*args, **kwargs):
+        nonlocal diagnostics_collected
+        diagnostics_collected = True
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(runtime, "_collect_batch_diagnostics", fake_collect_batch_diagnostics)
+
+    asyncio.run(
+        runtime._run_batch_process(
+            "runner-cancelled",
+            tmp_path,
+            BatchRunRequest(),
+            run_dir / "BATCH_DIAGNOSIS.md",
+            run_dir / "raw",
+            run_dir / "results",
+            run_dir / "batch.log",
+        )
+    )
+
+    result = runtime.store.get_batch_run("runner-cancelled")
+    assert result is not None
+    assert result["status"] == "cancelled"
+    assert result["exit_code"] == 0
+    assert diagnostics_collected is False
+    asyncio.run(runtime.close())
+
+
+def test_cancel_batch_rejects_duplicate_stopping_request(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
+    runtime = OpsRuntime()
+    _create_batch_record(runtime, tmp_path, "stopping-run", "cancelling")
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(runtime.cancel_batch("stopping-run"))
+
+    assert exc_info.value.status_code == 409
+    assert "already stopping" in str(exc_info.value.detail)
+    asyncio.run(runtime.close())
+
+
+def test_close_terminates_paused_batch_and_kills_after_timeout(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
+    monkeypatch.setattr(ops_module, "BATCH_PROCESS_TERMINATE_TIMEOUT_SECONDS", 0.01)
+    runtime = OpsRuntime()
+    _create_batch_record(runtime, tmp_path, "close-run", "paused")
+    process = FakeBatchProcess(wait_timeout=True)
+    runtime.batch_processes["close-run"] = process
+
+    asyncio.run(runtime.close())
+
+    result = runtime.store.get_batch_run("close-run")
+    assert result is not None
+    assert result["status"] == "cancelled"
+    assert process.events == [
+        ("signal", signal.SIGCONT),
+        ("terminate", None),
+        ("kill", None),
+    ]
+
+
+@pytest.mark.parametrize("source_status", ["running", "cancelling"])
+def test_retry_problem_pages_requires_terminal_source_batch(
+    tmp_path: Path,
+    monkeypatch,
+    source_status: str,
+) -> None:
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
+    runtime = OpsRuntime()
     source_record = {
-        "run_id": "running-source",
-        "status": "running",
+        "run_id": "active-source",
+        "status": source_status,
         "settings": {},
     }
 
@@ -756,12 +974,12 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert 'data-view="config"' in dashboard_html
     assert "性能实验室" in dashboard_html
     assert "配置中心" in dashboard_html
-    assert "UI8" in dashboard_html
+    assert "UI9" in dashboard_html
     assert "预览变更" in dashboard_html
     assert "保存并应用" in dashboard_html
     assert "config-apply-dialog" in dashboard_html
-    assert "ops.js?v=ui8" in dashboard_html
-    assert "ops.css?v=ui8" in dashboard_html
+    assert "ops.js?v=ui9" in dashboard_html
+    assert "ops.css?v=ui9" in dashboard_html
     assert "log-live" in dashboard_html
     assert "log-follow" in dashboard_html
     assert "markdown-table-wrap" in dashboard_js
@@ -780,8 +998,14 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "导出 CSV" in dashboard_js
     assert "retry-problem-pages" in dashboard_js
     assert "data-problem-pages-retry" in dashboard_js
+    assert 'cancelling: "正在停止"' in dashboard_js
+    assert "cancel-pending" in dashboard_js
+    assert "button.disabled" in dashboard_js
+    assert "batch-router-diagnose.py" in dashboard_js
+    assert "远程任务不会被取消" in dashboard_js
     assert "回滚到此版本" in dashboard_js
     assert "task-timing-table" in dashboard_css
+    assert "action-button.cancel-pending" in dashboard_css
     assert "width: calc(100vw - 24px)" in dashboard_css
 
     index_route = next(route for route in app.routes if route.path == "/")
