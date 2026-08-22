@@ -1309,6 +1309,15 @@ function labRunSettings(run) {
   return run.settings || run.config || {};
 }
 
+function labRunMetrics(run) {
+  return run.metrics || {};
+}
+
+function labMetric(value, digits = 1) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toFixed(digits) : "-";
+}
+
 function labRunElapsed(run) {
   return formatElapsed(
     run.started_at || run.created_at,
@@ -1316,23 +1325,95 @@ function labRunElapsed(run) {
   );
 }
 
+function labGroupKey(run) {
+  const settings = labRunSettings(run);
+  return JSON.stringify([
+    settings.input_path || run.input_path || "",
+    settings.backend || "",
+    settings.page_timeout_seconds ?? "",
+    settings.page_connect_max_retries ?? "",
+    settings.task_timeout ?? "",
+    settings.server_url || "",
+    settings.recursive !== false,
+  ]);
+}
+
+function labIsStable(run) {
+  const metrics = labRunMetrics(run);
+  return Boolean(
+    metrics.complete
+    && Number(metrics.total_pages) > 0
+    && Number(metrics.successful_pages) > 0
+    && Number(metrics.failed_pages || 0) === 0
+  );
+}
+
+function labBaseline(run, runs) {
+  const metrics = labRunMetrics(run);
+  if (!labIsStable(run)) return null;
+  const candidates = runs.filter(item => {
+    const settings = labRunSettings(item);
+    const itemMetrics = labRunMetrics(item);
+    return labGroupKey(item) === labGroupKey(run)
+      && Number(settings.vlm_batch_size) === 1
+      && labIsStable(item)
+      && Number(itemMetrics.total_pages) === Number(metrics.total_pages);
+  });
+  return candidates.sort((a, b) => String(b.completed_at || b.created_at).localeCompare(String(a.completed_at || a.created_at)))[0] || null;
+}
+
 function renderLabRuns() {
   const status = document.getElementById("lab-status");
   const table = document.getElementById("lab-table");
-  status.textContent = `${state.batches.length} 条实验记录`;
-  if (!state.batches.length) {
+  const summary = document.getElementById("lab-summary");
+  const recommendation = document.getElementById("lab-recommendation");
+  const runs = state.batches;
+  status.textContent = `${runs.length} 条性能实验记录`;
+  if (!runs.length) {
+    summary.innerHTML = "";
+    recommendation.innerHTML = "";
     table.innerHTML = `<div class="empty-state">还没有性能实验。填写服务器目录后开始第一组基线测试。</div>`;
     return;
   }
-  table.innerHTML = `<table><thead><tr><th>测试目录</th><th>micro-batch</th><th>单页超时</th><th>连接重试</th><th>等待上限</th><th>状态</th><th>创建时间</th><th>耗时</th><th>记录</th></tr></thead><tbody>${state.batches.map(run => {
+
+  const completeRuns = runs.filter(run => labRunMetrics(run).complete);
+  const latestRun = runs[0];
+  const latestGroupKey = labGroupKey(latestRun);
+  const comparisonRuns = runs.filter(run => labGroupKey(run) === latestGroupKey);
+  const stableRuns = comparisonRuns.filter(labIsStable);
+  const baselineRuns = stableRuns.filter(run => Number(labRunSettings(run).vlm_batch_size) === 1);
+  const latestBaseline = baselineRuns.sort((a, b) => String(b.completed_at || b.created_at).localeCompare(String(a.completed_at || a.created_at)))[0] || null;
+  const comparableRuns = latestBaseline
+    ? stableRuns.filter(run => Number(labRunMetrics(run).total_pages) === Number(labRunMetrics(latestBaseline).total_pages))
+    : [];
+  const recommended = [...comparableRuns].sort((a, b) => Number(labRunMetrics(b).pages_per_minute || 0) - Number(labRunMetrics(a).pages_per_minute || 0))[0] || null;
+  summary.innerHTML = `<div class="lab-metric"><span>实验批次</span><strong>${runs.length}</strong></div><div class="lab-metric"><span>已完成</span><strong>${completeRuns.length}</strong></div><div class="lab-metric"><span>当前对照组</span><strong>${comparisonRuns.length}</strong></div><div class="lab-metric"><span>可比结果</span><strong>${comparableRuns.length}</strong></div>`;
+  recommendation.className = `lab-recommendation${recommended ? " good" : ""}`;
+  recommendation.innerHTML = recommended
+    ? `当前测试条件稳定推荐：<strong>micro-batch ${esc(labRunSettings(recommended).vlm_batch_size ?? "-")}</strong> · ${labMetric(labRunMetrics(recommended).pages_per_minute)} 页/分钟 · 相对基线 ${labMetric(Number(labRunMetrics(latestBaseline).elapsed_seconds) / Number(labRunMetrics(recommended).elapsed_seconds), 2)}×（目录 ${esc(labRunSettings(recommended).input_path || recommended.input_path || "-")}）`
+    : `当前测试条件暂不推荐：请先对目录 ${esc(labRunSettings(latestRun).input_path || latestRun.input_path || "-")} 完成 batch=1 基线，并确保候选批次页数一致且没有异常页。`;
+
+  table.innerHTML = `<table><thead><tr><th>测试目录</th><th>micro-batch</th><th>总页数</th><th>成功/异常</th><th>吞吐量</th><th>等效页耗时</th><th>相对 batch=1</th><th>状态/耗时</th><th>记录</th></tr></thead><tbody>${runs.map(run => {
     const settings = labRunSettings(run);
-    return `<tr><td><strong>${esc(settings.input_path || run.input_path || "-")}</strong><div class="mono muted">${esc(run.run_id || "")}</div></td><td>${esc(settings.vlm_batch_size ?? "-")} 页</td><td>${esc(settings.page_timeout_seconds ?? "-")} 秒</td><td>${esc(settings.page_connect_max_retries ?? "-")}</td><td>${esc(settings.task_timeout ?? "-")} 秒</td><td>${badge(run.status)}${run.failed_pages ? `<div class="bad-text">失败页 ${esc(run.failed_pages)}</div>` : ""}</td><td>${esc(formatDate(run.created_at || run.started_at))}</td><td class="mono">${esc(labRunElapsed(run))}</td><td><button class="text-button" data-batch-detail="${esc(run.run_id)}">查看记录</button></td></tr>`;
+    const metrics = labRunMetrics(run);
+    const baseline = labBaseline(run, runs);
+    const baselineElapsed = Number(labRunMetrics(baseline || {}).elapsed_seconds);
+    const runElapsed = Number(metrics.elapsed_seconds);
+    const speedup = baseline && baselineElapsed > 0 && runElapsed > 0 ? baselineElapsed / runElapsed : null;
+    const stable = labIsStable(run);
+    let speedText = "运行中";
+    if (metrics.complete && !stable) speedText = "不可比较";
+    else if (stable && Number(settings.vlm_batch_size) === 1) speedText = "1.00× 基线";
+    else if (speedup != null) speedText = `${labMetric(speedup, 2)}×`;
+    else if (metrics.complete) speedText = "待补 batch=1 基线";
+    const isRecommended = recommended && run.run_id === recommended.run_id;
+    return `<tr class="${isRecommended ? "lab-recommended-row" : ""}"><td><strong>${esc(settings.input_path || run.input_path || "-")}</strong><div class="mono muted">${esc(run.run_id || "")}</div></td><td>${esc(settings.vlm_batch_size ?? "-")} 页</td><td class="lab-table-number">${esc(metrics.total_pages ?? "-")}</td><td>${esc(metrics.successful_pages ?? 0)} / <span class="${metrics.failed_pages ? "lab-failure" : ""}">${esc(metrics.failed_pages ?? 0)}</span></td><td class="lab-table-number">${labMetric(metrics.pages_per_minute)} 页/分</td><td class="lab-table-number">${labMetric(metrics.average_page_seconds)} 秒</td><td class="lab-speedup ${speedup == null ? "pending" : ""}">${esc(speedText)}</td><td>${badge(run.status)}<div class="mono muted">${esc(labRunElapsed(run))}</div>${metrics.pending_pages ? `<div class="muted">待处理 ${esc(metrics.pending_pages)} 页</div>` : ""}</td><td><button class="text-button" data-batch-detail="${esc(run.run_id)}">查看记录</button></td></tr>`;
   }).join("")}</tbody></table>`;
 }
 
 async function loadLab() {
   const data = await api("/api/batch-runs");
-  state.batches = data.items || [];
+  state.batches = (data.items || []).filter(run => labRunSettings(run).experiment_type === "performance_lab");
   renderLabRuns();
 }
 
@@ -1354,6 +1435,7 @@ async function startLabExperiment(event) {
     page_timeout_seconds: Number(form.get("page_timeout_seconds")),
     page_connect_max_retries: Number(form.get("page_connect_max_retries")),
     vlm_batch_size: Number(form.get("vlm_batch_size")),
+    experiment_type: "performance_lab",
     server_url: String(form.get("server_url") || "").trim() || null,
     recursive: form.get("recursive") === "on",
     effort: "medium",

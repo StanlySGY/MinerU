@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MinerU 运维控制台</title>
-  <link rel="stylesheet" href="/assets/ops.css?v=ui10">
+  <link rel="stylesheet" href="/assets/ops.css?v=ui11">
 </head>
 <body>
   <div class="shell">
@@ -124,7 +124,7 @@
             <label><span>控制台等待上限（秒）</span><input name="task_timeout" type="number" value="7200" min="60"><small>达到上限只停止诊断脚本等待，不会取消 MinerU 后台任务</small></label>
             <label><span>VLM 单次请求超时（秒）</span><input name="page_timeout_seconds" type="number" value="600" min="1" max="7200" step="1"><small>用于测试异常页真实处理时长；底层 HTTP 硬超时必须不小于此值</small></label>
             <label><span>连接错误重试次数</span><input name="page_connect_max_retries" type="number" value="0" min="0" max="3"><small>耗时基准测试建议保持 0</small></label>
-            <label><span>VLM micro-batch 页数</span><input name="vlm_batch_size" type="number" value="1" min="1" max="16"><small>可尝试 2 或 4；批处理失败时会自动逐页隔离</small></label>
+            <label><span>VLM micro-batch 页数</span><input name="vlm_batch_size" type="number" value="1" min="1" max="32"><small>可尝试 2 或 4；批处理失败时会自动逐页隔离</small></label>
             <label class="server-url"><span>VLM Server URL</span><input name="server_url" placeholder="可选，例如 http://10.0.0.8:30000"></label>
             <label class="check-label"><input name="recursive" type="checkbox" checked><span>包含子目录</span></label>
             <button id="batch-submit" type="submit" class="primary-button">开始测试</button>
@@ -141,7 +141,7 @@
             <h2>性能实验室</h2>
             <p>用相同 PDF 对比不同 VLM micro-batch、单页超时和连接重试策略，快速找出现场设备的吞吐甜点。</p>
           </div>
-          <div class="feature-tags"><span>1 / 2 / 4 / 8 / 16 页</span><span>失败自动逐页隔离</span><span>复用批量任务报告</span></div>
+          <div class="feature-tags"><span>1 / 2 / 4 / 8 / 16 / 32 页</span><span>失败自动逐页隔离</span><span>复用批量任务报告</span></div>
         </section>
         <div class="lab-layout">
           <section class="panel lab-form-panel">
@@ -158,6 +158,7 @@
                   <label class="lab-option"><input type="radio" name="vlm_batch_size" value="4"><span>4</span></label>
                   <label class="lab-option"><input type="radio" name="vlm_batch_size" value="8"><span>8</span></label>
                   <label class="lab-option"><input type="radio" name="vlm_batch_size" value="16"><span>16</span></label>
+                  <label class="lab-option"><input type="radio" name="vlm_batch_size" value="32"><span>32</span></label>
                 </div>
                 <small>这是一次 VLM 请求处理的页数，不是 Router 同时处理的任务数；整批失败或返回页数异常时会自动回退逐页隔离。</small>
               </fieldset>
@@ -171,17 +172,19 @@
           </section>
           <aside class="panel lab-guide">
             <div class="section-heading"><h2>推荐测试顺序</h2></div>
-            <ol><li><strong>基线</strong><span>micro-batch 1，重试 0。</span></li><li><strong>提高吞吐</strong><span>依次测试 2、4、8。</span></li><li><strong>观察拐点</strong><span>比较总耗时、失败页和单页请求耗时。</span></li><li><strong>谨慎测试 16</strong><span>确认显存、上下文和队列没有成为瓶颈。</span></li></ol>
+            <ol><li><strong>基线</strong><span>micro-batch 1，重试 0。</span></li><li><strong>提高吞吐</strong><span>依次测试 2、4、8。</span></li><li><strong>观察拐点</strong><span>比较总耗时、失败页和单页请求耗时。</span></li><li><strong>谨慎测试 16</strong><span>确认显存、上下文和队列没有成为瓶颈。</span></li><li><strong>压力档位</strong><span>16 / 32 仅用于压力测试，可能增加显存占用、耗时和失败概率。</span></li></ol>
           </aside>
         </div>
         <div class="section-heading"><h2>最近实验</h2><span id="lab-status" class="muted">读取中</span></div>
+        <div id="lab-summary" class="lab-metric-grid"></div>
+        <div id="lab-recommendation" class="lab-recommendation"></div>
         <div id="lab-table" class="table-wrap panel"></div>
       </section>
 
       <section id="view-config" class="view">
         <section class="feature-hero config-hero">
           <div>
-            <span class="feature-kicker">安全、可解释的现场配置 <b class="ui8-badge">UI10</b></span>
+            <span class="feature-kicker">安全、可解释的现场配置 <b class="ui8-badge">UI11</b></span>
             <h2>配置中心</h2>
             <p>从宿主机 Agent 读取当前 env 配置，先预览差异，再通过 Compose 校验安全应用；失败会自动回滚。</p>
           </div>
@@ -256,7 +259,7 @@
       <label><span>VLM 单次请求超时（秒）</span><input name="page_timeout_seconds" type="number" value="1200" min="1" max="7200" step="1" required><small>例如原来 600 秒超时，可改成 1200 秒继续测试；不能超过底层 HTTP 硬超时。</small></label>
       <label><span>控制台等待上限（秒）</span><input name="task_timeout" type="number" value="7200" min="60" max="86400" step="1" required><small>提交时会自动保证至少比单页超时多 60 秒；达到上限不会取消 MinerU 后台任务。</small></label>
       <label><span>连接错误重试次数</span><input name="page_connect_max_retries" type="number" value="0" min="0" max="3" step="1" required><small>测量这一页真实处理时间时建议保持 0，避免重试耗时干扰结果。</small></label>
-      <label><span>VLM micro-batch 页数</span><input name="vlm_batch_size" type="number" value="1" min="1" max="16" step="1" required><small>异常页专项测试建议保持 1，以便准确观察每一页耗时。</small></label>
+      <label><span>VLM micro-batch 页数</span><input name="vlm_batch_size" type="number" value="1" min="1" max="32" step="1" required><small>异常页专项测试建议保持 1，以便准确观察每一页耗时。</small></label>
       <div class="retry-dialog-actions">
         <button id="cancel-problem-pages-retry" type="button" class="secondary-button">取消</button>
         <button id="submit-problem-pages-retry" type="submit" class="primary-button">截取并开始重试</button>
@@ -298,6 +301,6 @@
     </div>
   </dialog>
 
-  <script src="/assets/ops.js?v=ui10"></script>
+  <script src="/assets/ops.js?v=ui11"></script>
 </body>
 </html>

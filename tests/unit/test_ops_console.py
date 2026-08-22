@@ -930,6 +930,61 @@ def test_ops_runtime_discovers_compose_roles_and_external_vlm(tmp_path: Path, mo
     asyncio.run(runtime.close())
 
 
+def test_batch_run_request_supports_performance_lab_and_batch_32() -> None:
+    assert BatchRunRequest().experiment_type == "batch_test"
+    payload = BatchRunRequest(experiment_type="performance_lab", vlm_batch_size=32)
+    assert payload.experiment_type == "performance_lab"
+    assert payload.vlm_batch_size == 32
+    with pytest.raises(ValueError):
+        BatchRunRequest(vlm_batch_size=33)
+
+
+def test_batch_run_metrics_counts_pages_and_throughput(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
+    runtime = OpsRuntime()
+    run_dir = runtime.report_dir / "metrics-run"
+    results_dir = run_dir / "results" / "0001-sample"
+    results_dir.mkdir(parents=True)
+    preview = {
+        "file_name": "sample.pdf",
+        "progress": {
+            "files": [{
+                "file_name": "sample.pdf",
+                "pages": [
+                    {"page_number": 1, "status": "completed"},
+                    {"page_number": 2, "status": "completed"},
+                    {"page_number": 3, "status": "completed"},
+                    {"page_number": 4, "status": "skipped"},
+                ],
+            }]
+        },
+    }
+    (results_dir / "preview.json").write_text(json.dumps(preview), encoding="utf-8")
+    record = runtime.store.create_batch_run(
+        "metrics-run", run_dir / "input", {"experiment_type": "performance_lab"},
+        run_dir / "BATCH_DIAGNOSIS.md", run_dir / "raw", run_dir / "batch.log",
+    )
+    runtime.store.update_batch_run(
+        "metrics-run", status="completed_with_failures",
+        started_at="2026-08-22T00:00:00+00:00",
+        completed_at="2026-08-22T00:02:00+00:00",
+    )
+    record = runtime.store.get_batch_run("metrics-run")
+    assert record is not None
+    metrics = runtime.batch_run_metrics(record)
+    assert metrics["total_pages"] == 4
+    assert metrics["successful_pages"] == 3
+    assert metrics["failed_pages"] == 1
+    assert metrics["processed_pages"] == 4
+    assert metrics["elapsed_seconds"] == 120.0
+    assert metrics["pages_per_minute"] == 2.0
+    assert metrics["successful_pages_per_minute"] == 1.5
+    assert metrics["average_page_seconds"] == 30.0
+    assert metrics["complete"] is True
+    asyncio.run(runtime.close())
+
+
 def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
@@ -973,13 +1028,16 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert 'data-view="lab"' in dashboard_html
     assert 'data-view="config"' in dashboard_html
     assert "性能实验室" in dashboard_html
+    assert "吞吐量" in dashboard_html or "吞吐量" in dashboard_js
+    assert "experiment_type" in dashboard_js
+    assert "32" in dashboard_html
     assert "配置中心" in dashboard_html
-    assert "UI10" in dashboard_html
+    assert "UI11" in dashboard_html
     assert "预览变更" in dashboard_html
     assert "保存并应用" in dashboard_html
     assert "config-apply-dialog" in dashboard_html
-    assert "ops.js?v=ui10" in dashboard_html
-    assert "ops.css?v=ui10" in dashboard_html
+    assert "ops.js?v=ui11" in dashboard_html
+    assert "ops.css?v=ui11" in dashboard_html
     assert "log-live" in dashboard_html
     assert "log-follow" in dashboard_html
     assert "markdown-table-wrap" in dashboard_js

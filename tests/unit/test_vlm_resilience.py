@@ -313,6 +313,27 @@ async def test_micro_batch_failure_falls_back_to_isolated_pages():
 
 
 @pytest.mark.asyncio
+async def test_micro_batch_supports_32_pages_and_preserves_order():
+    class Predictor:
+        def __init__(self):
+            self.calls = []
+
+        async def aio_batch_two_step_extract(self, images, image_analysis):
+            self.calls.append(list(images))
+            return [{"page": image} for image in images]
+
+    images = [f"page-{index}" for index in range(33)]
+    predictor = Predictor()
+    results, failures = await resilience.aio_extract_pages_with_failure_isolation(
+        predictor, images, page_start_index=0, image_analysis=False,
+        task_id=None, source_file_name=None, batch_size=32,
+    )
+    assert [len(call) for call in predictor.calls] == [32, 1]
+    assert [item["page"] for item in results] == images
+    assert failures == []
+
+
+@pytest.mark.asyncio
 async def test_global_page_concurrency_is_enforced(monkeypatch):
     monkeypatch.setenv("MINERU_VLM_GLOBAL_PAGE_CONCURRENCY", "2")
     resilience._vlm_page_semaphores.clear()

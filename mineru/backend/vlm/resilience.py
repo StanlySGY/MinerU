@@ -170,7 +170,7 @@ async def aio_extract_pages_with_failure_isolation(
         if connect_max_retries is None
         else min(3, max(0, int(connect_max_retries)))
     )
-    effective_batch_size = min(16, max(1, int(batch_size)))
+    effective_batch_size = min(32, max(1, int(batch_size)))
     task_progress_registry.queue_pages(
         task_id,
         source_file_name,

@@ -1,5 +1,53 @@
 # Session handoff — 2026-08-22
 
+## 2026-08-22 完成：UI11 性能实验室与 micro-batch 32
+
+本轮继续增强性能实验室，目标是让现场可以用同一批 PDF 对比不同 VLM micro-batch 的吞吐、平均页耗时、异常页和 batch=1 基线，并避免把普通批量测试混入实验历史。
+
+### 已完成
+
+- `vlm_batch_size` 已贯通 API 校验、VLM resilience、诊断脚本和运维控制台，允许范围从 `1-32`，默认仍为 `1`。
+- 新增 `experiment_type`：普通批量测试为 `batch_test`，性能实验为 `performance_lab`；性能实验历史单独过滤。
+- 批次 API 增加 `metrics`：总页数、成功页、异常页、待处理页、已处理页、总耗时、页/分钟、成功页/分钟、平均页耗时和是否完整结束。
+- 性能实验表格增加吞吐量、平均页耗时、相对 batch=1 基线和稳定配置推荐；完整结束且无异常页的结果才可推荐，快速失败或有异常页不作为稳定推荐。
+- 性能实验 UI 增加 32 档和压力测试提示；16/32 可能增加显存/NPU 内存、耗时和失败概率，建议先测 1、2、4、8。
+
+### 修改文件
+
+```text
+mineru/cli/ops.py
+mineru/cli/api_request.py
+mineru/backend/vlm/resilience.py
+docker/multi/batch-router-diagnose.py
+docker/multi/env.multi.example
+mineru/ops/static/index.html
+mineru/ops/static/ops.js
+mineru/ops/static/ops.css
+tests/unit/test_ops_console.py
+tests/unit/test_vlm_resilience.py
+tests/unit/test_api_request.py
+tests/unit/test_batch_router_diagnose.py
+handoff.md
+```
+
+### 现场镜像
+
+```text
+mineru-code:v3.4.2-ops-ui11
+/data/maas/sgy_arm/gd-dev/MinerU/docker/base/export/mineru-code-v3.4.2-ops-ui11.tar.gz
+```
+
+现场拉取 `dev` 后构建并导出；如果使用共享 `/app` code volume，仍需按现场既有流程刷新或重建 code volume，并重建 `mineru-ops`、Router/API 等相关服务。浏览器升级后执行 `Ctrl+F5`，确认静态资源为 `ops.js?v=ui11`、`ops.css?v=ui11`。
+
+### 当前验证
+
+```text
+node --check mineru/ops/static/ops.js
+python -m py_compile mineru/cli/ops.py mineru/cli/api_request.py mineru/backend/vlm/resilience.py docker/multi/batch-router-diagnose.py
+python -m pytest -o addopts='' tests/unit/test_ops_console.py tests/unit/test_task_progress.py tests/unit/test_api_request.py tests/unit/test_vlm_resilience.py tests/unit/test_batch_router_diagnose.py -q
+git diff --check
+```
+
 ## 2026-08-22 完成：UI10 服务状态与界面易用性优化
 
 本轮继续增强运维控制台的现场可读性和响应式体验，重点解决服务状态容易混淆、配置长值难以查看以及批量详情在不同屏幕尺寸下使用不舒适的问题。

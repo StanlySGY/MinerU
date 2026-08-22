@@ -1269,7 +1269,7 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         task_timeout=max(1.0, args.task_timeout),
         page_timeout_seconds=min(7200.0, max(1.0, args.page_timeout_seconds)),
         page_connect_max_retries=min(3, max(0, args.page_connect_max_retries)),
-        vlm_batch_size=min(16, max(1, args.vlm_batch_size)),
+        vlm_batch_size=min(32, max(1, args.vlm_batch_size)),
         pause_seconds=max(0.0, args.pause_seconds),
         submit_retries=max(0, args.submit_retries),
         curl_bin=args.curl_bin,

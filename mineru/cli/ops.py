@@ -23,7 +23,7 @@ import zlib
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Literal
 
 import click
 import httpx
@@ -815,15 +815,16 @@ class BatchRunRequest(BaseModel):
     task_timeout: int = Field(default=7200, ge=60, le=86400)
     page_timeout_seconds: float = Field(default=600.0, ge=1, le=7200)
     page_connect_max_retries: int = Field(default=0, ge=0, le=3)
-    vlm_batch_size: int = Field(default=1, ge=1, le=16)
+    vlm_batch_size: int = Field(default=1, ge=1, le=32)
     pause_seconds: float = Field(default=2.0, ge=0, le=300)
+    experiment_type: Literal["batch_test", "performance_lab"] = "batch_test"
 
 
 class ProblemPagesRetryRequest(BaseModel):
     task_timeout: int = Field(default=7200, ge=60, le=86400)
     page_timeout_seconds: float = Field(default=1200.0, ge=1, le=7200)
     page_connect_max_retries: int = Field(default=0, ge=0, le=3)
-    vlm_batch_size: int = Field(default=1, ge=1, le=16)
+    vlm_batch_size: int = Field(default=1, ge=1, le=32)
 
 
 class ConfigValidateRequest(BaseModel):
@@ -1732,6 +1733,104 @@ class OpsRuntime:
                     "pages": pages,
                 }
             ],
+        }
+
+    def batch_run_metrics(
+        self,
+        record: dict[str, Any],
+        artifacts: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Return comparable page-level throughput metrics for a batch run."""
+        artifacts = artifacts if artifacts is not None else self.batch_artifacts(record)
+        total_pages = 0
+        successful_pages = 0
+        failed_pages = 0
+        pending_pages = 0
+        saw_real_progress = False
+
+        for preview in artifacts.get("previews") or []:
+            progress = preview.get("progress") if isinstance(preview, dict) else None
+            files = progress.get("files") if isinstance(progress, dict) else None
+            if not isinstance(files, list) or not files:
+                fallback = self._fallback_batch_progress(record, preview, artifacts)
+                files = fallback.get("files") or []
+            else:
+                saw_real_progress = True
+            for file_state in files:
+                if not isinstance(file_state, dict):
+                    continue
+                pages = file_state.get("pages") or []
+                if isinstance(pages, list) and pages:
+                    page_count = len(pages)
+                    total_pages += page_count
+                    for page in pages:
+                        if not isinstance(page, dict):
+                            pending_pages += 1
+                            continue
+                        status = str(page.get("status") or "unknown")
+                        if status == "completed":
+                            successful_pages += 1
+                        elif status in {"failed", "skipped"}:
+                            failed_pages += 1
+                        else:
+                            pending_pages += 1
+                else:
+                    try:
+                        total_pages += max(0, int(file_state.get("total_pages") or 0))
+                    except (TypeError, ValueError):
+                        pass
+
+        if total_pages == 0:
+            for original in artifacts.get("originals") or []:
+                try:
+                    path = self.resolve_artifact(
+                        record,
+                        str(original.get("kind") or "input"),
+                        str(original["path"]),
+                    )
+                    total_pages += self.pdf_page_count(path)
+                except Exception:
+                    continue
+
+        processed_pages = successful_pages + failed_pages
+        if total_pages and not saw_real_progress:
+            pending_pages = max(pending_pages, total_pages - processed_pages)
+        else:
+            pending_pages = max(0, total_pages - processed_pages)
+
+        def parse_time(value: Any) -> datetime | None:
+            if not value:
+                return None
+            try:
+                parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+        started = parse_time(record.get("started_at") or record.get("created_at"))
+        completed = parse_time(record.get("completed_at"))
+        if started is not None:
+            end = completed or datetime.now(timezone.utc)
+            elapsed_seconds = max(0.0, (end - started).total_seconds())
+        else:
+            elapsed_seconds = 0.0
+        processed_for_rate = processed_pages if processed_pages > 0 else 0
+        pages_per_minute = (processed_for_rate / elapsed_seconds * 60) if elapsed_seconds > 0 else 0.0
+        successful_pages_per_minute = (successful_pages / elapsed_seconds * 60) if elapsed_seconds > 0 else 0.0
+        average_page_seconds = (elapsed_seconds / processed_for_rate) if processed_for_rate else 0.0
+        status = str(record.get("status") or "")
+        complete = status in TERMINAL_BATCH_STATES and pending_pages == 0
+        return {
+            "total_pages": total_pages,
+            "successful_pages": successful_pages,
+            "failed_pages": failed_pages,
+            "pending_pages": pending_pages,
+            "processed_pages": processed_pages,
+            "elapsed_seconds": round(elapsed_seconds, 3),
+            "pages_per_minute": round(pages_per_minute, 3),
+            "successful_pages_per_minute": round(successful_pages_per_minute, 3),
+            "average_page_seconds": round(average_page_seconds, 3),
+            "complete": complete,
         }
 
     def collect_batch_task_snapshots(self) -> list[dict[str, Any]]:
@@ -3065,8 +3164,11 @@ def create_app() -> FastAPI:
     @app.get("/api/batch-runs")
     async def batch_runs(request: Request):
         authorize(request)
+        items = runtime.store.list_batch_runs()
+        for item in items:
+            item["metrics"] = runtime.batch_run_metrics(item)
         return {
-            "items": runtime.store.list_batch_runs(),
+            "items": items,
             "storage": runtime.artifact_storage_status(),
         }
 
@@ -3133,7 +3235,9 @@ def create_app() -> FastAPI:
         result = runtime.store.get_batch_run(run_id)
         if result is None:
             raise HTTPException(status_code=404, detail="batch run not found")
-        result["artifacts"] = runtime.batch_artifacts(result)
+        artifacts = runtime.batch_artifacts(result)
+        result["artifacts"] = artifacts
+        result["metrics"] = runtime.batch_run_metrics(result, artifacts)
         return result
 
     @app.get("/api/batch-runs/{run_id}/artifacts/{kind}/{artifact_path:path}")

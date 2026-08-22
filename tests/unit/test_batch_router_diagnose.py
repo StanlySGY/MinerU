@@ -110,6 +110,24 @@ def test_format_page_seconds_handles_missing_and_invalid_values() -> None:
     assert MODULE.format_page_seconds(12.345) == "12.35"
 
 
+@pytest.mark.parametrize(("requested", "expected"), [(32, 32), (33, 32)])
+def test_build_config_caps_vlm_batch_size_at_32(
+    tmp_path: Path,
+    monkeypatch,
+    requested: int,
+    expected: int,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["batch-router-diagnose.py", str(tmp_path), "--vlm-batch-size", str(requested)],
+    )
+
+    config = MODULE.build_config(MODULE.parse_args())
+
+    assert config.vlm_batch_size == expected
+
+
 def _run_config(tmp_path: Path):
     return MODULE.RunConfig(
         input_dir=tmp_path,

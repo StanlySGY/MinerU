@@ -287,7 +287,7 @@ async def parse_request_form(
     ] = None,
     vlm_batch_size: Annotated[
         int,
-        Form(description="Pages per VLM micro-batch (1-16)"),
+        Form(description="Pages per VLM micro-batch (1-32)"),
     ] = 1,
 ) -> ParseRequestOptions:
     """解析 API/Router 共用的 multipart 表单，并保持 Swagger 参数同源。"""
@@ -314,8 +314,8 @@ async def parse_request_form(
         page_timeout_seconds,
         page_connect_max_retries,
     )
-    if not 1 <= vlm_batch_size <= 16:
-        raise HTTPException(status_code=400, detail="vlm_batch_size must be between 1 and 16")
+    if not 1 <= vlm_batch_size <= 32:
+        raise HTTPException(status_code=400, detail="vlm_batch_size must be between 1 and 32")
 
     effective_return_original_file = return_original_file and response_format_zip
     return ParseRequestOptions(

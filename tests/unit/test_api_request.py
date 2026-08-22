@@ -1,10 +1,14 @@
+import asyncio
+from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile
+from starlette.requests import Request
 
 from mineru.cli.api_request import (
     apply_effective_vlm_request_controls,
+    parse_request_form,
     resolve_vlm_request_controls,
 )
 
@@ -90,3 +94,48 @@ def test_router_preserves_explicit_vlm_control_fields():
         ("page_timeout_seconds", "30"),
         ("page_connect_max_retries", "0"),
     ]
+
+
+def _request_for_parse_form() -> Request:
+    app = FastAPI()
+    app.state.public_bind_exposed = False
+    app.state.allow_public_http_client = False
+    return Request(
+        {
+            "type": "http",
+            "app": app,
+            "method": "POST",
+            "scheme": "http",
+            "path": "/tasks",
+            "raw_path": b"/tasks",
+            "query_string": b"",
+            "headers": [],
+            "client": ("test", 1234),
+            "server": ("test", 80),
+        }
+    )
+
+
+def _parse_request_form_with_batch_size(batch_size: int):
+    return asyncio.run(
+        parse_request_form(
+            _request_for_parse_form(),
+            [UploadFile(filename="sample.pdf", file=BytesIO(b"%PDF-test"))],
+            backend="pipeline",
+            vlm_batch_size=batch_size,
+        )
+    )
+
+
+def test_parse_request_form_accepts_vlm_batch_size_32():
+    options = _parse_request_form_with_batch_size(32)
+
+    assert options.vlm_batch_size == 32
+
+
+def test_parse_request_form_rejects_vlm_batch_size_above_32():
+    with pytest.raises(HTTPException) as exc_info:
+        _parse_request_form_with_batch_size(33)
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "vlm_batch_size must be between 1 and 32"
