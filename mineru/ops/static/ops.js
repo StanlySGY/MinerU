@@ -243,11 +243,16 @@ async function loadOverview() {
 }
 
 function serviceCard(service) {
-  const runtimeState = service.runtime?.state || "unknown";
-  const cls = service.health === "healthy" ? "good" : service.health === "unavailable" ? "bad" : "warn";
+  const runtimeState = String(service.runtime?.state || "unknown").toLowerCase();
+  const runtimeHealth = String(service.runtime?.health || "unknown").toLowerCase();
+  const cls = service.health === "healthy" ? "good" : ["unhealthy", "unavailable"].includes(service.health) ? "bad" : "warn";
+  const runtimeHealthClass = runtimeHealth === "healthy" ? "good" : runtimeHealth === "starting" ? "warn" : runtimeHealth === "unhealthy" ? "bad" : "";
+  const runtimeText = {running: "运行中", restarting: "重启中", paused: "已暂停", exited: "已退出", dead: "已停止", created: "已创建", unknown: "未知"}[runtimeState] || runtimeState;
+  const runtimeHealthText = {healthy: "健康", unhealthy: "异常", starting: "启动中", none: "无探活", unknown: "未知"}[runtimeHealth] || runtimeHealth;
   const windowSize = service.health_payload?.processing_window_size;
-  const workload = windowSize ? ` · 窗口 ${windowSize} · 处理中 ${service.health_payload?.processing_tasks || 0}` : "";
-  return `<article class="service-card ${cls}"><div class="service-card-head"><div><h3>${esc(service.name)}</h3><span class="muted">${esc(String(service.role).toUpperCase())}</span></div>${badge(service.health)}</div><p>容器：${esc(runtimeState)}${esc(workload)}</p><p>${esc(service.endpoint || service.health_error || "无检测端点")}</p></article>`;
+  const workload = windowSize ? `窗口 ${windowSize} · 处理中 ${service.health_payload?.processing_tasks || 0}` : "";
+  const httpDetail = service.health_status_code ? `HTTP ${service.health_status_code}` : service.health_error || "未配置端点";
+  return `<article class="service-card ${cls}"><div class="service-card-head"><div><h3>${esc(service.name)}</h3><span class="muted">${esc(String(service.role).toUpperCase())}</span></div>${badge(service.health)}</div><div class="service-card-metrics"><div><small>容器状态</small><strong>${esc(runtimeText)}</strong><span class="runtime-health ${runtimeHealthClass}">Docker 健康：${esc(runtimeHealthText)}</span></div><div><small>HTTP 探活</small><strong>${esc(httpDetail)}</strong><span class="muted">${esc(service.endpoint || "无检测端点")}</span></div></div>${workload ? `<p class="service-workload">${esc(workload)}</p>` : ""}</article>`;
 }
 
 async function loadServices() {
@@ -260,7 +265,12 @@ function renderServicesTable() {
   const services = state.services.filter(item => state.serviceFilter === "all" || item.role === state.serviceFilter);
   document.getElementById("services-table").innerHTML = `<table><thead><tr><th>服务</th><th>角色</th><th>容器</th><th>健康</th><th>镜像/端点</th><th>操作</th></tr></thead><tbody>${services.map(service => {
     const actions = service.control_enabled ? ["check", "start", "stop", "restart"] : ["check"];
-    return `<tr><td><strong>${esc(service.name)}</strong></td><td>${esc(service.role)}</td><td>${esc(service.runtime?.state || "unknown")}</td><td>${badge(service.health)}${service.health_message ? `<div class="muted">${esc(service.health_message)}</div>` : ""}</td><td><div class="mono">${esc(service.image || service.endpoint || "-")}</div></td><td><div class="actions">${actions.map(action => `<button class="action-button ${action === "stop" ? "danger" : ""}" data-service="${esc(service.name)}" data-action="${action}">${{check:"检查",start:"启动",stop:"停止",restart:"重启"}[action]}</button>`).join("")}</div></td></tr>`;
+    const runtimeState = String(service.runtime?.state || "unknown").toLowerCase();
+    const runtimeHealth = String(service.runtime?.health || "unknown").toLowerCase();
+    const runtimeLabel = {running: "运行中", restarting: "重启中", paused: "已暂停", exited: "已退出", dead: "已停止", created: "已创建", unknown: "未知"}[runtimeState] || runtimeState;
+    const runtimeHealthLabel = {healthy: "健康", unhealthy: "异常", starting: "启动中", none: "无探活", unknown: "未知"}[runtimeHealth] || runtimeHealth;
+    const endpointDetail = service.health_status_code ? `HTTP ${service.health_status_code}` : service.health_error || "-";
+    return `<tr><td><strong>${esc(service.name)}</strong></td><td>${esc(service.role)}</td><td><strong>${esc(runtimeLabel)}</strong><div class="muted">Docker 健康：${esc(runtimeHealthLabel)}</div></td><td>${badge(service.health)}<div class="muted">${esc(endpointDetail)}</div>${service.health_message ? `<div class="muted">${esc(service.health_message)}</div>` : ""}</td><td><div class="mono service-endpoint">${esc(service.image || service.endpoint || "-")}</div></td><td><div class="actions">${actions.map(action => `<button class="action-button ${action === "stop" ? "danger" : ""}" data-service="${esc(service.name)}" data-action="${action}">${{check:"检查",start:"启动",stop:"停止",restart:"重启"}[action]}</button>`).join("")}</div></td></tr>`;
   }).join("")}</tbody></table>`;
 }
 
@@ -1381,7 +1391,8 @@ function configControl(item) {
   const candidate = draftExists ? state.configDraft[item.key] : current;
   const error = state.configValidationErrors[item.key];
   const readonly = item.editable === false;
-  let control = `<span class="config-value">${esc(item.display_value ?? current ?? "-")}</span>`;
+  const displayValue = item.display_value ?? current ?? "-";
+  let control = `<span class="config-value" title="${esc(displayValue)}">${esc(displayValue)}</span>`;
   if (!readonly) {
     if (item.type === "enum" && Array.isArray(item.choices)) {
       control = `<select data-config-key="${key}"><option value="">请选择候选值</option>${item.choices.map(choice => `<option value="${esc(choice)}"${candidate === choice ? " selected" : ""}>${esc(choice)}</option>`).join("")}</select>`;

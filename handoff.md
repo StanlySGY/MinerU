@@ -1,4 +1,59 @@
-# Session handoff — 2026-08-20
+# Session handoff — 2026-08-22
+
+## 2026-08-22 完成：UI10 服务状态与界面易用性优化
+
+本轮继续增强运维控制台的现场可读性和响应式体验，重点解决服务状态容易混淆、配置长值难以查看以及批量详情在不同屏幕尺寸下使用不舒适的问题。
+
+### 服务状态展示
+
+- 服务卡片和服务表格明确区分：容器运行状态、Docker health、HTTP 探活状态和服务 endpoint。
+- 容器运行状态统一显示“运行中/重启中/已暂停/已退出”等中文状态。
+- Docker health 统一显示“健康/异常/启动中/无探活/未知”，并根据 Docker health 使用对应颜色；不会再错误地用容器运行状态给 Docker health 着色。
+- Docker health 和 runtime 值统一转为小写后再判断，兼容 Docker 返回值大小写差异。
+- HTTP 探活显示 HTTP 状态码或具体错误信息；服务 endpoint 支持长地址换行。
+- 服务卡片保留整体服务可用性颜色，同时增加 processing window 和正在处理任务数，便于判断 API 是否有负载。
+
+### 配置中心与批量详情界面
+
+- 配置中心只读长值支持自动换行，并通过鼠标悬停 `title` 查看完整值。
+- 配置错误项移除负 margin，避免错误提示挤压相邻配置项。
+- 批量详情对话框桌面端最大约 `1400×900`，中等屏幕保留可用空间，移动端继续全屏显示。
+- 批量表单、统计卡片和任务问题列表优化 `minmax()`、边框和响应式布局，减少窄屏错位与内容压缩。
+- 侧栏底部状态文字提高对比度，方便现场查看连接状态。
+
+### 资源与版本
+
+- 页面徽标更新为 `UI10`。
+- 静态资源使用 `ops.js?v=ui10`、`ops.css?v=ui10`；现场升级后建议浏览器执行 `Ctrl+F5`。
+- 目标代码镜像：`mineru-code:v3.4.2-ops-ui10`。
+- 目标导出文件：`/data/maas/sgy_arm/gd-dev/MinerU/docker/base/export/mineru-code-v3.4.2-ops-ui10.tar.gz`。
+
+### 本轮涉及文件
+
+```text
+mineru/ops/static/ops.js
+mineru/ops/static/ops.css
+mineru/ops/static/index.html
+tests/unit/test_ops_console.py
+handoff.md
+```
+
+### 验证结果
+
+```text
+node --check mineru/ops/static/ops.js                                      # 通过
+python -m py_compile mineru/cli/ops.py                                    # 通过
+python -m pytest -o addopts='' tests/unit/test_ops_console.py -q           # 35 passed
+python -m pytest -o addopts='' tests/unit/test_ops_console.py tests/unit/test_task_progress.py tests/unit/test_api_request.py tests/unit/test_vlm_resilience.py tests/unit/test_batch_router_diagnose.py -q  # 68 passed
+git diff --check                                                        # 通过
+```
+
+### 现场升级提示
+
+- 现场拉取 `dev` 后，用 `docker/base/Dockerfile.code` 构建上述 UI10 代码镜像。
+- 导出 tar.gz 后在现场执行 `docker load`，并将 `env.multi` 中代码镜像改为 `mineru-code:v3.4.2-ops-ui10`。
+- 若代码通过共享 code volume 注入容器，必须按现场既有流程刷新或重建该 code volume，再重建 `mineru-ops` 和相关服务；仅替换镜像标签可能仍然使用旧 volume 内容。
+- 配置中心变更后仍需重建受影响 API/Router 容器；正在处理的请求不会动态继承新配置。
 
 ## 2026-08-21 完成：UI9 批量测试可靠停止
 

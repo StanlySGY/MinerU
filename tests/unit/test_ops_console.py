@@ -974,12 +974,12 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert 'data-view="config"' in dashboard_html
     assert "性能实验室" in dashboard_html
     assert "配置中心" in dashboard_html
-    assert "UI9" in dashboard_html
+    assert "UI10" in dashboard_html
     assert "预览变更" in dashboard_html
     assert "保存并应用" in dashboard_html
     assert "config-apply-dialog" in dashboard_html
-    assert "ops.js?v=ui9" in dashboard_html
-    assert "ops.css?v=ui9" in dashboard_html
+    assert "ops.js?v=ui10" in dashboard_html
+    assert "ops.css?v=ui10" in dashboard_html
     assert "log-live" in dashboard_html
     assert "log-follow" in dashboard_html
     assert "markdown-table-wrap" in dashboard_js
@@ -1006,7 +1006,13 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "回滚到此版本" in dashboard_js
     assert "task-timing-table" in dashboard_css
     assert "action-button.cancel-pending" in dashboard_css
-    assert "width: calc(100vw - 24px)" in dashboard_css
+    assert "service-card-metrics" in dashboard_js
+    assert "runtime-health" in dashboard_js
+    assert "service-endpoint" in dashboard_js
+    assert "service-card-metrics" in dashboard_css
+    assert "max-width: 1400px" in dashboard_css
+    assert "overflow-wrap: anywhere" in dashboard_css
+    assert "width: 100vw" in dashboard_css
 
     index_route = next(route for route in app.routes if route.path == "/")
     response = asyncio.run(index_route.endpoint())
