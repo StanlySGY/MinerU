@@ -1220,6 +1220,182 @@ def test_batch_run_metrics_counts_pages_and_throughput(tmp_path: Path, monkeypat
     asyncio.run(runtime.close())
 
 
+def test_performance_snapshot_fingerprints_dataset_redacts_config_and_degrades(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    pdf = input_dir / "sample.pdf"
+    pdf.write_bytes(b"%PDF-first")
+    runtime = OpsRuntime()
+    monkeypatch.setattr(runtime, "pdf_page_count", lambda path: 3)
+
+    first = runtime.performance_dataset_snapshot(input_dir)
+    second = runtime.performance_dataset_snapshot(input_dir)
+    assert first["dataset_sha256"] == second["dataset_sha256"]
+    assert first["files"] == [{
+        "path": "sample.pdf",
+        "size_bytes": len(b"%PDF-first"),
+        "sha256": runtime.file_sha256(pdf),
+        "page_count": 3,
+    }]
+
+    pdf.write_bytes(b"%PDF-changed")
+    changed = runtime.performance_dataset_snapshot(input_dir)
+    assert changed["dataset_sha256"] != first["dataset_sha256"]
+
+    safe = runtime._safe_experiment_config({
+        "MINERU_OPS_AUTH_TOKEN": "do-not-store",
+        "nested": {"api_key": "also-secret", "safe": "kept"},
+    })
+    assert safe == {
+        "MINERU_OPS_AUTH_TOKEN": "<redacted>",
+        "nested": {"api_key": "<redacted>", "safe": "kept"},
+    }
+
+    async def unavailable_agent(*args, **kwargs):
+        raise RuntimeError("agent socket unavailable")
+
+    monkeypatch.setattr(runtime, "agent_call", unavailable_agent)
+    snapshot = asyncio.run(
+        runtime.performance_snapshot(input_dir, BatchRunRequest(experiment_type="performance_lab"))
+    )
+    assert snapshot["dataset_sha256"] == changed["dataset_sha256"]
+    assert snapshot["effective_config"] == {}
+    assert "effective config unavailable: RuntimeError" in snapshot["warnings"][0]
+    asyncio.run(runtime.close())
+
+
+def test_performance_metrics_account_for_timeouts_retries_and_percentiles(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
+    runtime = OpsRuntime()
+    pages = [
+        {
+            "status": "completed", "page_number": 1, "vlm_request_seconds": 10,
+            "attempts": 1,
+            "attempt_details": [{"outcome": "completed", "request_seconds": 10}],
+        },
+        {
+            "status": "completed", "page_number": 2, "vlm_request_seconds": 20,
+            "attempts": 2,
+            "attempt_details": [
+                {"outcome": "timeout", "error": "timed out", "request_seconds": 600, "retry_wait_before_seconds": 5},
+                {"outcome": "completed", "request_seconds": 20},
+            ],
+        },
+        {
+            "status": "failed", "page_number": 3, "vlm_request_seconds": 600,
+            "attempts": 1,
+            "error_type": "TimeoutError",
+            "attempt_details": [{"outcome": "timeout", "request_seconds": 600}],
+        },
+    ]
+    monkeypatch.setattr(runtime, "batch_page_records", lambda record, artifacts: pages)
+    metrics = runtime.batch_run_metrics(
+        {
+            "status": "completed_with_failures",
+            "created_at": "2026-08-23T00:00:00+00:00",
+            "started_at": "2026-08-23T00:00:00+00:00",
+            "completed_at": "2026-08-23T00:02:00+00:00",
+        },
+        {"previews": [], "originals": []},
+    )
+
+    assert metrics["total_pages"] == 3
+    assert metrics["successful_pages"] == 2
+    assert metrics["failed_pages"] == 1
+    assert metrics["timeout_pages"] == 2
+    assert metrics["retry_pages"] == 2
+    assert metrics["p50_page_seconds"] == 15.0
+    assert metrics["p95_page_seconds"] == 19.5
+    assert metrics["max_page_seconds"] == 20.0
+    assert metrics["successful_attempt_seconds"] == 30.0
+    assert metrics["failed_attempt_seconds"] == 1200.0
+    assert metrics["retry_overhead_seconds"] == 5.0
+    assert metrics["without_retry_seconds"] == 30.0
+    assert metrics["with_retry_seconds"] == 1235.0
+    assert metrics["complete"] is True
+    asyncio.run(runtime.close())
+
+
+def test_performance_experiment_comparison_and_exports_choose_batch_one_baseline(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
+    runtime = OpsRuntime()
+    run_dir = runtime.report_dir / "compare"
+    run_dir.mkdir(parents=True)
+    for run_id in ("batch-8", "batch-1"):
+        runtime.store.create_batch_run(
+            run_id,
+            run_dir / run_id,
+            {"experiment_type": "performance_lab"},
+            run_dir / f"{run_id}.md",
+            run_dir / f"{run_id}-raw",
+            run_dir / f"{run_id}.log",
+        )
+        runtime.store.update_batch_run(
+            run_id,
+            status="completed",
+            started_at="2026-08-23T00:00:00+00:00",
+            completed_at="2026-08-23T00:01:00+00:00",
+        )
+
+    def experiment(run_id: str, batch_size: int, dataset_sha256: str, elapsed: float) -> dict:
+        return {
+            "run_id": run_id,
+            "status": "completed",
+            "created_at": "2026-08-23T00:00:00+00:00" if batch_size == 1 else "2026-08-23T00:01:00+00:00",
+            "experiment_name": run_id,
+            "environment_name": "lab-a",
+            "hardware_type": "ascend-npu",
+            "engine": "mineru",
+            "settings": {
+                "experiment_type": "performance_lab", "backend": "vlm-http-client",
+                "engine": "mineru", "vlm_batch_size": batch_size,
+                "page_timeout_seconds": 600.0, "page_connect_max_retries": 0,
+            },
+            "snapshot": {"dataset_sha256": dataset_sha256},
+            "metrics": {
+                "complete": True, "total_pages": 2, "failed_pages": 0,
+                "page_samples": [{}, {}], "elapsed_seconds": elapsed,
+                "pages_per_minute": round(120 / elapsed, 3), "successful_pages": 2,
+                "timeout_pages": 0, "p50_page_seconds": 20.0,
+                "p95_page_seconds": 30.0, "max_page_seconds": 30.0,
+                "retry_pages": 0, "retry_overhead_seconds": 0.0,
+                "without_retry_seconds": 40.0, "with_retry_seconds": 40.0,
+            },
+        }
+
+    records = {
+        "batch-1": experiment("batch-1", 1, "same-dataset", 100.0),
+        "batch-8": experiment("batch-8", 8, "other-dataset", 50.0),
+    }
+    monkeypatch.setattr(runtime, "performance_experiment_record", lambda record: records[record["run_id"]])
+    comparison = runtime.compare_performance_experiments(["batch-8", "batch-1"])
+
+    assert comparison["baseline_run_id"] == "batch-1"
+    batch_eight = next(item for item in comparison["items"] if item["run_id"] == "batch-8")
+    assert batch_eight["speedup"] == 2.0
+    assert "dataset hash 不同或缺失，结果不宜直接比较" in batch_eight["warnings"]
+    csv_content = runtime.performance_experiments_csv(comparison)
+    markdown_content = runtime.performance_experiments_markdown(comparison)
+    assert "run_id,experiment_name" in csv_content
+    assert "batch-8" in csv_content
+    assert "# MinerU 性能实验对比" in markdown_content
+    assert "batch-1" in markdown_content
+    asyncio.run(runtime.close())
+
+
 def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
@@ -1268,18 +1444,18 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert 'data-view="lab"' in dashboard_html
     assert 'data-view="config"' in dashboard_html
     assert "性能实验室" in dashboard_html
-    assert "吞吐量" in dashboard_html or "吞吐量" in dashboard_js
+    assert "吞吐" in dashboard_html or "吞吐" in dashboard_js
     assert "experiment_type" in dashboard_js
     assert "32" in dashboard_html
     assert "配置中心" in dashboard_html
-    assert "UI14" in dashboard_html
+    assert "UI15" in dashboard_html
     assert "预览变更" in dashboard_html
     assert "保存并应用" in dashboard_html
     assert "最终有效配置" in dashboard_html
     assert "config-apply-dialog" in dashboard_html
     assert "config-apply-result" in dashboard_html
-    assert "ops.js?v=ui14" in dashboard_html
-    assert "ops.css?v=ui14" in dashboard_html
+    assert "ops.js?v=ui15" in dashboard_html
+    assert "ops.css?v=ui15" in dashboard_html
     assert "problem-pages-list" in dashboard_html
     assert "problem-pages-select-all" in dashboard_html
     assert "runtime-diagnostics" in dashboard_html

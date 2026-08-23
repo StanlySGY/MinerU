@@ -10,13 +10,16 @@ import io
 import json
 import math
 import os
+import platform
 import re
 import secrets
 import shutil
 import signal
+import socket
 import sqlite3
 import struct
 import subprocess
+import sys
 import time
 import uuid
 import zipfile
@@ -37,6 +40,7 @@ from loguru import logger
 from pydantic import BaseModel, Field
 
 from mineru.utils.pdfium_guard import rewrite_pdf_bytes_with_pdfium
+from mineru.version import __version__
 
 DEFAULT_DATA_DIR = "/tmp/mineru-ops"
 DEFAULT_TEST_ROOT = "./test-pdfs"
@@ -877,6 +881,15 @@ class BatchRunRequest(BaseModel):
     vlm_batch_size: int = Field(default=1, ge=1, le=32)
     pause_seconds: float = Field(default=2.0, ge=0, le=300)
     experiment_type: Literal["batch_test", "performance_lab"] = "batch_test"
+    experiment_name: str = Field(default="", max_length=120)
+    environment_name: str = Field(default="", max_length=120)
+    hardware_type: Literal["ascend-npu", "nvidia-t4", "other"] = "other"
+    engine: Literal["mineru", "ragflow", "other"] = "mineru"
+    notes: str = Field(default="", max_length=2000)
+
+
+class ExperimentCompareRequest(BaseModel):
+    run_ids: list[str] = Field(default_factory=list)
 
 
 class ProblemPageSelection(BaseModel):
@@ -2043,51 +2056,289 @@ class OpsRuntime:
             ],
         }
 
+    @staticmethod
+    def file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def performance_dataset_snapshot(self, input_path: Path) -> dict[str, Any]:
+        files: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        for path in sorted(
+            item for item in input_path.rglob("*")
+            if item.is_file() and item.suffix.lower() == ".pdf"
+        ):
+            relative = path.relative_to(input_path).as_posix()
+            try:
+                size_bytes = path.stat().st_size
+                sha256 = self.file_sha256(path)
+                try:
+                    page_count: int | None = self.pdf_page_count(path)
+                except Exception as exc:
+                    page_count = None
+                    warnings.append(f"{relative}: page count unavailable ({type(exc).__name__})")
+                files.append({
+                    "path": relative,
+                    "size_bytes": size_bytes,
+                    "sha256": sha256,
+                    "page_count": page_count,
+                })
+            except OSError as exc:
+                warnings.append(f"{relative}: fingerprint unavailable ({type(exc).__name__})")
+        digest = hashlib.sha256()
+        for item in files:
+            digest.update(json.dumps(item, ensure_ascii=False, sort_keys=True).encode("utf-8"))
+            digest.update(b"\n")
+        return {"files": files, "file_count": len(files), "dataset_sha256": digest.hexdigest(), "warnings": warnings}
+
+    @staticmethod
+    def _is_sensitive_key(key: str) -> bool:
+        normalized = re.sub(r"[^A-Z0-9]", "", str(key).upper())
+        return any(token in normalized for token in ("TOKEN", "SECRET", "PASSWORD", "PASSWD", "APIKEY", "ACCESSKEY", "PRIVATEKEY", "AUTH"))
+
+    @classmethod
+    def _safe_experiment_config(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        def clean(value: Any, key: str = "") -> Any:
+            if cls._is_sensitive_key(key):
+                return "<redacted>"
+            if isinstance(value, dict):
+                return {str(name): clean(item, str(name)) for name, item in value.items()}
+            if isinstance(value, list):
+                return [clean(item, key) for item in value[:100]]
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                return value
+            return str(value)
+        result = clean(payload)
+        return result if isinstance(result, dict) else {}
+
+    async def performance_snapshot(self, input_path: Path, request: BatchRunRequest) -> dict[str, Any]:
+        warnings: list[str] = []
+        commit = self._safe_command(["git", "rev-parse", "HEAD"])
+        dirty = self._safe_command(["git", "status", "--porcelain"])
+        try:
+            config = await self.agent_call({"action": "config_effective"}, timeout=60)
+        except Exception as exc:
+            config = {}
+            warnings.append(
+                f"effective config unavailable: {type(exc).__name__}: {exc}"
+            )
+        if not config.get("ok", True):
+            warnings.append(str(config.get("error") or "effective config unavailable"))
+        dataset = self.performance_dataset_snapshot(input_path)
+        warnings.extend(dataset.get("warnings") or [])
+        return {
+            "captured_at": utc_now_iso(),
+            "git_commit": str(commit.get("stdout") or "") or None,
+            "git_dirty": bool(str(dirty.get("stdout") or "").strip()),
+            "image": os.getenv("MINERU_CODE_IMAGE") or os.getenv("MINERU_IMAGE") or None,
+            "app_version": __version__,
+            "hostname": platform.node() or socket.gethostname(),
+            "platform": platform.platform(),
+            "python_version": sys.version.split()[0],
+            "effective_config": self._safe_experiment_config(config),
+            "pdf_files": dataset["files"],
+            "dataset_sha256": dataset["dataset_sha256"],
+            "warnings": warnings,
+            "request": self._safe_experiment_config(request.model_dump()),
+        }
+
+    @staticmethod
+    def percentile(values: list[float], percentile: float) -> float | None:
+        if not values:
+            return None
+        ordered = sorted(values)
+        position = (len(ordered) - 1) * percentile
+        lower = int(position)
+        upper = min(lower + 1, len(ordered) - 1)
+        fraction = position - lower
+        return round(ordered[lower] + (ordered[upper] - ordered[lower]) * fraction, 3)
+
+    @staticmethod
+    def _first_not_none(*values: Any) -> Any:
+        return next((value for value in values if value is not None), None)
+
+    @classmethod
+    def _page_has_timeout(cls, page: dict[str, Any]) -> bool:
+        timeout_tokens = ("timeout", "timed out", "wait_timeout")
+        details = page.get("attempt_details") or []
+        values = [page.get("error_type"), page.get("error"), page.get("status")]
+        if isinstance(details, dict):
+            details = [details]
+        if isinstance(details, list):
+            for attempt in details:
+                if isinstance(attempt, dict):
+                    values.extend(
+                        [
+                            attempt.get("outcome"),
+                            attempt.get("error_type"),
+                            attempt.get("error"),
+                        ]
+                    )
+        text = " ".join(str(value or "").lower() for value in values)
+        return any(token in text for token in timeout_tokens)
+
+    @classmethod
+    def _normalize_page_record(
+        cls,
+        page: dict[str, Any],
+        *,
+        task_id: str,
+        source_path: str = "",
+        file_name: str = "",
+    ) -> dict[str, Any] | None:
+        page_number = cls._failed_page_number(page)
+        if page_number is None:
+            return None
+        details = page.get("attempt_details")
+        if not isinstance(details, list):
+            details = []
+        normalized_attempts = cls._first_not_none(page.get("attempts"), len(details) or None, 1)
+        try:
+            normalized_attempts = max(1, int(normalized_attempts))
+        except (TypeError, ValueError):
+            normalized_attempts = 1
+        return {
+            "task_id": task_id,
+            "file_name": str(cls._first_not_none(page.get("file_name"), file_name, Path(source_path).name, "") or ""),
+            "source_path": str(cls._first_not_none(page.get("source_path"), page.get("relative_path"), source_path, file_name, "") or ""),
+            "page_number": page_number,
+            "status": str(cls._first_not_none(page.get("status"), "unknown") or "unknown"),
+            "total_seconds": cls._first_not_none(page.get("total_seconds"), page.get("elapsed_seconds")),
+            "vlm_request_seconds": page.get("vlm_request_seconds"),
+            "successful_attempt_seconds": page.get("successful_attempt_seconds"),
+            "failed_attempt_seconds": page.get("failed_attempt_seconds"),
+            "retry_overhead_seconds": cls._first_not_none(page.get("retry_overhead_seconds"), page.get("retry_wait_seconds")),
+            "attempts": normalized_attempts,
+            "error_type": page.get("error_type"),
+            "error": page.get("error"),
+            "attempt_details": details,
+            "timeout": cls._page_has_timeout({**page, "attempt_details": details}),
+        }
+
+    def batch_page_records(
+        self,
+        record: dict[str, Any],
+        artifacts: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        artifacts = artifacts if artifacts is not None else self.batch_artifacts(record)
+        records_by_key: dict[tuple[str, str, int], dict[str, Any]] = {}
+        run_namespace = str(record.get("run_id") or "batch")
+        for preview in artifacts.get("previews") or []:
+            if not isinstance(preview, dict):
+                continue
+            task_id = str(preview.get("task_id") or "")
+            namespace = task_id or f"{run_namespace}:{len(records_by_key)}"
+            preview_source = str(
+                preview.get("relative_path")
+                or preview.get("source_path")
+                or preview.get("file_name")
+                or ""
+            )
+            # The timing store is authoritative because it contains attempt details
+            # and is written after the worker finishes a page.
+            timing_rows = self.store.all_page_timings(task_id) if task_id else []
+            for row in timing_rows:
+                normalized = self._normalize_page_record(
+                    row,
+                    task_id=task_id,
+                    source_path=str(
+                        self._first_not_none(
+                            row.get("source_path"),
+                            row.get("relative_path"),
+                            preview_source,
+                            row.get("file_name"),
+                            "",
+                        )
+                        or ""
+                    ),
+                    file_name=str(row.get("file_name") or ""),
+                )
+                if normalized is None:
+                    continue
+                key = (
+                    namespace,
+                    str(normalized.get("source_path") or normalized.get("file_name") or ""),
+                    int(normalized["page_number"]),
+                )
+                records_by_key[key] = normalized
+            progress = preview.get("progress") if isinstance(preview.get("progress"), dict) else {}
+            for file_state in progress.get("files") or []:
+                if not isinstance(file_state, dict):
+                    continue
+                file_source = str(
+                    file_state.get("source_path")
+                    or file_state.get("relative_path")
+                    or preview_source
+                    or file_state.get("file_name")
+                    or ""
+                )
+                file_name = str(file_state.get("file_name") or Path(file_source).name)
+                for page in file_state.get("pages") or []:
+                    if not isinstance(page, dict):
+                        continue
+                    normalized = self._normalize_page_record(
+                        page,
+                        task_id=task_id,
+                        source_path=file_source,
+                        file_name=file_name,
+                    )
+                    if normalized is None:
+                        continue
+                    key = (
+                        namespace,
+                        str(normalized.get("source_path") or normalized.get("file_name") or ""),
+                        int(normalized["page_number"]),
+                    )
+                    records_by_key.setdefault(key, normalized)
+        return sorted(
+            records_by_key.values(),
+            key=lambda row: (str(row.get("source_path") or ""), int(row.get("page_number") or 0)),
+        )
+
     def batch_run_metrics(
         self,
         record: dict[str, Any],
         artifacts: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Return comparable page-level throughput metrics for a batch run."""
+        """Return comparable wall-time and page-level metrics for a batch run."""
         artifacts = artifacts if artifacts is not None else self.batch_artifacts(record)
-        total_pages = 0
-        successful_pages = 0
-        failed_pages = 0
-        pending_pages = 0
-        saw_real_progress = False
+        page_samples = self.batch_page_records(record, artifacts)
 
+        # Prefer the page registry because it merges the authoritative timing store
+        # with progress/failed-page fallbacks and keeps one row per source page.
+        total_pages = len(page_samples)
+        successful_pages = sum(
+            str(page.get("status") or "").lower() == "completed" for page in page_samples
+        )
+        failed_pages = sum(
+            str(page.get("status") or "").lower() in {"failed", "skipped"}
+            for page in page_samples
+        )
+        pending_pages = sum(
+            str(page.get("status") or "").lower() not in {"completed", "failed", "skipped"}
+            for page in page_samples
+        )
+
+        # A progress file may exist without page details while the worker is still
+        # registering the PDF. Use its declared page count as a lower-cost fallback.
+        declared_pages = 0
         for preview in artifacts.get("previews") or []:
             progress = preview.get("progress") if isinstance(preview, dict) else None
             files = progress.get("files") if isinstance(progress, dict) else None
-            if not isinstance(files, list) or not files:
-                fallback = self._fallback_batch_progress(record, preview, artifacts)
-                files = fallback.get("files") or []
-            else:
-                saw_real_progress = True
+            if not isinstance(files, list):
+                continue
             for file_state in files:
                 if not isinstance(file_state, dict):
                     continue
-                pages = file_state.get("pages") or []
-                if isinstance(pages, list) and pages:
-                    page_count = len(pages)
-                    total_pages += page_count
-                    for page in pages:
-                        if not isinstance(page, dict):
-                            pending_pages += 1
-                            continue
-                        status = str(page.get("status") or "unknown")
-                        if status == "completed":
-                            successful_pages += 1
-                        elif status in {"failed", "skipped"}:
-                            failed_pages += 1
-                        else:
-                            pending_pages += 1
-                else:
-                    try:
-                        total_pages += max(0, int(file_state.get("total_pages") or 0))
-                    except (TypeError, ValueError):
-                        pass
-
+                try:
+                    declared_pages += max(0, int(file_state.get("total_pages") or 0))
+                except (TypeError, ValueError):
+                    continue
+        if declared_pages:
+            total_pages = max(total_pages, declared_pages)
         if total_pages == 0:
             for original in artifacts.get("originals") or []:
                 try:
@@ -2099,12 +2350,8 @@ class OpsRuntime:
                     total_pages += self.pdf_page_count(path)
                 except Exception:
                     continue
-
         processed_pages = successful_pages + failed_pages
-        if total_pages and not saw_real_progress:
-            pending_pages = max(pending_pages, total_pages - processed_pages)
-        else:
-            pending_pages = max(0, total_pages - processed_pages)
+        pending_pages = max(pending_pages, total_pages - processed_pages)
 
         def parse_time(value: Any) -> datetime | None:
             if not value:
@@ -2122,12 +2369,92 @@ class OpsRuntime:
             elapsed_seconds = max(0.0, (end - started).total_seconds())
         else:
             elapsed_seconds = 0.0
+
+        def number(value: Any) -> float | None:
+            try:
+                return None if value is None else max(0.0, float(value))
+            except (TypeError, ValueError):
+                return None
+
+        def attempt_totals(page: dict[str, Any]) -> tuple[float, float, float]:
+            details = page.get("attempt_details") or []
+            if isinstance(details, dict):
+                details = [details]
+            success = number(page.get("successful_attempt_seconds"))
+            failed = number(page.get("failed_attempt_seconds"))
+            overhead = number(page.get("retry_overhead_seconds"))
+            if isinstance(details, list) and details:
+                success = sum(
+                    number(item.get("request_seconds")) or 0.0
+                    for item in details
+                    if isinstance(item, dict) and item.get("outcome") == "completed"
+                )
+                failed = sum(
+                    number(item.get("request_seconds")) or 0.0
+                    for item in details
+                    if isinstance(item, dict) and item.get("outcome") != "completed"
+                )
+                overhead = sum(
+                    number(item.get("retry_wait_before_seconds")) or 0.0
+                    for item in details
+                    if isinstance(item, dict)
+                )
+            return success or 0.0, failed or 0.0, overhead or 0.0
+
+        durations: list[float] = []
+        with_retry_seconds = 0.0
+        without_retry_seconds = 0.0
+        failed_attempt_seconds = 0.0
+        successful_attempt_seconds = 0.0
+        retry_overhead_seconds = 0.0
+        retry_pages = 0
+        timeout_pages = 0
+        for page in page_samples:
+            success_attempt, failed_attempt, retry_wait = attempt_totals(page)
+            fallback_duration = number(
+                self._first_not_none(page.get("vlm_request_seconds"), page.get("total_seconds"))
+            ) or 0.0
+            if str(page.get("status") or "").lower() == "completed":
+                durations.append(success_attempt or fallback_duration)
+            successful_attempt_seconds += success_attempt
+            failed_attempt_seconds += failed_attempt
+            retry_overhead_seconds += retry_wait
+            if success_attempt or failed_attempt or retry_wait:
+                with_retry_seconds += success_attempt + failed_attempt + retry_wait
+            else:
+                with_retry_seconds += fallback_duration
+            if success_attempt:
+                without_retry_seconds += success_attempt
+            elif str(page.get("status") or "").lower() == "completed":
+                without_retry_seconds += fallback_duration
+            details = page.get("attempt_details") or []
+            has_failed_attempt = failed_attempt > 0 or any(
+                isinstance(item, dict) and item.get("outcome") != "completed"
+                for item in (details if isinstance(details, list) else [details])
+            )
+            if int(page.get("attempts") or 1) > 1 or has_failed_attempt or retry_wait > 0:
+                retry_pages += 1
+            # Records loaded from persisted artifacts may predate the normalized
+            # ``timeout`` field. Re-evaluate the page so timeout attempts remain
+            # visible even when metrics are calculated from raw page samples.
+            if page.get("timeout") or self._page_has_timeout(page):
+                timeout_pages += 1
+
+        durations.sort()
         processed_for_rate = processed_pages if processed_pages > 0 else 0
-        pages_per_minute = (processed_for_rate / elapsed_seconds * 60) if elapsed_seconds > 0 else 0.0
-        successful_pages_per_minute = (successful_pages / elapsed_seconds * 60) if elapsed_seconds > 0 else 0.0
-        average_page_seconds = (elapsed_seconds / processed_for_rate) if processed_for_rate else 0.0
+        pages_per_minute = processed_for_rate / elapsed_seconds * 60 if elapsed_seconds > 0 else 0.0
+        successful_pages_per_minute = successful_pages / elapsed_seconds * 60 if elapsed_seconds > 0 else 0.0
+        average_page_seconds = elapsed_seconds / processed_for_rate if processed_for_rate else 0.0
         status = str(record.get("status") or "")
         complete = status in TERMINAL_BATCH_STATES and pending_pages == 0
+        slowest_pages = sorted(
+            [
+                {**page, "duration_seconds": round(number(self._first_not_none(page.get("vlm_request_seconds"), page.get("total_seconds"))) or 0.0, 3)}
+                for page in page_samples
+            ],
+            key=lambda item: item["duration_seconds"],
+            reverse=True,
+        )[:10]
         return {
             "total_pages": total_pages,
             "successful_pages": successful_pages,
@@ -2138,6 +2465,20 @@ class OpsRuntime:
             "pages_per_minute": round(pages_per_minute, 3),
             "successful_pages_per_minute": round(successful_pages_per_minute, 3),
             "average_page_seconds": round(average_page_seconds, 3),
+            "p50_page_seconds": self.percentile(durations, 0.50),
+            "p95_page_seconds": self.percentile(durations, 0.95),
+            "max_page_seconds": round(max(durations), 3) if durations else None,
+            "slowest_pages": slowest_pages,
+            "retry_pages": retry_pages,
+            "retry_rate": round(retry_pages / total_pages, 4) if total_pages else 0.0,
+            "retry_overhead_seconds": round(retry_overhead_seconds, 3),
+            "failed_attempt_seconds": round(failed_attempt_seconds, 3),
+            "successful_attempt_seconds": round(successful_attempt_seconds, 3),
+            "without_retry_seconds": round(without_retry_seconds, 3),
+            "with_retry_seconds": round(with_retry_seconds, 3),
+            "timeout_pages": timeout_pages,
+            "timeout_rate": round(timeout_pages / total_pages, 4) if total_pages else 0.0,
+            "page_samples": page_samples[:500],
             "complete": complete,
         }
 
@@ -2287,6 +2628,209 @@ class OpsRuntime:
             self.last_task_sync_items = list(items)
             self.last_task_sync_monotonic = now
             return items
+
+    def performance_experiment_record(
+        self,
+        record: dict[str, Any],
+        *,
+        include_artifacts: bool = False,
+    ) -> dict[str, Any]:
+        settings = dict(record.get("settings") or {})
+        if settings.get("experiment_type") != "performance_lab":
+            raise HTTPException(status_code=404, detail="performance experiment not found")
+        artifacts = self.batch_artifacts(record)
+        metrics = self.batch_run_metrics(record, artifacts)
+        snapshot = settings.get("snapshot") if isinstance(settings.get("snapshot"), dict) else {}
+        result = {
+            "run_id": record.get("run_id"),
+            "status": record.get("status"),
+            "created_at": record.get("created_at"),
+            "started_at": record.get("started_at"),
+            "completed_at": record.get("completed_at"),
+            "input_path": record.get("input_path"),
+            "experiment_name": settings.get("experiment_name") or "未命名实验",
+            "environment_name": settings.get("environment_name") or "未标记环境",
+            "hardware_type": settings.get("hardware_type") or "other",
+            "engine": settings.get("engine") or "mineru",
+            "notes": settings.get("notes") or "",
+            "settings": settings,
+            "snapshot": snapshot,
+            "metrics": metrics,
+        }
+        if include_artifacts:
+            result["artifacts"] = artifacts
+        return result
+
+    def list_performance_experiments(self) -> list[dict[str, Any]]:
+        return [
+            self.performance_experiment_record(record)
+            for record in self.store.list_batch_runs(limit=10000)
+            if (record.get("settings") or {}).get("experiment_type") == "performance_lab"
+        ]
+
+    @staticmethod
+    def _experiment_dataset_hash(item: dict[str, Any]) -> str | None:
+        snapshot = item.get("snapshot") or {}
+        value = snapshot.get("dataset_sha256")
+        return str(value) if value else None
+
+    def compare_performance_experiments(self, run_ids: list[str]) -> dict[str, Any]:
+        normalized_ids = list(dict.fromkeys(str(item).strip() for item in run_ids if str(item).strip()))
+        if len(normalized_ids) < 2:
+            raise HTTPException(status_code=400, detail="select at least 2 performance experiments")
+        if len(normalized_ids) > 20:
+            raise HTTPException(status_code=400, detail="select at most 20 performance experiments")
+        records: list[dict[str, Any]] = []
+        for run_id in normalized_ids:
+            record = self.store.get_batch_run(run_id)
+            if record is None or (record.get("settings") or {}).get("experiment_type") != "performance_lab":
+                raise HTTPException(status_code=404, detail=f"performance experiment not found: {run_id}")
+            records.append(self.performance_experiment_record(record))
+
+        complete = [item for item in records if item["metrics"].get("complete")]
+        # Baseline precedence is deliberately explicit: prefer completed runs,
+        # then batch=1, then a matching dataset hash, and finally the earliest run.
+        # This keeps an incomplete or unlike-for-like run from becoming the reference
+        # merely because it was selected first in the UI.
+        baseline_candidates = complete or records
+        batch_one = [
+            item
+            for item in baseline_candidates
+            if int((item.get("settings") or {}).get("vlm_batch_size") or 0) == 1
+        ]
+        if batch_one:
+            baseline_candidates = batch_one
+        reference_hash = next(
+            (
+                self._experiment_dataset_hash(item)
+                for item in sorted(
+                    baseline_candidates,
+                    key=lambda item: str(item.get("created_at") or "9999"),
+                )
+                if self._experiment_dataset_hash(item)
+            ),
+            None,
+        )
+        same_dataset = [
+            item
+            for item in baseline_candidates
+            if reference_hash and self._experiment_dataset_hash(item) == reference_hash
+        ]
+        if same_dataset:
+            baseline_candidates = same_dataset
+        baseline = sorted(
+            baseline_candidates,
+            key=lambda item: str(item.get("created_at") or "9999"),
+        )[0]
+        baseline_metrics = baseline["metrics"]
+        warnings: list[str] = []
+        compared: list[dict[str, Any]] = []
+        for item in records:
+            metrics = item["metrics"]
+            item_warnings: list[str] = []
+            item_hash = self._experiment_dataset_hash(item)
+            if not item_hash or not reference_hash or item_hash != reference_hash:
+                item_warnings.append("dataset hash 不同或缺失，结果不宜直接比较")
+            if metrics.get("total_pages") != baseline_metrics.get("total_pages"):
+                item_warnings.append("总页数不同")
+            settings = item.get("settings") or {}
+            base_settings = baseline.get("settings") or {}
+            if settings.get("engine") != base_settings.get("engine") or settings.get("backend") != base_settings.get("backend"):
+                item_warnings.append("引擎或后端配置不同")
+            if settings.get("page_timeout_seconds") != base_settings.get("page_timeout_seconds"):
+                item_warnings.append("单页超时时间不同")
+            if settings.get("page_connect_max_retries") != base_settings.get("page_connect_max_retries"):
+                item_warnings.append("连接重试次数不同")
+            if not metrics.get("complete"):
+                item_warnings.append("实验尚未完成")
+            if int(metrics.get("failed_pages") or 0) > 0:
+                item_warnings.append("存在失败或跳过页")
+            if int(metrics.get("total_pages") or 0) > len(metrics.get("page_samples") or []):
+                item_warnings.append("页级样本不足")
+            elapsed = float(metrics.get("elapsed_seconds") or 0)
+            baseline_elapsed = float(baseline_metrics.get("elapsed_seconds") or 0)
+            ppm = float(metrics.get("pages_per_minute") or 0)
+            baseline_ppm = float(baseline_metrics.get("pages_per_minute") or 0)
+            row = {
+                **item,
+                "speedup": round(baseline_elapsed / elapsed, 3) if baseline_elapsed > 0 and elapsed > 0 else None,
+                "throughput_ratio": round(ppm / baseline_ppm, 3) if baseline_ppm > 0 else None,
+                "warnings": item_warnings,
+            }
+            compared.append(row)
+            warnings.extend(item_warnings)
+        return {
+            "baseline_run_id": baseline.get("run_id"),
+            "items": compared,
+            "warnings": list(dict.fromkeys(warnings)),
+            "generated_at": utc_now_iso(),
+        }
+
+    def performance_experiments_csv(self, comparison: dict[str, Any]) -> str:
+        fields = [
+            "run_id", "experiment_name", "environment_name", "hardware_type", "engine", "status",
+            "dataset_sha256", "vlm_batch_size", "page_timeout_seconds", "total_pages", "successful_pages",
+            "failed_pages", "timeout_pages", "pages_per_minute", "elapsed_seconds", "p50_page_seconds",
+            "p95_page_seconds", "max_page_seconds", "retry_pages", "retry_overhead_seconds",
+            "without_retry_seconds", "with_retry_seconds",
+        ]
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for item in comparison.get("items") or []:
+            settings = item.get("settings") or {}
+            metrics = item.get("metrics") or {}
+            row = {
+                "run_id": item.get("run_id"),
+                "experiment_name": item.get("experiment_name"),
+                "environment_name": item.get("environment_name"),
+                "hardware_type": item.get("hardware_type"),
+                "engine": item.get("engine"),
+                "status": item.get("status"),
+                "dataset_sha256": self._experiment_dataset_hash(item),
+                "vlm_batch_size": settings.get("vlm_batch_size"),
+                "page_timeout_seconds": settings.get("page_timeout_seconds"),
+                **{field: metrics.get(field) for field in fields if field in metrics},
+            }
+            writer.writerow(row)
+        return output.getvalue()
+
+    @staticmethod
+    def performance_experiments_markdown(comparison: dict[str, Any]) -> str:
+        lines = [
+            "# MinerU 性能实验对比",
+            "",
+            f"基线实验：`{comparison.get('baseline_run_id') or '-'}`",
+            "",
+            "| 实验 | 环境/硬件 | batch | 页数 | 成功/失败/超时 | 吞吐（页/分） | P50/P95（秒） | 含重试/不含重试（秒） | 相对基线 |",
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+        for item in comparison.get("items") or []:
+            settings = item.get("settings") or {}
+            metrics = item.get("metrics") or {}
+            lines.append(
+                "| {name} | {env} / {hardware} | {batch} | {pages} | {success}/{failed}/{timeout} | {ppm} | {p50}/{p95} | {with_retry}/{without_retry} | {speedup}× |".format(
+                    name=item.get("experiment_name") or item.get("run_id"),
+                    env=item.get("environment_name") or "-",
+                    hardware=item.get("hardware_type") or "-",
+                    batch=settings.get("vlm_batch_size") or "-",
+                    pages=metrics.get("total_pages") or 0,
+                    success=metrics.get("successful_pages") or 0,
+                    failed=metrics.get("failed_pages") or 0,
+                    timeout=metrics.get("timeout_pages") or 0,
+                    ppm=metrics.get("pages_per_minute") or "-",
+                    p50=metrics.get("p50_page_seconds") or "-",
+                    p95=metrics.get("p95_page_seconds") or "-",
+                    with_retry=metrics.get("with_retry_seconds") or 0,
+                    without_retry=metrics.get("without_retry_seconds") or 0,
+                    speedup=item.get("speedup") or "-",
+                )
+            )
+        warnings = comparison.get("warnings") or []
+        lines.extend(["", "## 口径说明", "", "- 总耗时是批次 wall time；含重试时长包含失败尝试与 retry wait；不含重试时长只统计成功尝试。"])
+        if warnings:
+            lines.extend(["", "## 警告", "", *[f"- {warning}" for warning in warnings]])
+        return "\n".join(lines) + "\n"
 
     @staticmethod
     def pdf_page_count(path: Path) -> int:
@@ -2677,6 +3221,16 @@ class OpsRuntime:
         settings["source_type"] = source_type
         if settings_extra:
             settings.update(settings_extra)
+        if request.experiment_type == "performance_lab":
+            try:
+                settings["snapshot"] = await self.performance_snapshot(effective_input_path, request)
+            except Exception as exc:
+                settings["snapshot"] = {
+                    "captured_at": utc_now_iso(),
+                    "warnings": [
+                        f"performance snapshot unavailable: {type(exc).__name__}: {exc}"
+                    ],
+                }
         record = self.store.create_batch_run(
             run_id,
             effective_input_path,
@@ -3578,6 +4132,54 @@ def create_app() -> FastAPI:
         )
         return result
 
+    @app.get("/api/performance-experiments")
+    async def performance_experiments(request: Request):
+        authorize(request)
+        items = runtime.list_performance_experiments()
+        return {"items": items, "total": len(items)}
+
+    @app.get("/api/performance-experiments/export")
+    async def export_performance_experiments(
+        request: Request,
+        run_ids: str,
+        format: str = "json",
+    ):
+        authorize(request)
+        comparison = runtime.compare_performance_experiments(
+            [item for item in run_ids.split(",") if item.strip()]
+        )
+        if format == "json":
+            return JSONResponse(comparison)
+        if format == "csv":
+            return Response(
+                content=runtime.performance_experiments_csv(comparison),
+                media_type="text/csv; charset=utf-8",
+                headers={"Content-Disposition": 'attachment; filename="mineru-performance-experiments.csv"'},
+            )
+        if format in {"markdown", "md"}:
+            return Response(
+                content=runtime.performance_experiments_markdown(comparison),
+                media_type="text/markdown; charset=utf-8",
+                headers={"Content-Disposition": 'attachment; filename="mineru-performance-experiments.md"'},
+            )
+        raise HTTPException(status_code=400, detail="format must be json, csv, or markdown")
+
+    @app.post("/api/performance-experiments/compare")
+    async def compare_performance_experiments(
+        payload: ExperimentCompareRequest,
+        request: Request,
+    ):
+        authorize(request)
+        return runtime.compare_performance_experiments(payload.run_ids)
+
+    @app.get("/api/performance-experiments/{run_id}")
+    async def performance_experiment(run_id: str, request: Request):
+        authorize(request)
+        record = runtime.store.get_batch_run(run_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="performance experiment not found")
+        return runtime.performance_experiment_record(record, include_artifacts=True)
+
     @app.get("/api/batch-runs/{run_id}")
     async def batch_run(run_id: str, request: Request):
         authorize(request)
@@ -3674,6 +4276,7 @@ def create_app() -> FastAPI:
             settings = dict(record["settings"])
             source_type = str(settings.pop("source_type", "server_directory"))
             settings.pop("pdf_count", None)
+            settings.pop("snapshot", None)
             display_path = str(settings.get("input_path") or ".")
             if source_type == "browser_upload":
                 input_path = runtime.run_dir_for_record(record) / "input"

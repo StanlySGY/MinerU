@@ -1,4 +1,69 @@
-# Session handoff — 2026-08-23
+# Session handoff — 2026-08-24
+
+## 2026-08-24 完成：UI15 性能实验档案、统计与对比导出
+
+本轮把运维控制台的性能实验从“临时批量测试”提升为可复盘的实验档案闭环，方便现场对不同 batch、超时和重试策略进行对比，而不需要手工抄录结果。
+
+### 性能实验能力
+
+- 批量测试表单新增性能实验元数据：实验名称、环境名称、硬件类型、引擎和备注。
+- 支持 batch `1/2/4/8/16/32`，并可分别设置单页 VLM timeout、任务 timeout 和连接重试次数。
+- 性能实验使用 `settings.experiment_type == "performance_lab"` 标记；普通批量测试仍为 `batch_test`，历史普通测试不会混入实验归档。
+- 实验启动时快照 Git commit/dirty 状态、MinerU 版本、容器镜像、主机名、平台、Python 版本、effective config、PDF 文件清单、页数、文件 SHA256、数据集 SHA256 和请求参数。
+- 配置快照对 token、secret、password、API key、access key、private key、auth 等敏感字段脱敏；快照获取失败只记录 warning，不阻断实验。
+- RAGFlow/其他引擎目前只是实验归档标签，自动执行逻辑仍然是 MinerU。
+
+### 页级统计与比较
+
+- 归档总页数、成功页、失败页、待处理页、P50/P95/max 页耗时、最慢页 Top 10、timeout 页、retry 页。
+- 同时记录成功 attempt 耗时、失败 attempt 耗时、retry 等待/开销、无重试耗时、有重试耗时、总耗时和 pages/minute。
+- 只要某页任意 attempt 出现 timeout，该页就统计为 timeout page；本轮同时修复了原始/旧归档记录未带 `timeout` 字段时漏计的问题。
+- 支持实验归档搜索、环境/硬件筛选、多选比较，以及 JSON、CSV、Markdown 导出。
+- 比较基线优先选择：已完成记录 → batch=1 → 相同 dataset SHA256 → 最早创建记录。
+
+### 文件、资源与验证
+
+正式修改文件：
+
+```text
+mineru/cli/ops.py
+mineru/ops/static/index.html
+mineru/ops/static/ops.js
+mineru/ops/static/ops.css
+tests/unit/test_ops_console.py
+handoff.md
+```
+
+验证结果：
+
+```text
+python -m pytest -o addopts='' tests/unit/test_ops_console.py -q
+# 43 passed
+
+python -m pytest -o addopts='' tests/unit/test_ops_console.py tests/unit/test_ops_agent_config.py tests/unit/test_api_request.py tests/unit/test_vlm_resilience.py tests/unit/test_batch_router_diagnose.py -q
+# 109 passed
+
+python -m py_compile mineru/cli/ops.py       # 通过
+node --check mineru/ops/static/ops.js       # 通过
+git diff --check                           # 通过
+```
+
+目标镜像：
+
+```text
+mineru-code:v3.4.2-ops-ui15
+/data/maas/sgy_arm/gd-dev/MinerU/docker/base/export/mineru-code-v3.4.2-ops-ui15.tar.gz
+```
+
+### 现场升级注意事项
+
+- 性能实验归档仅收录 `settings.experiment_type == "performance_lab"` 的批量记录。
+- 共享 `/app` code volume 时，只换镜像标签可能仍运行旧代码；必须按现场既有流程刷新或重建 code volume，并重建 `mineru-ops`、API、Router 等相关服务。
+- 宿主机单独部署 `mineru-ops-agent.py` 时，也要同步本轮代码并重启 Agent。
+- 升级后浏览器执行 `Ctrl+F5`，确认加载 `ops.js?v=ui15`、`ops.css?v=ui15`。
+- 配置/实验参数变更只影响重建后的新进程和新请求，正在处理的请求不会动态继承新配置。
+
+提交和推送状态：本轮代码尚未提交/推送，完成测试后由本次交接继续处理。
 
 ## 2026-08-23 完成：UI14 配置最终态核验与失败自动回滚可视化
 

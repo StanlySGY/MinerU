@@ -33,6 +33,11 @@ const state = {
   configApplying: false,
   configApplyResult: null,
   labSubmitting: false,
+  labRuns: [],
+  labSelectedRuns: new Set(),
+  labComparison: null,
+  labFilters: {query: "", environment: "", hardware: ""},
+  labComparing: false,
   problemPages: [],
   selectedProblemPages: new Set(),
   problemPagesSubmitting: false,
@@ -1533,17 +1538,16 @@ function labRunElapsed(run) {
   );
 }
 
-function labGroupKey(run) {
-  const settings = labRunSettings(run);
-  return JSON.stringify([
-    settings.input_path || run.input_path || "",
-    settings.backend || "",
-    settings.page_timeout_seconds ?? "",
-    settings.page_connect_max_retries ?? "",
-    settings.task_timeout ?? "",
-    settings.server_url || "",
-    settings.recursive !== false,
-  ]);
+function labHardwareLabel(value) {
+  return {
+    "ascend-npu": "昇腾 NPU",
+    "nvidia-t4": "NVIDIA T4",
+    other: "其他",
+  }[value] || value || "其他";
+}
+
+function labRunDatasetHash(run) {
+  return run.snapshot?.dataset_sha256 || run.settings?.snapshot?.dataset_sha256 || "";
 }
 
 function labIsStable(run) {
@@ -1553,75 +1557,146 @@ function labIsStable(run) {
     && Number(metrics.total_pages) > 0
     && Number(metrics.successful_pages) > 0
     && Number(metrics.failed_pages || 0) === 0
+    && Number(metrics.timeout_pages || 0) === 0
   );
 }
 
-function labBaseline(run, runs) {
-  const metrics = labRunMetrics(run);
-  if (!labIsStable(run)) return null;
-  const candidates = runs.filter(item => {
-    const settings = labRunSettings(item);
-    const itemMetrics = labRunMetrics(item);
-    return labGroupKey(item) === labGroupKey(run)
-      && Number(settings.vlm_batch_size) === 1
-      && labIsStable(item)
-      && Number(itemMetrics.total_pages) === Number(metrics.total_pages);
+function filteredLabRuns() {
+  const {query, environment, hardware} = state.labFilters;
+  const needle = query.trim().toLowerCase();
+  return state.labRuns.filter(run => {
+    const settings = labRunSettings(run);
+    const searchable = [
+      run.run_id,
+      run.input_path,
+      settings.input_path,
+      run.experiment_name,
+      run.environment_name,
+      run.notes,
+      run.engine,
+      settings.engine,
+    ].filter(Boolean).join(" ").toLowerCase();
+    return (!needle || searchable.includes(needle))
+      && (!environment || run.environment_name === environment)
+      && (!hardware || run.hardware_type === hardware);
   });
-  return candidates.sort((a, b) => String(b.completed_at || b.created_at).localeCompare(String(a.completed_at || a.created_at)))[0] || null;
+}
+
+function populateLabEnvironments() {
+  const select = document.getElementById("lab-filter-environment");
+  const current = state.labFilters.environment;
+  const values = [...new Set(state.labRuns.map(run => run.environment_name).filter(Boolean))].sort((a, b) => a.localeCompare(b, "zh-CN"));
+  select.innerHTML = `<option value="">全部环境</option>${values.map(value => `<option value="${esc(value)}">${esc(value)}</option>`).join("")}`;
+  select.value = values.includes(current) ? current : "";
+  state.labFilters.environment = select.value;
+}
+
+function renderLabComparison() {
+  const panel = document.getElementById("lab-comparison-panel");
+  const comparison = state.labComparison;
+  if (!comparison) {
+    panel.classList.add("hidden");
+    panel.innerHTML = "";
+    return;
+  }
+  const warnings = comparison.warnings || [];
+  const rows = comparison.items || [];
+  panel.classList.remove("hidden");
+  panel.innerHTML = `<div class="section-heading"><h3>实验对比</h3><span class="muted">基线：${esc(comparison.baseline_run_id || "-")}</span></div>${warnings.length ? `<div class="lab-warning-list"><strong>比较提醒</strong>${warnings.map(item => `<span>• ${esc(item)}</span>`).join("")}</div>` : `<p class="lab-comparison-ok">当前所选实验没有发现明显的可比性提醒。</p>`}<div class="lab-comparison-table"><table><thead><tr><th>实验</th><th>环境 / 硬件</th><th>batch</th><th>页数</th><th>成功 / 失败 / 超时</th><th>吞吐</th><th>P50 / P95 / max</th><th>含重试 / 不含重试</th><th>相对基线</th><th>提醒</th></tr></thead><tbody>${rows.map(item => {
+    const settings = labRunSettings(item);
+    const metrics = labRunMetrics(item);
+    const warningText = (item.warnings || []).join("；");
+    const baseline = item.run_id === comparison.baseline_run_id;
+    return `<tr class="${baseline ? "lab-baseline-row" : ""}"><td><strong>${esc(item.experiment_name || "未命名实验")}</strong><div class="mono muted">${esc(item.run_id || "")}</div></td><td>${esc(item.environment_name || "未标记环境")}<div class="muted">${esc(labHardwareLabel(item.hardware_type))}</div></td><td>${esc(settings.vlm_batch_size ?? "-")}</td><td>${esc(metrics.total_pages ?? "-")}</td><td>${esc(metrics.successful_pages ?? 0)} / ${esc(metrics.failed_pages ?? 0)} / ${esc(metrics.timeout_pages ?? 0)}</td><td>${labMetric(metrics.pages_per_minute)} 页/分</td><td>${labMetric(metrics.p50_page_seconds)} / ${labMetric(metrics.p95_page_seconds)} / ${labMetric(metrics.max_page_seconds)}</td><td>${labMetric(metrics.without_retry_seconds)} / ${labMetric(metrics.with_retry_seconds)}</td><td class="lab-speedup">${baseline ? "1.00×" : item.speedup == null ? "-" : `${labMetric(item.speedup, 2)}×`}<div class="muted">${item.throughput_ratio == null ? "" : `${labMetric(item.throughput_ratio, 2)}× 吞吐`}</div></td><td class="${warningText ? "lab-failure" : "muted"}">${esc(warningText || "-")}</td></tr>`;
+  }).join("")}</tbody></table></div>${rows.some(item => (item.metrics?.slowest_pages || []).length) ? `<div class="lab-slowest-grid">${rows.map(item => {
+    const slowest = item.metrics?.slowest_pages || [];
+    if (!slowest.length) return "";
+    return `<div><strong>${esc(item.experiment_name || item.run_id)}</strong><ol>${slowest.slice(0, 3).map(page => `<li>第 ${esc(page.page_number ?? "-")} 页 · ${labMetric(page.seconds)} 秒${page.timeout ? " · 超时" : ""}</li>`).join("")}</ol></div>`;
+  }).join("")}</div>` : ""}`;
 }
 
 function renderLabRuns() {
   const status = document.getElementById("lab-status");
   const table = document.getElementById("lab-table");
   const summary = document.getElementById("lab-summary");
-  const recommendation = document.getElementById("lab-recommendation");
-  const runs = state.batches;
-  status.textContent = `${runs.length} 条性能实验记录`;
+  const runs = filteredLabRuns();
+  const completeRuns = state.labRuns.filter(run => labRunMetrics(run).complete);
+  const selectedVisible = runs.filter(run => state.labSelectedRuns.has(run.run_id)).length;
+  status.textContent = `${runs.length}/${state.labRuns.length} 条性能实验记录`;
+  document.getElementById("lab-selection-count").textContent = `已选择 ${state.labSelectedRuns.size} 条`;
+  document.getElementById("lab-compare").disabled = state.labSelectedRuns.size < 2 || state.labComparing;
+  summary.innerHTML = `<div class="lab-metric"><span>归档实验</span><strong>${state.labRuns.length}</strong></div><div class="lab-metric"><span>已完成</span><strong>${completeRuns.length}</strong></div><div class="lab-metric"><span>当前筛选</span><strong>${runs.length}</strong></div><div class="lab-metric"><span>已选可见</span><strong>${selectedVisible}</strong></div>`;
   if (!runs.length) {
-    summary.innerHTML = "";
-    recommendation.innerHTML = "";
-    table.innerHTML = `<div class="empty-state">还没有性能实验。填写服务器目录后开始第一组基线测试。</div>`;
+    table.innerHTML = `<div class="empty-state">没有符合条件的性能实验。可以清除筛选，或先填写服务器目录开始实验。</div>`;
+    renderLabComparison();
     return;
   }
-
-  const completeRuns = runs.filter(run => labRunMetrics(run).complete);
-  const latestRun = runs[0];
-  const latestGroupKey = labGroupKey(latestRun);
-  const comparisonRuns = runs.filter(run => labGroupKey(run) === latestGroupKey);
-  const stableRuns = comparisonRuns.filter(labIsStable);
-  const baselineRuns = stableRuns.filter(run => Number(labRunSettings(run).vlm_batch_size) === 1);
-  const latestBaseline = baselineRuns.sort((a, b) => String(b.completed_at || b.created_at).localeCompare(String(a.completed_at || a.created_at)))[0] || null;
-  const comparableRuns = latestBaseline
-    ? stableRuns.filter(run => Number(labRunMetrics(run).total_pages) === Number(labRunMetrics(latestBaseline).total_pages))
-    : [];
-  const recommended = [...comparableRuns].sort((a, b) => Number(labRunMetrics(b).pages_per_minute || 0) - Number(labRunMetrics(a).pages_per_minute || 0))[0] || null;
-  summary.innerHTML = `<div class="lab-metric"><span>实验批次</span><strong>${runs.length}</strong></div><div class="lab-metric"><span>已完成</span><strong>${completeRuns.length}</strong></div><div class="lab-metric"><span>当前对照组</span><strong>${comparisonRuns.length}</strong></div><div class="lab-metric"><span>可比结果</span><strong>${comparableRuns.length}</strong></div>`;
-  recommendation.className = `lab-recommendation${recommended ? " good" : ""}`;
-  recommendation.innerHTML = recommended
-    ? `当前测试条件稳定推荐：<strong>micro-batch ${esc(labRunSettings(recommended).vlm_batch_size ?? "-")}</strong> · ${labMetric(labRunMetrics(recommended).pages_per_minute)} 页/分钟 · 相对基线 ${labMetric(Number(labRunMetrics(latestBaseline).elapsed_seconds) / Number(labRunMetrics(recommended).elapsed_seconds), 2)}×（目录 ${esc(labRunSettings(recommended).input_path || recommended.input_path || "-")}）`
-    : `当前测试条件暂不推荐：请先对目录 ${esc(labRunSettings(latestRun).input_path || latestRun.input_path || "-")} 完成 batch=1 基线，并确保候选批次页数一致且没有异常页。`;
-
-  table.innerHTML = `<table><thead><tr><th>测试目录</th><th>micro-batch</th><th>总页数</th><th>成功/异常</th><th>吞吐量</th><th>等效页耗时</th><th>相对 batch=1</th><th>状态/耗时</th><th>记录</th></tr></thead><tbody>${runs.map(run => {
+  table.innerHTML = `<table><thead><tr><th>选择</th><th>实验 / 环境 / 硬件</th><th>batch</th><th>页数</th><th>成功 / 异常 / 超时</th><th>吞吐</th><th>P50 / P95 / max</th><th>重试开销</th><th>总耗时</th><th>状态</th><th>记录</th></tr></thead><tbody>${runs.map(run => {
     const settings = labRunSettings(run);
     const metrics = labRunMetrics(run);
-    const baseline = labBaseline(run, runs);
-    const baselineElapsed = Number(labRunMetrics(baseline || {}).elapsed_seconds);
-    const runElapsed = Number(metrics.elapsed_seconds);
-    const speedup = baseline && baselineElapsed > 0 && runElapsed > 0 ? baselineElapsed / runElapsed : null;
-    const stable = labIsStable(run);
-    let speedText = "运行中";
-    if (metrics.complete && !stable) speedText = "不可比较";
-    else if (stable && Number(settings.vlm_batch_size) === 1) speedText = "1.00× 基线";
-    else if (speedup != null) speedText = `${labMetric(speedup, 2)}×`;
-    else if (metrics.complete) speedText = "待补 batch=1 基线";
-    const isRecommended = recommended && run.run_id === recommended.run_id;
-    return `<tr class="${isRecommended ? "lab-recommended-row" : ""}"><td><strong>${esc(settings.input_path || run.input_path || "-")}</strong><div class="mono muted">${esc(run.run_id || "")}</div></td><td>${esc(settings.vlm_batch_size ?? "-")} 页</td><td class="lab-table-number">${esc(metrics.total_pages ?? "-")}</td><td>${esc(metrics.successful_pages ?? 0)} / <span class="${metrics.failed_pages ? "lab-failure" : ""}">${esc(metrics.failed_pages ?? 0)}</span></td><td class="lab-table-number">${labMetric(metrics.pages_per_minute)} 页/分</td><td class="lab-table-number">${labMetric(metrics.average_page_seconds)} 秒</td><td class="lab-speedup ${speedup == null ? "pending" : ""}">${esc(speedText)}</td><td>${badge(run.status)}<div class="mono muted">${esc(labRunElapsed(run))}</div>${metrics.pending_pages ? `<div class="muted">待处理 ${esc(metrics.pending_pages)} 页</div>` : ""}</td><td><button class="text-button" data-batch-detail="${esc(run.run_id)}">查看记录</button></td></tr>`;
+    const selected = state.labSelectedRuns.has(run.run_id);
+    const statusText = metrics.complete ? (labIsStable(run) ? "稳定" : "有异常") : "处理中";
+    return `<tr><td><input class="lab-checkbox" type="checkbox" data-lab-select="${esc(run.run_id)}" ${selected ? "checked" : ""} aria-label="选择 ${esc(run.experiment_name || run.run_id)}"></td><td><strong>${esc(run.experiment_name || "未命名实验")}</strong><div>${esc(run.environment_name || "未标记环境")} · ${esc(labHardwareLabel(run.hardware_type))}</div><div class="mono muted">${esc(run.run_id || "")} · ${esc(settings.input_path || run.input_path || "-")}</div></td><td>${esc(settings.vlm_batch_size ?? "-")}</td><td>${esc(metrics.total_pages ?? "-")}</td><td>${esc(metrics.successful_pages ?? 0)} / <span class="${metrics.failed_pages ? "lab-failure" : ""}">${esc(metrics.failed_pages ?? 0)}</span> / <span class="${metrics.timeout_pages ? "lab-failure" : ""}">${esc(metrics.timeout_pages ?? 0)}</span></td><td class="lab-table-number">${labMetric(metrics.pages_per_minute)} 页/分</td><td class="lab-table-number">${labMetric(metrics.p50_page_seconds)} / ${labMetric(metrics.p95_page_seconds)} / ${labMetric(metrics.max_page_seconds)}</td><td>${labMetric(metrics.retry_overhead_seconds)} 秒<div class="muted">${esc(metrics.retry_pages ?? 0)} 页重试</div></td><td>${esc(labRunElapsed(run))}<div class="muted">含重试 ${labMetric(metrics.with_retry_seconds)} 秒</div></td><td>${badge(run.status)}<div class="muted">${statusText}</div>${metrics.pending_pages ? `<div class="muted">待处理 ${esc(metrics.pending_pages)} 页</div>` : ""}</td><td><button class="text-button" data-batch-detail="${esc(run.run_id)}">查看记录</button></td></tr>`;
   }).join("")}</tbody></table>`;
+  renderLabComparison();
+}
+
+function clearLabSelection() {
+  state.labSelectedRuns.clear();
+  state.labComparison = null;
+  renderLabRuns();
+}
+
+async function compareLabRuns() {
+  if (state.labSelectedRuns.size < 2) {
+    notice("请至少选择 2 条性能实验");
+    return;
+  }
+  state.labComparing = true;
+  renderLabRuns();
+  try {
+    state.labComparison = await api("/api/performance-experiments/compare", {
+      method: "POST",
+      body: JSON.stringify({run_ids: [...state.labSelectedRuns]}),
+    });
+    renderLabRuns();
+  } catch (error) {
+    notice(error.message);
+  } finally {
+    state.labComparing = false;
+    renderLabRuns();
+  }
+}
+
+async function exportLabRuns(format) {
+  if (state.labSelectedRuns.size < 2) {
+    notice("请至少选择 2 条性能实验后导出");
+    return;
+  }
+  try {
+    const query = encodeURIComponent([...state.labSelectedRuns].join(","));
+    const response = await authorizedFetch(`/api/performance-experiments/export?run_ids=${query}&format=${encodeURIComponent(format)}`);
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `mineru-performance-experiments.${format === "markdown" ? "md" : format}`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    notice(`已导出 ${format.toUpperCase()}`, false);
+  } catch (error) {
+    notice(error.message);
+  }
 }
 
 async function loadLab() {
-  const data = await api("/api/batch-runs");
-  state.batches = (data.items || []).filter(run => labRunSettings(run).experiment_type === "performance_lab");
+  const data = await api("/api/performance-experiments");
+  state.labRuns = data.items || [];
+  const available = new Set(state.labRuns.map(run => run.run_id));
+  state.labSelectedRuns = new Set([...state.labSelectedRuns].filter(runId => available.has(runId)));
+  populateLabEnvironments();
   renderLabRuns();
 }
 
@@ -1637,6 +1712,11 @@ async function startLabExperiment(event) {
   const submitButton = document.getElementById("lab-submit");
   const payload = {
     input_path: inputPath,
+    experiment_name: String(form.get("experiment_name") || "").trim() || null,
+    environment_name: String(form.get("environment_name") || "").trim() || null,
+    hardware_type: form.get("hardware_type"),
+    engine: form.get("engine"),
+    notes: String(form.get("notes") || "").trim() || null,
     backend: form.get("backend"),
     lang: String(form.get("lang") || "ch").trim() || "ch",
     task_timeout: Number(form.get("task_timeout")),
@@ -1666,6 +1746,29 @@ async function startLabExperiment(event) {
   }
 }
 
+document.getElementById("lab-filter-query").addEventListener("input", event => {
+  state.labFilters.query = event.target.value;
+  renderLabRuns();
+});
+document.getElementById("lab-filter-environment").addEventListener("change", event => {
+  state.labFilters.environment = event.target.value;
+  renderLabRuns();
+});
+document.getElementById("lab-filter-hardware").addEventListener("change", event => {
+  state.labFilters.hardware = event.target.value;
+  renderLabRuns();
+});
+document.getElementById("lab-compare").addEventListener("click", compareLabRuns);
+document.getElementById("lab-clear-selection").addEventListener("click", clearLabSelection);
+document.querySelectorAll("[data-lab-export]").forEach(button => button.addEventListener("click", () => exportLabRuns(button.dataset.labExport)));
+document.getElementById("lab-table").addEventListener("change", event => {
+  const checkbox = event.target.closest("[data-lab-select]");
+  if (!checkbox) return;
+  if (checkbox.checked) state.labSelectedRuns.add(checkbox.dataset.labSelect);
+  else state.labSelectedRuns.delete(checkbox.dataset.labSelect);
+  state.labComparison = null;
+  renderLabRuns();
+});
 document.getElementById("lab-form").addEventListener("submit", startLabExperiment);
 document.getElementById("lab-table").addEventListener("click", handleBatchTableClick);
 

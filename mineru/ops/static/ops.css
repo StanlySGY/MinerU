@@ -324,8 +324,22 @@ tbody tr[data-task].selected { background: #edf7f3; box-shadow: inset 3px 0 0 va
 .lab-metric span, .lab-metric strong { display: block; }
 .lab-metric span { color: var(--muted); font-size: 12px; }
 .lab-metric strong { margin-top: 5px; font-size: 18px; }
-.lab-recommendation { margin-bottom: 12px; padding: 11px 14px; border: 1px solid var(--line); border-radius: 7px; background: #fafbfb; color: var(--muted); font-size: 13px; line-height: 1.5; }
-.lab-recommendation.good { border-color: #b8d8c7; background: #f2fbf5; color: #245a3d; }
+.lab-archive-toolbar { display: grid; gap: 12px; margin-bottom: 12px; padding: 14px; }
+.lab-filter-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.lab-filter-grid label { display: grid; gap: 6px; color: #344148; font-size: 13px; }
+.lab-selection-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.lab-selection-actions .muted { margin-right: auto; }
+.lab-comparison-panel { margin-bottom: 12px; padding: 14px; border: 1px solid #bad8cd; border-radius: 7px; background: #fbfffc; }
+.lab-comparison-panel h3 { margin: 0; color: var(--accent-dark); font-size: 17px; }
+.lab-comparison-ok { margin: 8px 0 12px; color: #245a3d; font-size: 13px; }
+.lab-warning-list { display: grid; gap: 5px; margin: 8px 0 12px; padding: 10px 12px; border-left: 4px solid var(--warn); background: #fff9e9; color: #6e5110; font-size: 13px; }
+.lab-comparison-table { overflow-x: auto; }
+.lab-comparison-table table { min-width: 1100px; }
+.lab-slowest-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin-top: 12px; }
+.lab-slowest-grid > div { padding: 10px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+.lab-slowest-grid ol { margin: 7px 0 0; padding-left: 20px; color: var(--muted); font-size: 13px; }
+.lab-checkbox { width: 17px; min-height: auto; accent-color: var(--accent); }
+.lab-baseline-row { background: #f6fbf8; }
 .lab-speedup { font-weight: 700; color: var(--accent-dark); white-space: nowrap; }
 .lab-speedup.pending { color: var(--muted); font-weight: 500; }
 .lab-failure { color: var(--bad); font-weight: 700; }
@@ -649,6 +663,10 @@ button:disabled { cursor: wait; opacity: .58; }
   .config-layout { grid-template-columns: 1fr; }
   .config-history-panel { position: static; }
   .config-summary { grid-template-columns: repeat(2, 1fr); }
+  .lab-layout, .lab-form { grid-template-columns: 1fr; }
+  .lab-filter-grid { grid-template-columns: 1fr; }
+  .lab-selection-actions { align-items: stretch; }
+  .lab-selection-actions button { flex: 1; }
 }
 
 @media (max-width: 720px) {

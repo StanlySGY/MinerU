@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MinerU 运维控制台</title>
-  <link rel="stylesheet" href="/assets/ops.css?v=ui14">
+  <link rel="stylesheet" href="/assets/ops.css?v=ui15">
 </head>
 <body>
   <div class="shell">
@@ -159,17 +159,21 @@
           <div>
             <span class="feature-kicker">吞吐与稳定性基准测试</span>
             <h2>性能实验室</h2>
-            <p>用相同 PDF 对比不同 VLM micro-batch、单页超时和连接重试策略，快速找出现场设备的吞吐甜点。</p>
+            <p>用相同 PDF 对比不同 VLM micro-batch、单页超时和连接重试策略。每次实验会保存环境、代码、配置与数据集快照，方便复盘和导出。</p>
           </div>
-          <div class="feature-tags"><span>1 / 2 / 4 / 8 / 16 / 32 页</span><span>失败自动逐页隔离</span><span>复用批量任务报告</span></div>
+          <div class="feature-tags"><span>1 / 2 / 4 / 8 / 16 / 32 页</span><span>P50 / P95 / 慢页</span><span>JSON / CSV / Markdown</span></div>
         </section>
         <div class="lab-layout">
           <section class="panel lab-form-panel">
             <div class="section-heading"><h2>新建实验</h2><span class="muted">服务器目录</span></div>
             <form id="lab-form" class="lab-form">
-              <label class="lab-wide"><span>服务器测试目录</span><input name="input_path" value="."><small>相对于控制台允许的测试根目录；如需浏览器上传，请使用“批量测试”。</small></label>
+              <label class="lab-wide"><span>实验名称</span><input name="experiment_name" placeholder="例如：现场昇腾 batch-8 基准" maxlength="120"><small>用于归档和报告展示，不影响实际处理。</small></label>
+              <label><span>环境名称</span><input name="environment_name" placeholder="例如：现场 NPU / 公司 T4" maxlength="120"></label>
+              <label><span>硬件类型</span><select name="hardware_type"><option value="ascend-npu">昇腾 NPU</option><option value="nvidia-t4">NVIDIA T4</option><option value="other">其他</option></select></label>
+              <label><span>引擎标签</span><select name="engine"><option value="mineru">MinerU</option><option value="ragflow">RAGFlow</option><option value="other">其他</option></select></label>
               <label><span>后端</span><select name="backend"><option value="vlm-http-client">vlm-http-client</option><option value="hybrid-http-client">hybrid-http-client</option><option value="pipeline">pipeline</option></select></label>
               <label><span>语言</span><input name="lang" value="ch"></label>
+              <label class="lab-wide"><span>服务器测试目录</span><input name="input_path" value="."><small>相对于控制台允许的测试根目录；如需浏览器上传，请使用“批量测试”。</small></label>
               <fieldset class="lab-wide lab-batch-options">
                 <legend>VLM micro-batch 页数</legend>
                 <div class="lab-option-row">
@@ -182,29 +186,45 @@
                 </div>
                 <small>这是一次 VLM 请求处理的页数，不是 Router 同时处理的任务数；整批失败或返回页数异常时会自动回退逐页隔离。</small>
               </fieldset>
-              <label><span>单页请求超时（秒）</span><input name="page_timeout_seconds" type="number" value="600" min="1" max="7200" required></label>
+              <label><span>单页请求超时（秒）</span><input name="page_timeout_seconds" type="number" value="600" min="1" max="7200" required><small>可放大到 1200 秒观察现场慢页真实完成时间。</small></label>
               <label><span>任务等待上限（秒）</span><input name="task_timeout" type="number" value="7200" min="60" max="86400" required></label>
-              <label><span>连接错误重试次数</span><input name="page_connect_max_retries" type="number" value="0" min="0" max="3" required></label>
+              <label><span>连接错误重试次数</span><input name="page_connect_max_retries" type="number" value="0" min="0" max="3" required><small>耗时基准测试建议保持 0。</small></label>
               <label><span>VLM Server URL</span><input name="server_url" placeholder="可选"></label>
+              <label class="lab-wide"><span>实验备注</span><textarea name="notes" rows="2" maxlength="500" placeholder="例如：同一数据集，观察 batch-8 是否增加显存或失败率"></textarea></label>
               <label class="lab-wide check-label"><input name="recursive" type="checkbox" checked><span>包含子目录</span></label>
-              <div class="lab-wide lab-submit-row"><p>做耗时基准时建议先保持重试为 0，避免失败尝试污染结果。</p><button id="lab-submit" type="submit" class="primary-button">开始性能实验</button></div>
+              <div class="lab-wide lab-submit-row"><p>当前控制台自动执行仍使用 MinerU；RAGFlow/其他仅作为实验归档标签。建议先做 batch=1 基线，再逐步测试 2、4、8。</p><button id="lab-submit" type="submit" class="primary-button">开始性能实验</button></div>
             </form>
           </section>
           <aside class="panel lab-guide">
             <div class="section-heading"><h2>推荐测试顺序</h2></div>
-            <ol><li><strong>基线</strong><span>micro-batch 1，重试 0。</span></li><li><strong>提高吞吐</strong><span>依次测试 2、4、8。</span></li><li><strong>观察拐点</strong><span>比较总耗时、失败页和单页请求耗时。</span></li><li><strong>谨慎测试 16</strong><span>确认显存、上下文和队列没有成为瓶颈。</span></li><li><strong>压力档位</strong><span>16 / 32 仅用于压力测试，可能增加显存占用、耗时和失败概率。</span></li></ol>
+            <ol><li><strong>基线</strong><span>micro-batch 1，重试 0，记录完整快照。</span></li><li><strong>提高吞吐</strong><span>依次测试 2、4、8，并与同数据集基线比较。</span></li><li><strong>观察拐点</strong><span>关注 P95、慢页、超时页和失败页，而不只看平均速度。</span></li><li><strong>复盘现场</strong><span>导出 Markdown/CSV，报告中保留数据集和配置哈希。</span></li><li><strong>压力档位</strong><span>16 / 32 仅用于压力测试，可能增加显存占用、耗时和失败概率。</span></li></ol>
           </aside>
         </div>
-        <div class="section-heading"><h2>最近实验</h2><span id="lab-status" class="muted">读取中</span></div>
+        <div class="section-heading"><h2>实验归档</h2><span id="lab-status" class="muted">读取中</span></div>
+        <div class="lab-archive-toolbar panel">
+          <div class="lab-filter-grid">
+            <label><span>搜索</span><input id="lab-filter-query" placeholder="实验、环境、备注或 run id"></label>
+            <label><span>环境</span><select id="lab-filter-environment"><option value="">全部环境</option></select></label>
+            <label><span>硬件</span><select id="lab-filter-hardware"><option value="">全部硬件</option><option value="ascend-npu">昇腾 NPU</option><option value="nvidia-t4">NVIDIA T4</option><option value="other">其他</option></select></label>
+          </div>
+          <div class="lab-selection-actions">
+            <span id="lab-selection-count" class="muted">已选择 0 条</span>
+            <button id="lab-compare" type="button" class="secondary-button" disabled>比较所选</button>
+            <button id="lab-clear-selection" type="button" class="text-button">清除选择</button>
+            <button type="button" class="text-button" data-lab-export="json">导出 JSON</button>
+            <button type="button" class="text-button" data-lab-export="csv">导出 CSV</button>
+            <button type="button" class="text-button" data-lab-export="markdown">导出 Markdown</button>
+          </div>
+        </div>
         <div id="lab-summary" class="lab-metric-grid"></div>
-        <div id="lab-recommendation" class="lab-recommendation"></div>
+        <div id="lab-comparison-panel" class="lab-comparison-panel hidden"></div>
         <div id="lab-table" class="table-wrap panel"></div>
       </section>
 
       <section id="view-config" class="view">
         <section class="feature-hero config-hero">
           <div>
-            <span class="feature-kicker">安全、可解释的现场配置 <b class="ui8-badge">UI14</b></span>
+            <span class="feature-kicker">安全、可解释的现场配置 <b class="ui8-badge">UI15</b></span>
             <h2>配置中心</h2>
             <p>从宿主机 Agent 读取当前 env 配置，先预览差异，再通过 Compose 校验安全应用；失败会自动回滚。</p>
           </div>
@@ -356,6 +376,6 @@
     </div>
   </dialog>
 
-  <script src="/assets/ops.js?v=ui14"></script>
+  <script src="/assets/ops.js?v=ui15"></script>
 </body>
 </html>
