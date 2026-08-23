@@ -16,6 +16,7 @@ from mineru.cli.ops import (
     BatchRunRequest,
     OpsRuntime,
     OpsStore,
+    ProblemPageSelection,
     ProblemPagesRetryRequest,
     apply_service_runtime_health,
     build_smoke_test_pdf,
@@ -90,6 +91,66 @@ def test_ops_store_persists_task_snapshots(tmp_path: Path):
 
     assert store.cached_task("task-1") == payload
     assert store.cached_tasks() == [payload]
+
+
+def test_ops_store_lists_audit_logs(tmp_path: Path):
+    store = OpsStore(tmp_path / "ops.db")
+    store.audit("first", "target-a", True, "{}")
+    store.audit("second", "target-b", False, "failed")
+
+    payload = store.list_audit_logs(limit=1, offset=0)
+
+    assert payload["total"] == 2
+    assert payload["limit"] == 1
+    assert payload["offset"] == 0
+    assert payload["items"][0]["action"] == "second"
+    assert payload["items"][0]["target"] == "target-b"
+    assert payload["items"][0]["success"] is False
+
+    next_page = store.list_audit_logs(limit=1, offset=1)
+    assert next_page["items"][0]["action"] == "first"
+    assert next_page["items"][0]["success"] is True
+
+
+def test_runtime_diagnostics_is_offline_and_degrades_without_devices(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
+    monkeypatch.setenv("MINERU_MODEL_SOURCE", "local")
+    monkeypatch.setenv("MODELSCOPE_OFFLINE", "1")
+    monkeypatch.setenv("HF_HUB_OFFLINE", "true")
+    monkeypatch.setenv("TRANSFORMERS_OFFLINE", "yes")
+    monkeypatch.setattr(
+        OpsRuntime,
+        "_safe_command",
+        staticmethod(
+            lambda command, timeout=3.0: {
+                "available": False,
+                "ok": False,
+                "error": "command not found",
+            }
+        ),
+    )
+
+    runtime = OpsRuntime()
+    diagnostics = runtime.runtime_diagnostics()
+
+    assert diagnostics["offline"] == {
+        "configured": True,
+        "model_source": "local",
+        "modelscope_disabled": True,
+        "huggingface_disabled": True,
+        "transformers_disabled": True,
+        "network_access": "not_checked",
+    }
+    assert diagnostics["commands"]["nvidia_smi"]["available"] is False
+    assert diagnostics["commands"]["npu_smi"]["available"] is False
+    assert diagnostics["devices"] == []
+    assert diagnostics["models"][0]["path"] == "/models/pipeline"
+    assert diagnostics["warnings"]
+    asyncio.run(runtime.close())
 
 
 def test_ops_store_persists_and_summarizes_page_timings(tmp_path: Path):
@@ -188,8 +249,17 @@ def test_ops_store_persists_and_summarizes_page_timings(tmp_path: Path):
     assert summary["completed_average_vlm_request_seconds"] == 25.0
     assert summary["completed_p50_vlm_request_seconds"] == 25.0
     assert summary["completed_p95_vlm_request_seconds"] == 38.5
+    assert summary["completed_p99_vlm_request_seconds"] == 39.7
     assert summary["completed_max_vlm_request_seconds"] == 40.0
     assert summary["slow_pages"] == 3
+    assert summary["timeout_pages"] == 1
+    assert summary["timeout_rate"] == pytest.approx(0.2)
+    assert summary["retry_pages"] == 1
+    assert summary["retry_rate"] == pytest.approx(0.2)
+    assert summary["successful_attempt_seconds"] == pytest.approx(7.0)
+    assert summary["failed_attempt_seconds"] == pytest.approx(3.0)
+    assert summary["retry_overhead_seconds"] == pytest.approx(1.25)
+    assert summary["with_retry_wall_seconds"] == pytest.approx(706.0)
     skipped_summary = store.page_timing_summary("timing-task", status="skipped")
     assert skipped_summary["recorded_pages"] == 1
     assert skipped_summary["completed_pages"] == 0
@@ -831,6 +901,171 @@ def test_retry_problem_pages_creates_linked_batch_with_timeout_override(
     asyncio.run(runtime.close())
 
 
+def test_write_problem_pages_supports_per_page_selection_and_source_identity(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
+    runtime = OpsRuntime()
+    run_dir = runtime.report_dir / "source-run"
+    input_dir = run_dir / "input"
+    source_a = input_dir / "folder-a/shared.pdf"
+    source_b = input_dir / "folder-b/shared.pdf"
+    source_a.parent.mkdir(parents=True)
+    source_b.parent.mkdir(parents=True)
+    source_a.write_bytes(b"%PDF-source-a")
+    source_b.write_bytes(b"%PDF-source-b")
+
+    preview_payloads = [
+        (
+            "0001-shared-a",
+            {
+                "task_id": "task-a",
+                "file_name": "shared.pdf",
+                "relative_path": "folder-a/shared.pdf",
+                "progress": {
+                    "files": [
+                        {
+                            "file_name": "shared.pdf",
+                            "relative_path": "folder-a/shared.pdf",
+                            "pages": [
+                                {"page_number": 1, "status": "completed"},
+                                {
+                                    "page_number": 2,
+                                    "status": "skipped",
+                                    "error_type": "TimeoutError",
+                                    "error": "timed out",
+                                },
+                                {
+                                    "page_number": 3,
+                                    "status": "failed",
+                                    "error_type": "RuntimeError",
+                                    "error": "inference failed",
+                                },
+                            ],
+                        }
+                    ]
+                },
+            },
+        ),
+        (
+            "0002-shared-b",
+            {
+                "task_id": "task-b",
+                "file_name": "shared.pdf",
+                "relative_path": "folder-b/shared.pdf",
+                "progress": {
+                    "files": [
+                        {
+                            "file_name": "shared.pdf",
+                            "relative_path": "folder-b/shared.pdf",
+                            "pages": [
+                                {
+                                    "page_number": 1,
+                                    "status": "failed",
+                                    "error_type": "ValueError",
+                                    "error": "bad page",
+                                },
+                                {"page_number": 2, "status": "completed"},
+                            ],
+                        }
+                    ]
+                },
+            },
+        ),
+    ]
+    for directory_name, payload in preview_payloads:
+        result_dir = run_dir / "results" / directory_name
+        result_dir.mkdir(parents=True)
+        (result_dir / "preview.json").write_text(
+            json.dumps(payload, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    runtime.store.create_batch_run(
+        "source-run",
+        input_dir,
+        {"input_path": "browser upload", "source_type": "browser_upload", "pdf_count": 2},
+        run_dir / "BATCH_DIAGNOSIS.md",
+        run_dir / "raw",
+        run_dir / "batch.log",
+    )
+    record = runtime.store.get_batch_run("source-run")
+    assert record is not None
+
+    rewrite_calls: list[tuple[bytes, list[int]]] = []
+
+    def fake_rewrite(source_bytes: bytes, *, page_indices: list[int]) -> bytes:
+        rewrite_calls.append((source_bytes, page_indices))
+        return b"%PDF-selected-" + bytes(str(page_indices), encoding="ascii")
+
+    monkeypatch.setattr(
+        "mineru.cli.ops.rewrite_pdf_bytes_with_pdfium",
+        fake_rewrite,
+    )
+
+    all_result = runtime._write_problem_pages(
+        record,
+        tmp_path / "all-problem-pages",
+        output_prefix="",
+    )
+
+    assert all_result["exported_pdf_count"] == 2
+    assert all_result["exported_page_count"] == 3
+    assert rewrite_calls == [
+        (b"%PDF-source-a", [1, 2]),
+        (b"%PDF-source-b", [0]),
+    ]
+    assert [row["source_path"] for row in all_result["manifest"]["files"]] == [
+        "folder-a/shared.pdf",
+        "folder-b/shared.pdf",
+    ]
+
+    rewrite_calls.clear()
+    selected_result = runtime._write_problem_pages(
+        record,
+        tmp_path / "selected-problem-pages",
+        output_prefix="retry-input",
+        selected_pages=[
+            ProblemPageSelection(source_path="folder-b/shared.pdf", page_number=1),
+            ProblemPageSelection(source_path="folder-b/shared.pdf", page_number=1),
+        ],
+    )
+
+    assert selected_result["exported_pdf_count"] == 1
+    assert selected_result["exported_page_count"] == 1
+    assert rewrite_calls == [(b"%PDF-source-b", [0])]
+    selected_row = selected_result["manifest"]["files"][0]
+    assert selected_row["source_path"] == "folder-b/shared.pdf"
+    assert selected_row["original_page_numbers"] == [1]
+    assert selected_row["output_file"].startswith("retry-input/")
+
+    invalid_selections = [
+        ([], "select at least one problem page"),
+        (
+            [ProblemPageSelection(source_path="folder-a/shared.pdf", page_number=1)],
+            "not skipped or failed",
+        ),
+        (
+            [ProblemPageSelection(source_path="folder-a/shared.pdf", page_number=99)],
+            "not skipped or failed",
+        ),
+    ]
+    for selected_pages, expected_detail in invalid_selections:
+        with pytest.raises(HTTPException) as exc_info:
+            runtime._write_problem_pages(
+                record,
+                tmp_path / "invalid-problem-pages",
+                output_prefix="",
+                selected_pages=selected_pages,
+            )
+        assert exc_info.value.status_code == 400
+        assert expected_detail in str(exc_info.value.detail)
+
+    asyncio.run(runtime.close())
+
+
 def test_ops_runtime_background_sync_persists_router_tasks(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
@@ -1012,6 +1247,10 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "/api/config/apply" in paths
     assert "/api/config/restore" in paths
     assert "/api/config/history" in paths
+    assert "/api/audit" in paths
+    assert "/api/diagnostics/runtime" in paths
+    assert "/api/config/status" in paths
+    assert "/api/diagnostics/deep" in paths
     assert "/api/batch-runs/{run_id}/artifacts/{kind}/{artifact_path:path}" in paths
     assert "/" in paths
     dashboard_html = (static_dir / "index.html").read_text(encoding="utf-8")
@@ -1032,12 +1271,22 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "experiment_type" in dashboard_js
     assert "32" in dashboard_html
     assert "配置中心" in dashboard_html
-    assert "UI11" in dashboard_html
+    assert "UI13" in dashboard_html
     assert "预览变更" in dashboard_html
     assert "保存并应用" in dashboard_html
     assert "config-apply-dialog" in dashboard_html
-    assert "ops.js?v=ui11" in dashboard_html
-    assert "ops.css?v=ui11" in dashboard_html
+    assert "ops.js?v=ui13" in dashboard_html
+    assert "ops.css?v=ui13" in dashboard_html
+    assert "problem-pages-list" in dashboard_html
+    assert "problem-pages-select-all" in dashboard_html
+    assert "runtime-diagnostics" in dashboard_html
+    assert "runtime-diagnostics-refresh" in dashboard_html
+    assert "config-application-status" in dashboard_html
+    assert "config-status-refresh" in dashboard_html
+    assert "deep-diagnostics" in dashboard_html
+    assert "deep-diagnostics-refresh" in dashboard_html
+    assert "audit-log" in dashboard_html
+    assert "audit-refresh" in dashboard_html
     assert "log-live" in dashboard_html
     assert "log-follow" in dashboard_html
     assert "markdown-table-wrap" in dashboard_js
@@ -1055,7 +1304,15 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "导出 Markdown 报告" in dashboard_js
     assert "导出 CSV" in dashboard_js
     assert "retry-problem-pages" in dashboard_js
+    assert "configStatus" in dashboard_js
+    assert "deepDiagnostics" in dashboard_js
+    assert "pending_restart" in dashboard_js
+    assert "/api/config/status" in dashboard_js
+    assert "/api/diagnostics/deep" in dashboard_js
     assert "data-problem-pages-retry" in dashboard_js
+    assert "selected_pages" in dashboard_js
+    assert "/api/audit" in dashboard_js
+    assert "/api/diagnostics/runtime" in dashboard_js
     assert 'cancelling: "正在停止"' in dashboard_js
     assert "cancel-pending" in dashboard_js
     assert "button.disabled" in dashboard_js
@@ -1063,6 +1320,9 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "远程任务不会被取消" in dashboard_js
     assert "回滚到此版本" in dashboard_js
     assert "task-timing-table" in dashboard_css
+    assert "runtime-diagnostics-grid" in dashboard_css
+    assert "audit-table" in dashboard_css
+    assert "problem-page-row" in dashboard_css
     assert "action-button.cancel-pending" in dashboard_css
     assert "service-card-metrics" in dashboard_js
     assert "runtime-health" in dashboard_js

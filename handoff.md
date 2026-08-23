@@ -1,5 +1,38 @@
 # Session handoff — 2026-08-22
 
+## 2026-08-22 完成：独立版双环境 PDF 解析性能报告
+
+- 新增独立报告：`docs/analysis-error/双环境PDF解析性能综合对比报告.md`。
+- 报告直接基于当前五本 PDF、现场/公司两份 Excel、现场慢页单页复测数据和 RAGFlow 数据编写，不引用其他版本报告，也不使用“上一版/新增/补测”等历史叙述。
+- 统一纳入 MinerU 分文档耗时、五本合计耗时、吞吐、VLM 平均/P50/P95/最慢请求、现场慢页真实处理时间、RAGFlow 任务耗时及数据限制。
+- 保留并说明空气动力学 PDF 物理页数 484 与 Excel 记录 485 的差异；汇总计算按 Excel 记录口径使用。
+- 本报告核心汇总：MinerU 现场 443 分钟、公司 166 分钟，现场为 2.67 倍；现场扣除超时等待估算为 303 分钟，仍为公司 1.83 倍；RAGFlow 现场 106 分钟、公司 215 分钟。
+
+## 2026-08-22 完成：五文档及 RAGFlow 补测版性能报告
+
+### 本轮完成
+
+- 基于 `docs/analysis-error/现场解析测试.xlsx` 和 `docs/analysis-error/公司解析测试.xlsx`，重新整理五本 PDF 的 MinerU 对比结果。
+- 纳入现场新增的 14 个明确慢页单页复测数据，并区分 Excel 的“慢页数量”和“跳页页码”统计口径。
+- 纳入现场与公司 RAGFlow 五本 PDF 的用时数据，但明确标注 RAGFlow 缺少版本、解析器、模型、参数、完成页数和质量数据，暂不作硬件性能结论。
+- 核验 PDF 文件页数：空气动力学 PDF 物理页数为 484，而 Excel 最新测试记录为 485；报告按 Excel 任务口径统计并专门说明差异。
+- 新增报告：`docs/analysis-error/双环境PDF解析速度对比报告（五文档及RAGFlow补测版）.md`。旧报告未覆盖。
+
+### 核心数据
+
+- 五本按 Excel 共 1342 页。MinerU 现场总用时 443 分钟，公司总用时 166 分钟，现场为公司的 2.67 倍，现场原始吞吐约为公司 37.5%。
+- 按 Excel“去除超时页总用时”估算，现场为 303 分钟，仍为公司 1.83 倍；该列被报告明确称为扣除超时等待后的估算，不等同于完整无超时重跑。
+- 现场平均 VLM 请求耗时均高于公司，倍率 1.55–3.09 倍；P95 倍率 2.15–4.26 倍；高代和空气动力学最慢请求约为公司 8.93–9.16 倍。
+- 14 个明确列出的慢页复测中，13 页为 25–61 分钟，最慢为空气动力学第 325 页 61 分钟；第 207 页 0.5 分钟，报告作为异常例外处理。
+- RAGFlow 现场合计 106 分钟、公司合计 215 分钟；报告仅作为当前部署补充观察。
+
+### 当前待确认事项
+
+1. 如需正式对外/供应商评审，补充两侧完整环境快照、逐页事件时间线和现场慢页重复测试。
+2. 补齐 RAGFlow 两侧版本、解析器、模型、批处理参数、完成页数、失败页和质量抽样。
+3. 确认 Excel 中“慢页数量”与“跳页页码”不一致的业务含义。
+4. 进一步确认 600 秒超时后 HTTP 请求、VLM 推理、并发槽和任务状态是否真正取消/释放。
+
 ## 2026-08-22 完成：UI11 性能实验室与 micro-batch 32
 
 本轮继续增强性能实验室，目标是让现场可以用同一批 PDF 对比不同 VLM micro-batch 的吞吐、平均页耗时、异常页和 batch=1 基线，并避免把普通批量测试混入实验历史。
@@ -977,3 +1010,192 @@ Do not interpret passing `docker compose config` as runtime validation: it does 
 5. Exclude local/runtime data (`mineru-ops-data/ops.db`, `.mimocode/.cron-lock`, probably `.codegraph/`) unless the project explicitly wants it tracked.
 6. Run real field validation. No live VLM/NPU request or production Compose startup was performed in this session.
 7. If the intended behavior is “Hybrid automatically uses the VLM URL from Compose environment,” implement and test that explicitly; current documentation says callers must supply `server_url`.
+
+---
+
+## 2026-08-23：运维控制台 P1 改进收尾（UI12）
+
+本轮继续完成运维控制台 P1 的实现核对、测试补齐和回归验证。没有构建镜像，没有创建 commit，也没有推送远端。
+
+### 已完成能力
+
+1. **异常页逐页选择和重试**
+   - 批次详情中的异常页支持逐页勾选。
+   - 支持全选、取消全选、仅选择超时页、仅选择失败页。
+   - 重试时可单独设置：VLM 页请求超时、任务等待上限、连接重试次数、VLM batch size。
+   - 后端通过 `source_path + page_number` 标识页面，避免不同 PDF 的相同页码互相混淆。
+   - 未传 `selected_pages` 时兼容原行为，导出全部异常页；显式传空列表或选择正常页时返回 400。
+
+2. **页级耗时统计增强**
+   - 页记录增加 `attempt_details`，保留每次尝试的耗时和结果。
+   - 汇总增加成功尝试耗时、失败尝试耗时、重试额外耗时和包含重试的墙钟耗时。
+   - 增加 P99 VLM 请求耗时、超时页数量/比例、重试页数量/比例。
+   - 可同时观察“有效处理耗时”和“重试造成的额外耗时”，避免总时长掩盖重试成本。
+
+3. **运行时诊断**
+   - 新增 `GET /api/diagnostics/runtime`。
+   - 展示关键运行时环境、模型路径检查结果、GPU/NPU 命令探测结果和诊断警告。
+   - 诊断过程不联网、不主动加载模型；`nvidia-smi`、`npu-smi info` 均设置短超时并允许无设备时降级。
+
+4. **配置操作审计**
+   - 新增 `GET /api/audit?limit=100&offset=0`。
+   - 配置校验、保存、恢复等操作可在配置页查看时间、动作、目标、成功状态和详情。
+   - 审计列表支持倒序和分页参数。
+
+5. **前端 UI12**
+   - 服务页增加运行时诊断卡片和刷新按钮。
+   - 配置页增加审计日志表格和刷新按钮。
+   - 异常页重试弹窗增加逐页选择、筛选和重试参数。
+   - 更新相关布局、表格、状态和异常页列表样式。
+
+### 本轮主要修改文件
+
+```text
+mineru/cli/ops.py
+mineru/ops/static/index.html
+mineru/ops/static/ops.js
+mineru/ops/static/ops.css
+tests/unit/test_ops_console.py
+handoff.md
+```
+
+### 新增或补强的测试覆盖
+
+- `test_ops_store_lists_audit_logs`
+  - 审计日志倒序、分页、总数和布尔状态转换。
+- `test_runtime_diagnostics_is_offline_and_degrades_without_devices`
+  - 本地模型配置、离线变量、GPU/NPU 不可用时降级、禁止联网探测。
+- `test_write_problem_pages_supports_per_page_selection_and_source_identity`
+  - 全部异常页导出、逐页选择、跨 PDF 同页码隔离、去重和非法选择校验。
+- 运维控制台静态资源测试更新到 UI12，并覆盖新增 API、DOM 标识、JS 请求和 CSS 类名。
+
+### 验证结果
+
+```bash
+python -m pytest -o addopts='' tests/unit/test_ops_console.py -q
+# 40 passed in 4.81s
+
+python -m py_compile mineru/cli/ops.py
+# passed
+
+node --check mineru/ops/static/ops.js
+# passed
+
+git diff --check
+# passed
+
+python -m pytest -o addopts='' \
+  tests/unit/test_ops_console.py \
+  tests/unit/test_ops_agent_config.py \
+  tests/unit/test_api_request.py \
+  tests/unit/test_vlm_resilience.py \
+  tests/unit/test_batch_router_diagnose.py -q
+# 83 passed in 4.48s
+```
+
+### 当前限制
+
+1. 运维控制台展示的是 **ops 容器自身视角** 的环境、模型路径和设备命令结果，不能替代对 `mineru-api` 或独立 VLM 容器的容器内诊断。
+2. 模型目录存在只代表路径和挂载可见，不代表模型已经真实初始化成功；最终仍需执行一次真实解析请求验证。
+3. 控制台的任务等待超时不会取消 MinerU/VLM 端已经发出的远程任务；它只结束当前等待或记录超时状态。
+4. 当前运行时诊断不会访问互联网，也不会为了验证模型而触发下载，这是离线现场环境下的刻意设计。
+
+### 后续建议（P2/P3）
+
+- **P2：跨容器深度诊断**：由 ops 通过受控接口分别获取 router、API、VLM 容器的有效配置、模型加载状态、设备信息和连通性，明确“配置已保存”和“服务已应用”的区别。
+- **P2：配置应用状态**：展示配置版本、保存时间、各服务实际加载版本，以及哪些配置需要重启后生效。
+- **P2：性能实验对比**：将 batch size、页超时、重试策略、设备环境和结果指标保存为可对比的实验记录。
+- **P3：真正的任务取消**：需要 MinerU/VLM 协议侧提供取消能力；仅在运维控制台停止等待无法终止远端计算。
+- **P3：权限与审计增强**：增加登录鉴权、操作人、导出审计记录和敏感配置脱敏。
+
+---
+
+## 2026-08-23：运维控制台 P2 配置状态与跨容器诊断收尾（UI13）
+
+本轮完成运维控制台 P2/UI13 的配置可见性和跨容器诊断增强。没有构建镜像，没有创建 commit，也没有推送远端；工作区已有的其他未提交、未跟踪文件未清理、未删除、未重置。
+
+### 已完成能力
+
+1. **配置版本与指纹展示**
+   - 配置页展示 `env.multi` 的版本号、SHA256 和配置内容 Hash。
+   - 配置版本用于区分文件是否发生变化，Hash 用于辅助判断配置内容是否一致。
+   - 敏感值只展示脱敏结果，不在状态接口或页面中泄露明文。
+
+2. **配置生效状态比对**
+   - 运维 Agent 解析 `env.multi`，并分别读取 API、Router、Ops 容器的实际环境变量。
+   - 新增 `config_status` 能力，支持展示：`applied`、`pending_restart`、`unknown`、`not_created`。
+   - 显示服务级总体状态、摘要、需要重启的服务、比较过的变量、匹配变量、缺失变量和不一致变量。
+   - 对敏感变量只报告“不一致”，不返回源值和容器值。
+   - 缺失变量明确标记为“容器未加载该变量”，避免与普通值不一致混淆。
+
+3. **跨容器深度诊断**
+   - 新增深度诊断接口和 UI 面板，可检查 API、Router、Ops 的容器运行状态、实际环境变量、模型路径存在性/可读性/文件数量、挂载信息以及 GPU/NPU 探测结果。
+   - 诊断结果包含警告和配置应用状态，帮助区分“配置文件已保存”“容器已加载配置”和“容器未创建”。
+   - 深度诊断支持手动刷新，适合现场修改 env、重建容器后复核。
+
+4. **UI13 可用性和缓存处理**
+   - 更新静态资源版本标识为 UI13：`ops.js?v=ui13`、`ops.css?v=ui13`。
+   - 增加配置状态卡、诊断状态卡、刷新按钮、响应式布局和状态颜色。
+   - 优化 `unknown`、`not_created`、缺失变量和无差异场景的提示文案。
+
+5. **API 与测试**
+   - 新增 `GET /api/config/status`。
+   - 新增 `GET /api/diagnostics/deep`。
+   - 增加 Agent 配置解析、脱敏、状态比对、诊断和运维控制台静态资源/API 的测试覆盖。
+
+### 主要修改文件
+
+```text
+docker/multi/mineru-ops-agent.py
+mineru/cli/ops.py
+mineru/ops/static/index.html
+mineru/ops/static/ops.js
+mineru/ops/static/ops.css
+tests/unit/test_ops_agent_config.py
+tests/unit/test_ops_console.py
+handoff.md
+```
+
+### 验证结果
+
+```bash
+python -m pytest -o addopts='' tests/unit/test_ops_agent_config.py -q
+# 23 passed in 0.08s
+
+python -m pytest -o addopts='' \\
+  tests/unit/test_ops_console.py \\
+  tests/unit/test_ops_agent_config.py -q
+# 63 passed in 2.47s
+
+python -m pytest -o addopts='' \\
+  tests/unit/test_ops_console.py \\
+  tests/unit/test_ops_agent_config.py \\
+  tests/unit/test_api_request.py \\
+  tests/unit/test_vlm_resilience.py \\
+  tests/unit/test_batch_router_diagnose.py -q
+# 96 passed in 2.43s
+
+python -m py_compile docker/multi/mineru-ops-agent.py mineru/cli/ops.py
+# passed
+
+node --check mineru/ops/static/ops.js
+# passed
+
+git diff --check
+# passed
+```
+
+### 已知限制与后续建议
+
+1. 当前 `config_status` 主要比较白名单环境变量；Compose `command` 参数尚未纳入 `Config.Env` 的配置比对，因此命令行参数与 env 共同决定的配置仍需结合启动命令检查。
+2. 深度诊断不会联网，也不会主动加载模型；“模型路径存在、可读且有文件”不等于模型已经成功初始化，仍需通过真实解析请求验证。
+3. GPU/NPU 检测依赖容器中存在 `npu-smi` 或 `nvidia-smi`，现场没有对应工具时只能给出降级结果。
+4. `mineru-ops` 自身配置修改后可能仍需现场手工重启或重建容器，才能让新的环境变量进入进程。
+5. 运维控制台等待超时不等于远端 VLM 请求真正取消；真正取消仍属于后续 P3 协议能力，需要 MinerU/VLM API 提供取消接口或可中断任务句柄。
+6. 如果把 `MINERU_VLM_PAGE_TIMEOUT_SECONDS` 从 600 秒调大，必须同时确认 `MINERU_VLM_CLIENT_HTTP_TIMEOUT` 不小于新的页级软超时，并重建实际承载 API 的容器/代码镜像，不能只刷新浏览器或只保存配置文件。
+
+### 现场使用提醒
+
+- 本轮代码仍在本地 `dev` 工作区，未执行 `git commit`、`git push`、Docker build 或镜像导出。
+- 现场需要自行拉取代码、构建代码镜像并按既有 Compose 流程重建/刷新共享 code volume 和相关服务。
+- 部署后若页面仍显示旧 UI，浏览器执行强制刷新（如 `Ctrl+F5`），并确认加载的是 `ops.js?v=ui13` 和 `ops.css?v=ui13`。

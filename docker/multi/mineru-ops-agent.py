@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import socketserver
 import subprocess
@@ -152,11 +154,70 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
     },
 ]
 CONFIG_SCHEMA_BY_KEY = {item["key"]: item for item in CONFIG_SCHEMA}
+MODEL_PATH_ENV_KEYS = (
+    "MINERU_VLM_MODEL",
+    "MINERU_MODEL_DIR",
+    "MINERU_HOME",
+    "MINERU_MODEL_CACHE",
+    "MODELSCOPE_CACHE",
+    "HF_HOME",
+)
+DIAGNOSTIC_ENV_KEYS = set(CONFIG_SCHEMA_BY_KEY) | set(MODEL_PATH_ENV_KEYS) | {
+    "HF_HUB_OFFLINE",
+    "TRANSFORMERS_OFFLINE",
+    "MODELSCOPE_OFFLINE",
+    "CUDA_VISIBLE_DEVICES",
+    "ASCEND_RT_VISIBLE_DEVICES",
+}
+
+# Only compare variables that are actually expected to be injected into each
+# container.  The shared env.multi file also contains settings for other
+# services, and comparing all MINERU_* keys would create false restart alerts.
+API_CONTAINER_ENV_KEYS = {
+    "MINERU_VLM_MODEL",
+    "MINERU_MODEL_SOURCE",
+    "MINERU_DEVICE_MODE",
+    "MINERU_PROCESSING_WINDOW_SIZE",
+    "MINERU_API_MAX_CONCURRENT_REQUESTS",
+    "MINERU_VLM_FAILURE_POLICY",
+    "MINERU_VLM_GLOBAL_PAGE_CONCURRENCY",
+    "MINERU_VLM_PAGE_TIMEOUT_SECONDS",
+    "MINERU_VLM_CONNECT_MAX_RETRIES",
+    "MINERU_API_OUTPUT_ROOT",
+    "MINERU_FORMULA_ENABLE",
+    "MINERU_TABLE_ENABLE",
+    "MINERU_LOG_LEVEL",
+}
+ROUTER_CONTAINER_ENV_KEYS = {
+    "MINERU_VLM_PAGE_TIMEOUT_SECONDS",
+    "MINERU_VLM_CONNECT_MAX_RETRIES",
+}
+OPS_CONTAINER_ENV_KEYS = {
+    "MINERU_OPS_AUTH_TOKEN",
+    "MINERU_OPS_SMOKE_BACKEND",
+    "MINERU_OPS_SMOKE_TIMEOUT_SECONDS",
+    "MINERU_OPS_MAX_UPLOAD_MB",
+    "MINERU_OPS_ARTIFACT_RETENTION_DAYS",
+    "MINERU_OPS_ARTIFACT_MAX_GB",
+    "MINERU_OPS_SAVE_RESULT_IMAGES",
+}
+MASKED_VALUE = "••••••••"
+MAX_COMMAND_OUTPUT = 12000
 
 
 def _is_sensitive_config_key(key: str) -> bool:
     upper = key.upper()
     return any(marker in upper for marker in ("TOKEN", "PASSWORD", "SECRET"))
+
+
+def _service_expected_env_keys(service: str) -> set[str]:
+    if service.startswith("mineru-api-"):
+        return API_CONTAINER_ENV_KEYS
+    if service == "mineru-router":
+        return ROUTER_CONTAINER_ENV_KEYS
+    if service == "mineru-ops":
+        return OPS_CONTAINER_ENV_KEYS
+    return set()
 
 
 def _parse_env_file(path: Path) -> dict[str, str]:
@@ -181,7 +242,52 @@ def _parse_env_file(path: Path) -> dict[str, str]:
 
 
 def _masked_value(key: str, value: str) -> str:
-    return "••••••••" if _is_sensitive_config_key(key) and value else value
+    return MASKED_VALUE if _is_sensitive_config_key(key) and value else value
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _config_hash(values: dict[str, str], keys: list[str] | set[str] | None = None) -> str:
+    selected = sorted(keys if keys is not None else values)
+    payload = {key: values.get(key, "") for key in selected}
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _parse_environment_list(items: Any) -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not isinstance(items, list):
+        return values
+    for item in items:
+        if not isinstance(item, str) or "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        if key:
+            values[key] = value
+    return values
+
+
+def _safe_environment(values: dict[str, str]) -> dict[str, str]:
+    return {
+        key: _masked_value(key, value)
+        for key, value in sorted(values.items())
+        if key in DIAGNOSTIC_ENV_KEYS or key.startswith("MINERU_")
+    }
+
+
+def _trim_command_result(result: dict[str, Any]) -> dict[str, Any]:
+    trimmed = dict(result)
+    for key in ("output", "error"):
+        value = trimmed.get(key)
+        if isinstance(value, str) and len(value) > MAX_COMMAND_OUTPUT:
+            trimmed[key] = value[:MAX_COMMAND_OUTPUT] + "\n...（输出已截断）"
+    return trimmed
 
 
 def _quote_env_value(value: str) -> str:
@@ -393,7 +499,9 @@ class Agent:
             return {"ok": False, "error": f"configured env file does not exist: {path.name}"}
         try:
             values = _parse_env_file(path)
-            modified_at = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
+            stat = path.stat()
+            modified_at = datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat()
+            sha256 = _sha256_file(path)
         except (OSError, UnicodeError) as exc:
             return {"ok": False, "error": f"failed to read env file: {exc}"}
         items: list[dict[str, Any]] = []
@@ -445,6 +553,9 @@ class Agent:
             "ok": True,
             "env_file": str(path.relative_to(self.project_dir)),
             "modified_at": modified_at,
+            "sha256": sha256,
+            "config_hash": _config_hash(values),
+            "version": f"{datetime.fromtimestamp(stat.st_mtime, timezone.utc).strftime('%Y%m%d-%H%M%S')}-{sha256[:8]}",
             "items": items,
             "unknown_keys": sorted(unknown_keys),
             "mode": "safe_apply",
@@ -722,6 +833,245 @@ class Agent:
             )
         return {"ok": True, "items": history, "mode": "safe_apply"}
 
+    def _inspect_container(self, container: str) -> tuple[dict[str, Any] | None, str | None]:
+        result = run_command(["docker", "inspect", container], self.project_dir, timeout=30)
+        if not result.get("ok"):
+            return None, str(result.get("error") or "docker inspect failed")
+        try:
+            payload = json.loads(result.get("output", ""))
+            if not isinstance(payload, list) or not payload or not isinstance(payload[0], dict):
+                raise ValueError("unexpected docker inspect response")
+            return payload[0], None
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            return None, f"无法解析 docker inspect：{exc}"
+
+    @staticmethod
+    def _inspect_runtime(inspect: dict[str, Any]) -> dict[str, Any]:
+        state = inspect.get("State") if isinstance(inspect.get("State"), dict) else {}
+        health = state.get("Health") if isinstance(state.get("Health"), dict) else {}
+        config = inspect.get("Config") if isinstance(inspect.get("Config"), dict) else {}
+        return {
+            "state": state.get("Status") or "unknown",
+            "health": health.get("Status") or "none",
+            "image": config.get("Image") or inspect.get("Image"),
+            "started_at": state.get("StartedAt"),
+            "finished_at": state.get("FinishedAt"),
+        }
+
+    def _service_config_status(
+        self,
+        service: str,
+        runtime: dict[str, Any],
+        current: dict[str, str],
+    ) -> dict[str, Any]:
+        container = runtime.get("container")
+        base: dict[str, Any] = {
+            "service": service,
+            "container": container,
+            "state": runtime.get("state") or "unknown",
+            "health": runtime.get("health"),
+            "image": runtime.get("image"),
+            "status": "unknown",
+            "matches_current_env": None,
+            "requires_restart": False,
+            "config_hash": _config_hash(current),
+            "compared_keys": [],
+            "matching_keys": [],
+            "mismatched_keys": [],
+            "missing_keys": [],
+            "warnings": [],
+        }
+        if not container:
+            base.update({"state": "not-created", "status": "not_created", "requires_restart": False})
+            base["warnings"].append("容器尚未创建，无法确认实际加载配置")
+            return base
+        inspect, error = self._inspect_container(str(container))
+        if inspect is None:
+            base["status"] = "unknown"
+            base["warnings"].append(error or "无法读取容器信息")
+            return base
+        base.update(self._inspect_runtime(inspect))
+        actual = _parse_environment_list((inspect.get("Config") or {}).get("Env"))
+        expected_keys = _service_expected_env_keys(service)
+        if not expected_keys:
+            base["warnings"].append("该服务没有配置环境变量比对白名单，无法判断是否已生效")
+            return base
+        # env.multi 同时包含 API、Router、Ops 的配置；只比较确实会注入
+        # 当前服务 Config.Env 的变量，避免跨服务变量制造虚假的重启提示。
+        candidate_keys = sorted(expected_keys & (set(current) | set(actual)))
+        base["compared_keys"] = candidate_keys
+        if not candidate_keys:
+            base["warnings"].append("当前 env 文件和容器中都没有可比对的白名单变量")
+            return base
+        for key in candidate_keys:
+            expected = current.get(key)
+            actual_value = actual.get(key)
+            if expected is None:
+                continue
+            if actual_value is None:
+                base["missing_keys"].append(key)
+                continue
+            if actual_value == expected:
+                base["matching_keys"].append(key)
+            else:
+                sensitive = _is_sensitive_config_key(key)
+                base["mismatched_keys"].append(
+                    {
+                        "key": key,
+                        "sensitive": sensitive,
+                        "expected": MASKED_VALUE if sensitive else expected,
+                        "actual": MASKED_VALUE if sensitive else actual_value,
+                    }
+                )
+        mismatch = bool(base["mismatched_keys"] or base["missing_keys"])
+        base["matches_current_env"] = not mismatch
+        base["requires_restart"] = mismatch
+        base["status"] = "pending_restart" if mismatch else "applied"
+        base["config_hash"] = _config_hash(
+            {key: actual.get(key, "") for key in candidate_keys},
+            candidate_keys,
+        )
+        return base
+
+    def _config_file_metadata(self, path: Path, values: dict[str, str]) -> dict[str, Any]:
+        stat = path.stat()
+        sha256 = _sha256_file(path)
+        modified = datetime.fromtimestamp(stat.st_mtime, timezone.utc)
+        return {
+            "path": str(path.relative_to(self.project_dir)),
+            "sha256": sha256,
+            "config_hash": _config_hash(values),
+            "modified_at": modified.isoformat(),
+            "version": f"{modified.strftime('%Y%m%d-%H%M%S')}-{sha256[:8]}",
+        }
+
+    def config_status(self) -> dict[str, Any]:
+        try:
+            path = self.config_path()
+            if not path.is_file():
+                return {"ok": False, "error": f"configured env file does not exist: {path.name}"}
+            current = _parse_env_file(path)
+            metadata = self._config_file_metadata(path, current)
+        except (OSError, UnicodeError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+        service_result = self.services()
+        runtime_services = service_result.get("services", {}) if isinstance(service_result, dict) else {}
+        configured = sorted(self.configured_services())
+        statuses: dict[str, Any] = {}
+        for service in configured:
+            runtime = runtime_services.get(service, {}) if isinstance(runtime_services, dict) else {}
+            statuses[service] = self._service_config_status(service, runtime, current)
+        counts = {key: 0 for key in ("applied", "pending_restart", "unknown", "not_created")}
+        for status in statuses.values():
+            value = status.get("status", "unknown")
+            counts[value if value in counts else "unknown"] += 1
+        if counts["pending_restart"]:
+            overall = "pending_restart" if not counts["applied"] else "partially_applied"
+        elif counts["unknown"] or counts["not_created"]:
+            overall = "unknown" if not counts["applied"] else "partially_applied"
+        else:
+            overall = "applied"
+        warnings = []
+        if not service_result.get("ok"):
+            warnings.append(str(service_result.get("error") or "无法读取 Compose 服务状态"))
+        return {
+            "ok": True,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "env_file": metadata,
+            "overall": overall,
+            "summary": counts,
+            "services": statuses,
+            "warnings": warnings,
+        }
+
+    def _inspect_path(self, container: str, path: str) -> dict[str, Any]:
+        quoted = shlex.quote(path)
+        script = (
+            f"if [ -e {quoted} ]; then "
+            f"test -r {quoted}; readable=$?; "
+            f"count=$(find {quoted} -maxdepth 3 -type f 2>/dev/null | head -1001 | wc -l); "
+            f"else readable=1; count=0; fi; "
+            f"printf '%s %s\\n' $readable $count"
+        )
+        result = run_command(["docker", "exec", container, "sh", "-c", script], self.project_dir, timeout=30)
+        if not result.get("ok"):
+            return {"path": path, "exists": False, "readable": False, "file_count": 0, "scan_limited": False, "error": result.get("error")}
+        parts = str(result.get("output", "")).strip().split()
+        if len(parts) < 2:
+            return {"path": path, "exists": False, "readable": False, "file_count": 0, "scan_limited": False, "error": "无法解析路径检查结果"}
+        readable = parts[0] == "0"
+        try:
+            count = int(parts[1])
+        except ValueError:
+            count = 0
+        return {"path": path, "exists": True, "readable": readable, "file_count": count, "scan_limited": count >= 1001, "error": None}
+
+    def deep_diagnostics(self) -> dict[str, Any]:
+        status_result = self.config_status()
+        if not status_result.get("ok"):
+            return status_result
+        try:
+            current = _parse_env_file(self.config_path())
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+        services = status_result.get("services", {})
+        details: dict[str, Any] = {}
+        for service, config_status in services.items():
+            container = config_status.get("container")
+            detail = dict(config_status)
+            detail["environment"] = {}
+            detail["mounts"] = []
+            detail["models"] = []
+            detail["devices"] = {}
+            detail.setdefault("warnings", [])
+            if not container:
+                details[service] = detail
+                continue
+            inspect, error = self._inspect_container(str(container))
+            if inspect is None:
+                detail["warnings"].append(error or "无法读取容器信息")
+                details[service] = detail
+                continue
+            actual = _parse_environment_list((inspect.get("Config") or {}).get("Env"))
+            detail["environment"] = _safe_environment(actual)
+            for mount in inspect.get("Mounts", []) if isinstance(inspect.get("Mounts"), list) else []:
+                if not isinstance(mount, dict):
+                    continue
+                detail["mounts"].append(
+                    {
+                        "type": mount.get("Type"),
+                        "source": mount.get("Source"),
+                        "destination": mount.get("Destination"),
+                        "rw": mount.get("RW"),
+                    }
+                )
+            model_paths = {
+                key: value for key, value in actual.items()
+                if key in MODEL_PATH_ENV_KEYS and isinstance(value, str) and value.startswith("/")
+            }
+            for key, path in model_paths.items():
+                model = self._inspect_path(str(container), path)
+                model["key"] = key
+                detail["models"].append(model)
+            if service.startswith("mineru-api-") or service == "mineru-router":
+                for name, command in (("npu", "npu-smi info"), ("gpu", "nvidia-smi")):
+                    result = _trim_command_result(run_command(["docker", "exec", str(container), "sh", "-c", command], self.project_dir, timeout=30))
+                    detail["devices"][name] = {
+                        "available": bool(result.get("ok")),
+                        "ok": bool(result.get("ok")),
+                        "output": result.get("output", ""),
+                        "error": result.get("error"),
+                    }
+            details[service] = detail
+        return {
+            "ok": True,
+            "generated_at": status_result.get("generated_at"),
+            "env_file": status_result.get("env_file"),
+            "overall": status_result.get("overall"),
+            "services": details,
+            "warnings": status_result.get("warnings", []),
+        }
+
     def handle(self, request: dict[str, Any]) -> dict[str, Any]:
         action = request.get("action")
         if action == "config_schema":
@@ -738,6 +1088,10 @@ class Agent:
             return self.config_restore(str(request.get("name", "")))
         if action == "config_history":
             return self.config_history()
+        if action == "config_status":
+            return self.config_status()
+        if action == "deep_diagnostics":
+            return self.deep_diagnostics()
         if action == "services":
             return self.services()
         if action == "service_action":

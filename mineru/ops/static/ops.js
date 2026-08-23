@@ -32,6 +32,18 @@ const state = {
   configPlan: null,
   configApplying: false,
   labSubmitting: false,
+  problemPages: [],
+  selectedProblemPages: new Set(),
+  problemPagesSubmitting: false,
+  runtimeDiagnostics: null,
+  runtimeDiagnosticsLoading: false,
+  configStatus: null,
+  configStatusLoading: false,
+  deepDiagnostics: null,
+  deepDiagnosticsLoading: false,
+  auditLogs: null,
+  auditLoading: false,
+  auditOffset: 0,
   token: sessionStorage.getItem("mineruOpsToken") || "",
 };
 
@@ -44,13 +56,16 @@ const titles = {
   config: "配置中心",
   logs: "日志",
 };
+const AUDIT_PAGE_SIZE = 50;
+
 const statusText = {
   pending: "等待中", queued: "等待处理", processing: "处理中", completed: "已完成", failed: "失败",
   partial_success: "部分成功", running: "运行中", paused: "已暂停", cancelling: "正在停止", cancelled: "已取消",
   completed_with_failures: "完成（存在失败）", interrupted: "已中断", unhealthy: "异常",
   healthy: "健康", unavailable: "不可用", unknown: "未知", success: "成功", partial: "部分成功",
   client_error: "客户端错误", wait_timeout: "停止等待（后台可能仍在运行）",
-  monitoring_stopped: "停止监控"
+  monitoring_stopped: "停止监控", applied: "已生效", pending_restart: "等待重启生效",
+  partially_applied: "部分服务已生效", not_created: "容器未创建"
 };
 
 const tokenInput = document.getElementById("token");
@@ -67,8 +82,8 @@ function esc(value) {
 
 function badge(value) {
   const text = statusText[value] || value || "未知";
-  const cls = ["healthy", "completed", "running", "success"].includes(value) ? "good" :
-    ["pending", "processing", "paused", "cancelling", "partial", "partial_success", "completed_with_failures", "wait_timeout", "monitoring_stopped"].includes(value) ? "warn" :
+  const cls = ["healthy", "completed", "running", "success", "applied"].includes(value) ? "good" :
+    ["pending", "processing", "paused", "cancelling", "partial", "partial_success", "completed_with_failures", "wait_timeout", "monitoring_stopped", "pending_restart", "partially_applied", "not_created"].includes(value) ? "warn" :
     ["failed", "unhealthy", "unavailable", "cancelled", "interrupted"].includes(value) ? "bad" : "";
   return `<span class="badge ${cls}">${esc(text)}</span>`;
 }
@@ -261,6 +276,74 @@ async function loadServices() {
   updateLogServices();
 }
 
+function formatBytes(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) return "-";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let size = bytes;
+  let index = 0;
+  while (size >= 1024 && index < units.length - 1) {
+    size /= 1024;
+    index += 1;
+  }
+  return `${size.toFixed(index ? 1 : 0)} ${units[index]}`;
+}
+
+function diagnosticFlag(value, trueText = "已配置", falseText = "未配置") {
+  return `<span class="diagnostic-state ${value ? "good" : "bad"}">${value ? trueText : falseText}</span>`;
+}
+
+function renderRuntimeDiagnostics(payload) {
+  const target = document.getElementById("runtime-diagnostics");
+  if (!payload) {
+    target.innerHTML = `<div class="empty-state">暂无诊断信息</div>`;
+    return;
+  }
+  if (payload.load_error) {
+    target.innerHTML = `<div class="empty-state bad-text">诊断读取失败：${esc(payload.load_error)}</div>`;
+    return;
+  }
+  const offline = payload.offline || {};
+  const configuration = payload.configuration || {};
+  const sourceText = {local: "本地模型", modelscope: "ModelScope", huggingface: "Hugging Face", unknown: "未设置或不支持"}[offline.model_source] || offline.model_source || "未知";
+  const networkText = offline.network_access === "not_checked" ? "未检测网络（诊断不会联网）" : (offline.network_access || "未知");
+  const models = Array.isArray(payload.models) ? payload.models : [];
+  const devices = Array.isArray(payload.devices) ? payload.devices : [];
+  const commands = payload.commands || {};
+  const warnings = Array.isArray(payload.warnings) ? payload.warnings : [];
+  const modelCards = models.map(model => `<article class="runtime-diagnostic-card"><h3>模型路径：${esc(model.name || "未命名")}</h3><dl><div><dt>路径</dt><dd class="mono">${esc(model.path || "-")}</dd></div><div><dt>存在 / 可读</dt><dd>${diagnosticFlag(Boolean(model.exists), "存在", "不存在")} ${diagnosticFlag(Boolean(model.readable), "可读", "不可读")}</dd></div><div><dt>文件数</dt><dd>${esc(model.file_count ?? 0)}${model.scan_limited ? "（扫描已截断）" : ""}</dd></div><div><dt>已扫描大小</dt><dd>${esc(formatBytes(model.size_bytes))}</dd></div><div><dt>加载状态</dt><dd>${esc(model.load_state || "unknown")}</dd></div></dl>${model.scan_error ? `<p class="runtime-diagnostic-error">扫描错误：${esc(model.scan_error)}</p>` : ""}</article>`).join("");
+  const commandCards = [["nvidia_smi", "NVIDIA GPU / nvidia-smi"], ["npu_smi", "昇腾 NPU / npu-smi"]].map(([key, label]) => {
+    const command = commands[key] || {};
+    const status = !command.available ? "工具不可用" : command.ok ? "执行成功" : "执行失败";
+    const statusClass = command.ok ? "good" : command.available ? "warn" : "bad";
+    return `<article class="runtime-diagnostic-card"><h3>${label}</h3><dl><div><dt>状态</dt><dd><span class="diagnostic-state ${statusClass}">${status}</span></dd></div>${command.return_code != null ? `<div><dt>退出码</dt><dd>${esc(command.return_code)}</dd></div>` : ""}<div><dt>输出截断</dt><dd>${command.truncated ? "是" : "否"}</dd></div></dl>${command.error ? `<p class="runtime-diagnostic-error">${esc(command.error)}</p>` : ""}${command.stdout ? `<details><summary>标准输出</summary><pre>${esc(command.stdout)}</pre></details>` : ""}${command.stderr ? `<details><summary>错误输出</summary><pre>${esc(command.stderr)}</pre></details>` : ""}</article>`;
+  }).join("");
+  target.innerHTML = `<div class="runtime-diagnostics-meta"><span>生成时间：${esc(formatDate(payload.generated_at))}</span><span>网络状态：${esc(networkText)}</span></div><div class="runtime-diagnostics-grid"><article class="runtime-diagnostic-card"><h3>离线与模型来源</h3><dl><div><dt>离线模式</dt><dd>${diagnosticFlag(Boolean(offline.configured), "已配置", "未完整配置")}</dd></div><div><dt>模型来源</dt><dd>${esc(sourceText)}</dd></div><div><dt>ModelScope 离线</dt><dd>${diagnosticFlag(Boolean(offline.modelscope_disabled), "开启", "关闭")}</dd></div><div><dt>Hugging Face 离线</dt><dd>${diagnosticFlag(Boolean(offline.huggingface_disabled), "开启", "关闭")}</dd></div><div><dt>Transformers 离线</dt><dd>${diagnosticFlag(Boolean(offline.transformers_disabled), "开启", "关闭")}</dd></div></dl></article><article class="runtime-diagnostic-card"><h3>关键配置可见性</h3><dl><div><dt>Tools 配置</dt><dd>${diagnosticFlag(Boolean(configuration.tools_config_configured))}</dd></div><div><dt>VLM 模型</dt><dd>${diagnosticFlag(Boolean(configuration.vlm_model_configured))}</dd></div><div><dt>CUDA 设备</dt><dd>${diagnosticFlag(Boolean(configuration.cuda_visible_devices_configured))}</dd></div><div><dt>昇腾设备</dt><dd>${diagnosticFlag(Boolean(configuration.ascend_visible_devices_configured))}</dd></div><div><dt>检测到的设备</dt><dd>${devices.length ? devices.map(device => esc(`${device.vendor || "unknown"} ${device.type || "device"}`)).join("、") : "未检测到"}</dd></div></dl></article>${modelCards}${commandCards}</div>${warnings.length ? `<div class="runtime-diagnostics-warnings"><strong>诊断提示</strong><ul>${warnings.map(item => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}`;
+}
+
+async function loadRuntimeDiagnostics({force = false} = {}) {
+  if (state.runtimeDiagnosticsLoading) return;
+  if (!force && state.runtimeDiagnostics !== null) {
+    renderRuntimeDiagnostics(state.runtimeDiagnostics);
+    return;
+  }
+  const target = document.getElementById("runtime-diagnostics");
+  const button = document.getElementById("runtime-diagnostics-refresh");
+  state.runtimeDiagnosticsLoading = true;
+  button.disabled = true;
+  target.innerHTML = `<div class="empty-state">正在读取运行时诊断...</div>`;
+  try {
+    state.runtimeDiagnostics = await api("/api/diagnostics/runtime");
+    renderRuntimeDiagnostics(state.runtimeDiagnostics);
+  } catch (error) {
+    state.runtimeDiagnostics = {load_error: error.message};
+    renderRuntimeDiagnostics(state.runtimeDiagnostics);
+  } finally {
+    state.runtimeDiagnosticsLoading = false;
+    button.disabled = false;
+  }
+}
+
 function renderServicesTable() {
   const services = state.services.filter(item => state.serviceFilter === "all" || item.role === state.serviceFilter);
   document.getElementById("services-table").innerHTML = `<table><thead><tr><th>服务</th><th>角色</th><th>容器</th><th>健康</th><th>镜像/端点</th><th>操作</th></tr></thead><tbody>${services.map(service => {
@@ -370,16 +453,30 @@ function formatPageSeconds(value) {
   return `${Number(value).toFixed(2)} 秒`;
 }
 
+function formatRate(value) {
+  if (value == null || !Number.isFinite(Number(value))) return "-";
+  return `${(Number(value) * 100).toFixed(1)}%`;
+}
+
 function renderPageTimingSummary(summary) {
   if (!summary || !summary.recorded_pages) {
     return `<div class="task-timing-empty">暂无已保存的页级耗时记录</div>`;
   }
   const cards = [
     ["已记录页面", summary.recorded_pages],
+    ["完成页", summary.completed_pages || 0],
+    ["跳过/失败页", (summary.skipped_pages || 0) + (summary.failed_pages || 0)],
+    ["超时页", `${summary.timeout_pages || 0}（${formatRate(summary.timeout_rate)}）`],
+    ["发生重试页", `${summary.retry_pages || 0}（${formatRate(summary.retry_rate)}）`],
     ["平均 VLM 请求", formatPageSeconds(summary.completed_average_vlm_request_seconds)],
     ["P50", formatPageSeconds(summary.completed_p50_vlm_request_seconds)],
     ["P95", formatPageSeconds(summary.completed_p95_vlm_request_seconds)],
+    ["P99", formatPageSeconds(summary.completed_p99_vlm_request_seconds)],
     ["最慢请求", formatPageSeconds(summary.completed_max_vlm_request_seconds)],
+    ["成功尝试总时长", formatPageSeconds(summary.successful_attempt_seconds)],
+    ["失败尝试总时长", formatPageSeconds(summary.failed_attempt_seconds)],
+    ["重试等待", formatPageSeconds(summary.retry_overhead_seconds)],
+    ["含重试总耗时", formatPageSeconds(summary.with_retry_wall_seconds)],
     ["慢页数量", summary.slow_pages || 0],
   ];
   return `<div class="task-timing-summary">${cards.map(([label, value]) => `<div><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`).join("")}</div>`;
@@ -769,6 +866,89 @@ function closeProblemPagesRetry() {
   if (problemPagesRetryDialog.open) problemPagesRetryDialog.close();
 }
 
+function problemPageSourcePath(page, file, preview) {
+  return String(
+    page?.source_path
+    || page?.relative_path
+    || file?.source_path
+    || file?.relative_path
+    || preview?.source_path
+    || preview?.relative_path
+    || file?.file_name
+    || preview?.file_name
+    || "unknown.pdf"
+  ).replaceAll("\\", "/");
+}
+
+function problemPageIsTimeout(page) {
+  const text = `${page?.error_type || ""} ${page?.error || ""}`.toLowerCase();
+  return page?.status === "skipped" || /timeout|timed out|wait_timeout|超时/.test(text);
+}
+
+function extractProblemPages(detail) {
+  const previews = detail?.artifacts?.previews || detail?.previews || [];
+  const pages = [];
+  const addPage = (page, file = {}, preview = {}) => {
+    if (!page || !["skipped", "failed"].includes(String(page.status || "").toLowerCase())) return;
+    const pageNumber = Number(page.page_number ?? page.page_idx + 1);
+    if (!Number.isInteger(pageNumber) || pageNumber < 1) return;
+    const sourcePath = problemPageSourcePath(page, file, preview);
+    const key = JSON.stringify([sourcePath, pageNumber]);
+    if (pages.some(item => item.key === key)) return;
+    pages.push({
+      key,
+      source_path: sourcePath,
+      page_number: pageNumber,
+      status: String(page.status || "failed").toLowerCase(),
+      error_type: page.error_type || "",
+      error: page.error || "",
+      vlm_request_seconds: page.vlm_request_seconds ?? page.inference_seconds ?? null,
+      total_seconds: page.total_seconds ?? page.elapsed_seconds ?? null,
+    });
+  };
+  for (const preview of previews) {
+    for (const file of preview?.progress?.files || []) {
+      for (const page of file?.pages || []) addPage(page, file, preview);
+    }
+    for (const page of preview?.failed_pages || []) addPage(page, {}, preview);
+  }
+  for (const preview of detail?.progress?.files || []) {
+    for (const page of preview?.pages || []) addPage(page, preview, detail);
+  }
+  return pages.sort((left, right) => left.source_path.localeCompare(right.source_path) || left.page_number - right.page_number);
+}
+
+function renderProblemPagesSelector() {
+  const list = document.getElementById("problem-pages-list");
+  const summary = document.getElementById("problem-page-selection-summary");
+  const pages = state.problemPages;
+  const selected = pages.filter(page => state.selectedProblemPages.has(page.key)).length;
+  document.getElementById("problem-pages-select-all").disabled = !pages.length;
+  document.getElementById("problem-pages-select-none").disabled = !selected;
+  document.getElementById("problem-pages-select-timeout").disabled = !pages.some(problemPageIsTimeout);
+  document.getElementById("problem-pages-select-failed").disabled = !pages.some(page => page.status === "failed");
+  summary.textContent = pages.length
+    ? `共 ${pages.length} 页异常，已选择 ${selected} 页。默认全选；提交时只会截取选中的页面。`
+    : "没有发现可重试的跳过或失败页面。";
+  list.innerHTML = pages.length ? pages.map(page => {
+    const timeout = problemPageIsTimeout(page);
+    const timing = [
+      page.vlm_request_seconds != null ? `VLM ${formatPageSeconds(page.vlm_request_seconds)}` : "",
+      page.total_seconds != null ? `总计 ${formatPageSeconds(page.total_seconds)}` : "",
+    ].filter(Boolean).join(" · ");
+    const reason = [page.error_type, page.error].filter(Boolean).join("：");
+    return `<label class="problem-page-row"><input type="checkbox" data-problem-page-key="${esc(page.key)}" ${state.selectedProblemPages.has(page.key) ? "checked" : ""}><span class="problem-page-main"><strong>${esc(page.source_path)} · 第 ${esc(page.page_number)} 页</strong><span class="muted">${badge(page.status)}${timeout ? ' <span class="problem-page-timeout">超时</span>' : ""}${timing ? ` · ${esc(timing)}` : ""}</span>${reason ? `<small>${esc(reason)}</small>` : ""}</span></label>`;
+  }).join("") : `<div class="empty-state">该批次没有可截取的异常页。</div>`;
+  const submit = document.getElementById("submit-problem-pages-retry");
+  submit.disabled = !selected || state.problemPagesSubmitting;
+  submit.textContent = selected ? `重试 ${selected} 页` : "没有可重试页面";
+}
+
+function updateProblemPagesSelection(predicate) {
+  state.selectedProblemPages = new Set(state.problemPages.filter(predicate).map(page => page.key));
+  renderProblemPagesSelector();
+}
+
 async function openProblemPagesRetry(runId) {
   try {
     const detail = state.activeBatchId === runId && state.activeBatchDetail
@@ -780,6 +960,8 @@ async function openProblemPagesRetry(runId) {
     const settings = detail.settings || {};
     const previousTimeout = Number(settings.page_timeout_seconds) || 600;
     const suggestedTimeout = Math.min(7200, Math.max(1200, previousTimeout * 2));
+    state.problemPages = extractProblemPages(detail);
+    state.selectedProblemPages = new Set(state.problemPages.map(page => page.key));
     problemPagesRetryForm.elements.run_id.value = runId;
     problemPagesRetryForm.elements.page_timeout_seconds.value = String(suggestedTimeout);
     problemPagesRetryForm.elements.task_timeout.value = String(Math.max(
@@ -789,6 +971,7 @@ async function openProblemPagesRetry(runId) {
     problemPagesRetryForm.elements.page_connect_max_retries.value = "0";
     problemPagesRetryForm.elements.vlm_batch_size.value = "1";
     document.getElementById("problem-pages-retry-meta").textContent = `${settings.input_path || runId} · 原超时 ${previousTimeout} 秒 · 来源批次 ${runId}`;
+    renderProblemPagesSelector();
     if (!problemPagesRetryDialog.open) problemPagesRetryDialog.showModal();
   } catch (error) {
     notice(error.message);
@@ -803,19 +986,42 @@ problemPagesRetryForm.elements.page_timeout_seconds.addEventListener("change", (
   }
 });
 
+document.getElementById("problem-pages-list").addEventListener("change", event => {
+  const checkbox = event.target.closest("[data-problem-page-key]");
+  if (!checkbox) return;
+  if (checkbox.checked) state.selectedProblemPages.add(checkbox.dataset.problemPageKey);
+  else state.selectedProblemPages.delete(checkbox.dataset.problemPageKey);
+  renderProblemPagesSelector();
+});
+document.getElementById("problem-pages-select-all").addEventListener("click", () => updateProblemPagesSelection(() => true));
+document.getElementById("problem-pages-select-none").addEventListener("click", () => updateProblemPagesSelection(() => false));
+document.getElementById("problem-pages-select-timeout").addEventListener("click", () => updateProblemPagesSelection(problemPageIsTimeout));
+document.getElementById("problem-pages-select-failed").addEventListener("click", () => updateProblemPagesSelection(page => page.status === "failed"));
+
 problemPagesRetryForm.addEventListener("submit", async event => {
   event.preventDefault();
+  if (state.problemPagesSubmitting) return;
   const runId = problemPagesRetryForm.elements.run_id.value;
+  const selectedPages = state.problemPages.filter(page => state.selectedProblemPages.has(page.key));
+  if (!selectedPages.length) {
+    notice("请至少选择一个异常页");
+    return;
+  }
   const submitButton = document.getElementById("submit-problem-pages-retry");
   const payload = {
     page_timeout_seconds: Number(problemPagesRetryForm.elements.page_timeout_seconds.value),
     task_timeout: Number(problemPagesRetryForm.elements.task_timeout.value),
     page_connect_max_retries: Number(problemPagesRetryForm.elements.page_connect_max_retries.value),
     vlm_batch_size: Number(problemPagesRetryForm.elements.vlm_batch_size.value),
+    selected_pages: selectedPages.map(page => ({
+      source_path: page.source_path,
+      page_number: page.page_number,
+    })),
   };
   try {
-    submitButton.disabled = true;
-    submitButton.textContent = "正在截取异常页";
+    state.problemPagesSubmitting = true;
+    renderProblemPagesSelector();
+    submitButton.textContent = `正在截取 ${selectedPages.length} 页`;
     const result = await api(`/api/batch-runs/${encodeURIComponent(runId)}/retry-problem-pages`, {
       method: "POST",
       body: JSON.stringify(payload),
@@ -826,8 +1032,8 @@ problemPagesRetryForm.addEventListener("submit", async event => {
   } catch (error) {
     notice(error.message);
   } finally {
-    submitButton.disabled = false;
-    submitButton.textContent = "截取并开始重试";
+    state.problemPagesSubmitting = false;
+    renderProblemPagesSelector();
   }
 });
 
@@ -1496,9 +1702,154 @@ function renderConfig() {
   document.getElementById("config-agent-status").innerHTML = config.ok === false ? badge("unavailable") : badge("healthy");
   document.getElementById("config-env-file").textContent = config.env_file || "-";
   document.getElementById("config-modified-at").textContent = formatDate(config.modified_at);
+  const versionElement = document.getElementById("config-version");
+  const shaElement = document.getElementById("config-sha256");
+  const hashElement = document.getElementById("config-hash");
+  const overallElement = document.getElementById("config-application-overall");
+  if (versionElement) versionElement.textContent = config.version || "-";
+  if (shaElement) {
+    shaElement.textContent = config.sha256 ? config.sha256.slice(0, 12) : "-";
+    shaElement.title = config.sha256 || "";
+  }
+  if (hashElement) {
+    hashElement.textContent = config.config_hash ? config.config_hash.slice(0, 12) : "-";
+    hashElement.title = config.config_hash || "";
+  }
+  if (overallElement) overallElement.innerHTML = badge(state.configStatus?.overall || "unknown");
   const groups = new Map();
   for (const item of items) groups.set(item.category || "其他配置", [...(groups.get(item.category || "其他配置") || []), item]);
   document.getElementById("config-groups").innerHTML = [...groups.entries()].map(([category, group]) => `<section class="panel config-group"><div class="section-heading"><h2>${esc(category)}</h2><span>${group.length} 项</span></div>${group.map(item => configControl(item)).join("")}</section>`).join("") || `<div class="empty-state">没有可显示的配置。</div>`;
+}
+
+function configStatusValue(value) {
+  if (value == null || value === "") return "-";
+  return String(value);
+}
+
+function configMismatchHtml(item) {
+  const mismatch = typeof item === "string" ? {key: item, sensitive: false} : (item || {});
+  const detail = mismatch.missing
+    ? "：容器未加载该变量"
+    : mismatch.sensitive
+      ? "：敏感值不一致"
+      : "：当前容器值与 env.multi 不一致";
+  return `<li class="config-mismatch-item"><strong>${esc(mismatch.key || "未知配置")}</strong>${detail}</li>`;
+}
+
+function renderConfigStatus(payload = state.configStatus) {
+  const target = document.getElementById("config-application-status");
+  if (!target) return;
+  if (!payload) {
+    target.innerHTML = `<div class="empty-state">暂无配置生效状态</div>`;
+    return;
+  }
+  if (payload.load_error || payload.ok === false) {
+    target.innerHTML = `<div class="empty-state bad-text">配置生效状态读取失败：${esc(payload.load_error || payload.error || "未知错误")}</div>`;
+    return;
+  }
+  const env = payload.env_file || {};
+  const summary = payload.summary || {};
+  const services = payload.services && typeof payload.services === "object" ? payload.services : {};
+  const serviceEntries = Object.entries(services);
+  const counts = [
+    ["已生效", summary.applied || 0, "good"],
+    ["等待重启", summary.pending_restart || 0, "warn"],
+    ["未知", summary.unknown || 0, "bad"],
+    ["容器未创建", summary.not_created || 0, "warn"],
+  ];
+  const countHtml = counts.map(([label, value, cls]) => `<div class="config-status-count"><span>${label}</span><strong class="${cls}">${esc(value)}</strong></div>`).join("");
+  const serviceHtml = serviceEntries.length ? serviceEntries.map(([name, service]) => {
+    const mismatches = Array.isArray(service.mismatched_keys) ? service.mismatched_keys : [];
+    const missing = Array.isArray(service.missing_keys) ? service.missing_keys : [];
+    const warnings = Array.isArray(service.warnings) ? service.warnings : [];
+    const stateText = configStatusValue(service.state);
+    const healthText = configStatusValue(service.health);
+    const restartText = service.status === "applied"
+      ? "无需重启"
+      : service.status === "pending_restart"
+        ? "需要重启"
+        : "暂无法确认";
+    return `<article class="config-service-status"><div class="section-heading"><div><h3>${esc(name)}</h3><p class="muted mono">${esc(service.container || "容器未创建")}</p></div>${badge(service.status || "unknown")}</div><dl><div><dt>容器状态</dt><dd>${esc(stateText)}</dd></div><div><dt>健康状态</dt><dd>${esc(healthText)}</dd></div><div><dt>配置应用</dt><dd>${esc(restartText)}</dd></div><div><dt>比对变量</dt><dd>${esc(service.compared_keys?.length || 0)} 项（匹配 ${esc(service.matching_keys?.length || 0)}）</dd></div></dl>${mismatches.length || missing.length ? `<div class="config-mismatch-list"><strong>不一致项</strong><ul>${mismatches.map(configMismatchHtml).join("")}${missing.map(key => configMismatchHtml({key, sensitive: false, missing: true})).join("")}</ul></div>` : `<p class="muted">${service.status === "applied" ? "已比对白名单变量，未发现不一致。" : "暂无法确认配置是否已生效。"}</p>`}${warnings.length ? `<div class="config-diagnostic-warning"><strong>提示</strong><ul>${warnings.map(item => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}</article>`;
+  }).join("") : `<div class="empty-state">没有可检查的服务。</div>`;
+  target.innerHTML = `<div class="config-status-meta"><span>检查时间：${esc(formatDate(payload.generated_at))}</span><span>Env 版本：${esc(env.version || "-")}</span><span title="${esc(env.sha256 || "")}">SHA256：${esc(env.sha256 ? env.sha256.slice(0, 12) : "-")}</span><span title="${esc(env.config_hash || "")}">配置 Hash：${esc(env.config_hash ? env.config_hash.slice(0, 12) : "-")}</span></div><div class="config-status-counts">${countHtml}</div><div class="config-status-grid">${serviceHtml}</div>${Array.isArray(payload.warnings) && payload.warnings.length ? `<div class="config-diagnostic-warning"><strong>整体提示</strong><ul>${payload.warnings.map(item => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}`;
+}
+
+async function loadConfigStatus({force = false} = {}) {
+  if (state.configStatusLoading) return;
+  if (!force && state.configStatus !== null) {
+    renderConfigStatus();
+    renderConfig();
+    return;
+  }
+  const target = document.getElementById("config-application-status");
+  const button = document.getElementById("config-status-refresh");
+  state.configStatusLoading = true;
+  if (button) button.disabled = true;
+  if (target) target.innerHTML = `<div class="empty-state">正在读取配置实际生效状态...</div>`;
+  try {
+    state.configStatus = await api("/api/config/status");
+    renderConfigStatus();
+    renderConfig();
+  } catch (error) {
+    state.configStatus = {load_error: error.message};
+    renderConfigStatus();
+    renderConfig();
+  } finally {
+    state.configStatusLoading = false;
+    if (button) button.disabled = false;
+  }
+}
+
+function diagnosticJson(value, emptyText) {
+  if (value == null || (Array.isArray(value) && value.length === 0) || (typeof value === "object" && !Array.isArray(value) && Object.keys(value).length === 0)) {
+    return `<span class="muted">${esc(emptyText)}</span>`;
+  }
+  return `<pre>${esc(JSON.stringify(value, null, 2))}</pre>`;
+}
+
+function renderDeepDiagnostics(payload = state.deepDiagnostics) {
+  const target = document.getElementById("deep-diagnostics");
+  if (!target) return;
+  if (!payload) {
+    target.innerHTML = `<div class="empty-state">暂无深度诊断信息</div>`;
+    return;
+  }
+  if (payload.load_error || payload.ok === false) {
+    target.innerHTML = `<div class="empty-state bad-text">深度诊断读取失败：${esc(payload.load_error || payload.error || "未知错误")}</div>`;
+    return;
+  }
+  const services = payload.services && typeof payload.services === "object" ? payload.services : {};
+  const cards = Object.entries(services).map(([name, service]) => {
+    const models = Array.isArray(service.models) ? service.models : [];
+    const mounts = Array.isArray(service.mounts) ? service.mounts : [];
+    const warnings = Array.isArray(service.warnings) ? service.warnings : [];
+    const modelText = models.length ? diagnosticJson(models, "未发现可检查的绝对模型路径") : `<p class="muted">未发现可检查的绝对模型路径</p>`;
+    return `<article class="deep-service-card"><div class="section-heading"><div><h3>${esc(name)}</h3><p class="muted mono">${esc(service.container || "容器未创建")}</p></div>${badge(service.status || "unknown")}</div><dl><div><dt>镜像</dt><dd class="mono">${esc(service.image || "-")}</dd></div><div><dt>运行状态</dt><dd>${esc(service.state || "-")} / ${esc(service.health || "-")}</dd></div><div><dt>配置应用</dt><dd>${service.status === "applied" ? "无需重启" : service.status === "pending_restart" ? "需要重启" : "暂无法确认"}</dd></div></dl><details open><summary>实际环境变量</summary>${diagnosticJson(service.environment, "未读取到可展示的 MinerU 环境变量")}</details><details><summary>模型路径检查</summary>${modelText}</details><details><summary>容器挂载</summary>${diagnosticJson(mounts, "未发现容器挂载")}</details><details><summary>设备检测</summary>${diagnosticJson(service.devices, "未执行设备检测")}</details>${warnings.length ? `<div class="deep-diagnostic-warning"><strong>诊断提示</strong><ul>${warnings.map(item => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}</article>`;
+  }).join("");
+  target.innerHTML = `<div class="config-status-meta"><span>检查时间：${esc(formatDate(payload.generated_at))}</span><span>Env 文件：${esc(payload.env_file?.path || payload.env_file?.name || "-")}</span><span>总体状态：${badge(payload.overall || "unknown")}</span></div><div class="deep-service-grid">${cards || `<div class="empty-state">没有可诊断的服务。</div>`}</div>${Array.isArray(payload.warnings) && payload.warnings.length ? `<div class="deep-diagnostic-warning"><strong>整体提示</strong><ul>${payload.warnings.map(item => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}`;
+}
+
+async function loadDeepDiagnostics({force = false} = {}) {
+  if (state.deepDiagnosticsLoading) return;
+  if (!force && state.deepDiagnostics !== null) {
+    renderDeepDiagnostics();
+    return;
+  }
+  const target = document.getElementById("deep-diagnostics");
+  const button = document.getElementById("deep-diagnostics-refresh");
+  state.deepDiagnosticsLoading = true;
+  if (button) button.disabled = true;
+  if (target) target.innerHTML = `<div class="empty-state">正在读取跨容器深度诊断...</div>`;
+  try {
+    state.deepDiagnostics = await api("/api/diagnostics/deep");
+    renderDeepDiagnostics();
+  } catch (error) {
+    state.deepDiagnostics = {load_error: error.message};
+    renderDeepDiagnostics();
+  } finally {
+    state.deepDiagnosticsLoading = false;
+    if (button) button.disabled = false;
+  }
 }
 
 function configChangeHtml(change) {
@@ -1563,9 +1914,86 @@ async function loadConfig() {
   renderConfigHistory();
   renderConfigPlan();
   setConfigBusy(false);
+  void loadConfigStatus({force: true});
   const status = document.getElementById("config-validation-status");
   status.textContent = "修改输入框后先预览变更；确认后才会写入并重建受影响服务。";
   status.classList.remove("bad-text");
+  void loadAuditLogs();
+}
+
+function auditDetailText(detail) {
+  if (detail == null || detail === "") return "-";
+  if (typeof detail === "object") return JSON.stringify(detail, null, 2);
+  try {
+    const parsed = JSON.parse(detail);
+    return parsed && typeof parsed === "object"
+      ? JSON.stringify(parsed, null, 2)
+      : String(detail);
+  } catch {
+    return String(detail);
+  }
+}
+
+function renderAuditLogs(payload) {
+  const target = document.getElementById("audit-log");
+  if (payload?.load_error) {
+    target.innerHTML = `<div class="empty-state bad-text">审计记录读取失败：${esc(payload.load_error)}</div>`;
+    return;
+  }
+  const items = Array.isArray(payload?.items) ? payload.items : [];
+  const total = Number(payload?.total || 0);
+  if (!items.length) {
+    target.innerHTML = `<div class="empty-state">暂无操作审计记录</div>`;
+    return;
+  }
+  const rows = items.map(item => {
+    const success = Boolean(item.success);
+    const result = success
+      ? `<span class="diagnostic-state good">成功</span>`
+      : `<span class="diagnostic-state bad">失败</span>`;
+    return `<tr><td>${esc(formatDate(item.created_at))}</td><td>${esc(item.action || "-")}</td><td>${esc(item.target || "-")}</td><td>${result}</td><td><pre class="audit-detail">${esc(auditDetailText(item.detail))}</pre></td></tr>`;
+  }).join("");
+  const hasMore = items.length < total;
+  target.innerHTML = `<div class="audit-table-wrap"><table class="audit-table"><thead><tr><th>时间</th><th>操作</th><th>对象</th><th>结果</th><th>详情</th></tr></thead><tbody>${rows}</tbody></table></div>${hasMore ? `<button type="button" class="secondary-button audit-load-more" data-audit-load-more>加载更多（${esc(items.length)}/${esc(total)}）</button>` : `<p class="muted audit-load-more">已显示全部 ${esc(total)} 条记录</p>`}`;
+}
+
+async function loadAuditLogs({append = false} = {}) {
+  if (state.auditLoading) return;
+  const target = document.getElementById("audit-log");
+  const button = document.getElementById("audit-refresh");
+  const existingItems = append && Array.isArray(state.auditLogs?.items)
+    ? state.auditLogs.items
+    : [];
+  const offset = append ? existingItems.length : 0;
+  state.auditLoading = true;
+  button.disabled = true;
+  if (!append) target.innerHTML = `<div class="empty-state">正在读取操作审计...</div>`;
+  try {
+    const payload = await api(`/api/audit?limit=${AUDIT_PAGE_SIZE}&offset=${offset}`);
+    const nextItems = Array.isArray(payload.items) ? payload.items : [];
+    state.auditLogs = {
+      ...payload,
+      offset: 0,
+      items: append ? [...existingItems, ...nextItems] : nextItems,
+    };
+    state.auditOffset = state.auditLogs.items.length;
+    renderAuditLogs(state.auditLogs);
+  } catch (error) {
+    if (append && existingItems.length) {
+      state.auditLogs = {...state.auditLogs, load_more_error: error.message};
+      renderAuditLogs(state.auditLogs);
+      const message = document.createElement("p");
+      message.className = "runtime-diagnostic-error";
+      message.textContent = `加载更多失败：${error.message}`;
+      target.appendChild(message);
+    } else {
+      state.auditLogs = {items: [], total: 0, load_error: error.message};
+      renderAuditLogs(state.auditLogs);
+    }
+  } finally {
+    state.auditLoading = false;
+    button.disabled = false;
+  }
 }
 
 async function validateConfig() {
@@ -1712,12 +2140,37 @@ document.getElementById("config-history").addEventListener("click", event => {
   const button = event.target.closest("[data-config-restore]");
   if (button) restoreConfig(button.dataset.configRestore);
 });
+document.getElementById("runtime-diagnostics-refresh").addEventListener("click", () => {
+  void loadRuntimeDiagnostics({force: true});
+});
+document.getElementById("config-status-refresh")?.addEventListener("click", () => {
+  void loadConfigStatus({force: true});
+});
+document.getElementById("deep-diagnostics-refresh")?.addEventListener("click", () => {
+  void loadDeepDiagnostics({force: true});
+});
+document.getElementById("audit-refresh").addEventListener("click", () => {
+  void loadAuditLogs();
+});
+document.getElementById("audit-log").addEventListener("click", event => {
+  if (event.target.closest("[data-audit-load-more]")) {
+    void loadAuditLogs({append: true});
+  }
+});
 
 async function refreshCurrent() {
   notice("");
   try {
     if (state.view === "overview") await loadOverview();
-    else if (state.view === "services") await loadServices();
+    else if (state.view === "services") {
+      await loadServices();
+      if (state.runtimeDiagnostics === null) {
+        void loadRuntimeDiagnostics();
+      }
+      if (state.deepDiagnostics === null) {
+        void loadDeepDiagnostics();
+      }
+    }
     else if (state.view === "tasks") await refreshTasksView();
     else if (state.view === "batch") await loadBatches();
     else if (state.view === "lab") await loadLab();

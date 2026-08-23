@@ -16,6 +16,7 @@ import shutil
 import signal
 import sqlite3
 import struct
+import subprocess
 import time
 import uuid
 import zipfile
@@ -652,7 +653,8 @@ class OpsStore:
         query += " ORDER BY page_number ASC"
         with self.connect() as connection:
             rows = connection.execute(query, params).fetchall()
-        records = [dict(row) for row in rows]
+            records = [dict(row) for row in rows]
+            self._attach_page_attempts(connection, task_id, records)
         durations = sorted(
             float(row["vlm_request_seconds"])
             for row in records
@@ -681,6 +683,31 @@ class OpsStore:
             key=lambda row: float(row["vlm_request_seconds"]),
             reverse=True,
         )
+
+        def is_timeout(row: dict[str, Any]) -> bool:
+            error_type = str(row.get("error_type") or "").lower()
+            error = str(row.get("error") or "").lower()
+            return any(token in error_type or token in error for token in ("timeout", "timed out", "wait_timeout"))
+
+        timeout_pages = sum(is_timeout(row) for row in records)
+        retry_pages = sum(
+            int(row.get("attempts") or 1) > 1
+            or len(row.get("attempt_details") or []) > 1
+            for row in records
+        )
+        successful_attempt_seconds = round(sum(
+            float(row.get("successful_attempt_seconds") or 0.0) for row in records
+        ), 3)
+        failed_attempt_seconds = round(sum(
+            float(row.get("failed_attempt_seconds") or 0.0) for row in records
+        ), 3)
+        retry_overhead_seconds = round(sum(
+            float(row.get("retry_overhead_seconds") or 0.0) for row in records
+        ), 3)
+        with_retry_wall_seconds = round(sum(
+            float(row.get("total_seconds") or row.get("elapsed_seconds") or 0.0)
+            for row in records
+        ), 3)
         return {
             "task_id": task_id,
             "recorded_pages": len(records),
@@ -691,11 +718,20 @@ class OpsStore:
             if durations else None,
             "completed_p50_vlm_request_seconds": percentile(0.50),
             "completed_p95_vlm_request_seconds": percentile(0.95),
+            "completed_p99_vlm_request_seconds": percentile(0.99),
             "completed_max_vlm_request_seconds": round(max(durations), 3)
             if durations else None,
             "slow_page_seconds": slow_page_seconds,
             "slow_pages": len(slow_pages),
             "slowest_pages": slow_pages[:10],
+            "timeout_pages": timeout_pages,
+            "timeout_rate": round(timeout_pages / len(records), 4) if records else 0.0,
+            "retry_pages": retry_pages,
+            "retry_rate": round(retry_pages / len(records), 4) if records else 0.0,
+            "successful_attempt_seconds": successful_attempt_seconds,
+            "failed_attempt_seconds": failed_attempt_seconds,
+            "retry_overhead_seconds": retry_overhead_seconds,
+            "with_retry_wall_seconds": with_retry_wall_seconds,
         }
 
     def cached_tasks(self, limit: int = 100) -> list[dict[str, Any]]:
@@ -785,6 +821,29 @@ class OpsStore:
                 (utc_now_iso(), action, target, 1 if success else 0, detail[:4000]),
             )
 
+    def list_audit_logs(self, limit: int = 100, offset: int = 0) -> dict[str, Any]:
+        normalized_limit = min(max(int(limit), 1), 500)
+        normalized_offset = max(int(offset), 0)
+        with self.connect() as connection:
+            total = int(connection.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0])
+            rows = connection.execute(
+                "SELECT id, created_at, action, target, success, detail "
+                "FROM audit_log ORDER BY id DESC LIMIT ? OFFSET ?",
+                (normalized_limit, normalized_offset),
+            ).fetchall()
+        return {
+            "items": [
+                {
+                    **dict(row),
+                    "success": bool(row["success"]),
+                }
+                for row in rows
+            ],
+            "total": total,
+            "limit": normalized_limit,
+            "offset": normalized_offset,
+        }
+
     def delete_batch_run(self, run_id: str) -> None:
         with self.connect() as connection:
             connection.execute("DELETE FROM batch_runs WHERE run_id = ?", (run_id,))
@@ -820,11 +879,17 @@ class BatchRunRequest(BaseModel):
     experiment_type: Literal["batch_test", "performance_lab"] = "batch_test"
 
 
+class ProblemPageSelection(BaseModel):
+    source_path: str = Field(min_length=1, max_length=4096)
+    page_number: int = Field(ge=1)
+
+
 class ProblemPagesRetryRequest(BaseModel):
     task_timeout: int = Field(default=7200, ge=60, le=86400)
     page_timeout_seconds: float = Field(default=1200.0, ge=1, le=7200)
     page_connect_max_retries: int = Field(default=0, ge=0, le=3)
     vlm_batch_size: int = Field(default=1, ge=1, le=32)
+    selected_pages: list[ProblemPageSelection] | None = None
 
 
 class ConfigValidateRequest(BaseModel):
@@ -911,6 +976,131 @@ class OpsRuntime:
         self.save_result_images = env_bool("MINERU_OPS_SAVE_RESULT_IMAGES", True)
         self.cleanup_expired_artifacts()
         self.http_client = httpx.AsyncClient(timeout=15.0, follow_redirects=True)
+
+    @staticmethod
+    def _safe_command(command: list[str], timeout: float = 3.0) -> dict[str, Any]:
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except FileNotFoundError:
+            return {"available": False, "ok": False, "error": "command not found"}
+        except subprocess.TimeoutExpired:
+            return {"available": True, "ok": False, "error": f"timed out after {timeout:g}s"}
+        except OSError as exc:
+            return {"available": False, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        stdout = result.stdout.strip()
+        stderr = result.stderr.strip()
+        return {
+            "available": True,
+            "ok": result.returncode == 0,
+            "return_code": result.returncode,
+            "stdout": stdout[:12000],
+            "stderr": stderr[:4000],
+            "truncated": len(stdout) > 12000 or len(stderr) > 4000,
+        }
+
+    @staticmethod
+    def _model_path_status(path: Path, *, max_files: int = 5000) -> dict[str, Any]:
+        status: dict[str, Any] = {
+            "name": path.name or str(path),
+            "path": str(path),
+            "exists": path.exists(),
+            "readable": False,
+            "size_bytes": 0,
+            "file_count": 0,
+            "scan_limited": False,
+            "load_state": "unknown",
+        }
+        if not status["exists"]:
+            return status
+        status["readable"] = os.access(path, os.R_OK)
+        if not path.is_dir():
+            try:
+                status["size_bytes"] = path.stat().st_size
+                status["file_count"] = 1
+            except OSError as exc:
+                status["scan_error"] = f"{type(exc).__name__}: {exc}"
+            return status
+        try:
+            for root, _dirs, files in os.walk(path):
+                for name in files:
+                    status["file_count"] += 1
+                    try:
+                        status["size_bytes"] += (Path(root) / name).stat().st_size
+                    except OSError:
+                        continue
+                    if status["file_count"] >= max_files:
+                        status["scan_limited"] = True
+                        return status
+        except OSError as exc:
+            status["scan_error"] = f"{type(exc).__name__}: {exc}"
+        return status
+
+    def runtime_diagnostics(self) -> dict[str, Any]:
+        raw_source = os.getenv("MINERU_MODEL_SOURCE", "").strip().lower()
+        known_sources = {"local", "modelscope", "huggingface"}
+        model_source = raw_source if raw_source in known_sources else "unknown"
+
+        def enabled(name: str) -> bool:
+            return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+        model_paths = [Path("/models/pipeline")]
+        configured_model = os.getenv("MINERU_VLM_MODEL", "").strip()
+        if configured_model and (configured_model.startswith("/") or configured_model.startswith(".")):
+            configured_path = Path(configured_model).expanduser()
+            if configured_path not in model_paths:
+                model_paths.append(configured_path)
+
+        commands = {
+            "nvidia_smi": self._safe_command(["nvidia-smi"]),
+            "npu_smi": self._safe_command(["npu-smi", "info"]),
+        }
+        devices = []
+        if commands["nvidia_smi"].get("ok"):
+            devices.append({"type": "gpu", "vendor": "nvidia", "detected": True})
+        if commands["npu_smi"].get("ok"):
+            devices.append({"type": "npu", "vendor": "ascend", "detected": True})
+
+        warnings = []
+        if model_source == "unknown":
+            warnings.append("MINERU_MODEL_SOURCE is unset or unsupported")
+        if model_source == "local" and not Path("/models/pipeline").is_dir():
+            warnings.append("local model source is configured but /models/pipeline is unavailable")
+        if not devices:
+            warnings.append("no GPU/NPU management command is available in the ops container")
+
+        return {
+            "generated_at": utc_now_iso(),
+            "offline": {
+                "configured": model_source == "local" or all(
+                    enabled(name)
+                    for name in ("MODELSCOPE_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
+                ),
+                "model_source": model_source,
+                "modelscope_disabled": enabled("MODELSCOPE_OFFLINE"),
+                "huggingface_disabled": enabled("HF_HUB_OFFLINE"),
+                "transformers_disabled": enabled("TRANSFORMERS_OFFLINE"),
+                "network_access": "not_checked",
+            },
+            "configuration": {
+                "tools_config_configured": bool(os.getenv("MINERU_TOOLS_CONFIG_JSON", "").strip()),
+                "vlm_model_configured": bool(configured_model),
+                "cuda_visible_devices_configured": bool(os.getenv("CUDA_VISIBLE_DEVICES", "").strip()),
+                "ascend_visible_devices_configured": bool(
+                    os.getenv("ASCEND_RT_VISIBLE_DEVICES", "").strip()
+                    or os.getenv("NPU_VISIBLE_DEVICES", "").strip()
+                ),
+            },
+            "models": [self._model_path_status(path) for path in model_paths],
+            "devices": devices,
+            "commands": commands,
+            "warnings": warnings,
+        }
 
     async def start(self) -> None:
         if self.task_sync_task is None or self.task_sync_task.done():
@@ -1299,9 +1489,26 @@ class OpsRuntime:
 
     @classmethod
     def _problem_pages_from_preview(cls, preview: dict[str, Any]) -> list[dict[str, Any]]:
-        by_page_number: dict[int, dict[str, Any]] = {}
+        by_page: dict[tuple[str, int], dict[str, Any]] = {}
 
-        def add_page(page: Any, *, default_status: str | None = None) -> None:
+        def source_path_for(value: dict[str, Any], fallback: str = "") -> str:
+            return str(
+                value.get("source_path")
+                or value.get("relative_path")
+                or value.get("file_name")
+                or fallback
+                or preview.get("relative_path")
+                or preview.get("file_name")
+                or ""
+            )
+
+        def add_page(
+            page: Any,
+            *,
+            default_status: str | None = None,
+            source_path: str = "",
+            source_file: str = "",
+        ) -> None:
             if not isinstance(page, dict):
                 return
             status = str(page.get("status") or default_status or "")
@@ -1310,25 +1517,77 @@ class OpsRuntime:
             page_number = cls._failed_page_number(page)
             if page_number is None:
                 return
-            previous = by_page_number.get(page_number, {})
-            by_page_number[page_number] = {
+            resolved_source_path = source_path_for(page, source_path)
+            key = (resolved_source_path, page_number)
+            previous = by_page.get(key, {})
+            by_page[key] = {
                 **previous,
                 **page,
+                "source_path": resolved_source_path,
+                "source_file": str(
+                    page.get("source_file")
+                    or source_file
+                    or Path(resolved_source_path).name
+                ),
                 "page_idx": page_number - 1,
                 "page_number": page_number,
                 "status": status,
             }
 
         progress = preview.get("progress")
+        progress_source_paths: list[str] = []
         if isinstance(progress, dict):
-            for file_state in progress.get("files") or []:
-                if not isinstance(file_state, dict):
-                    continue
+            progress_files = [
+                item
+                for item in (progress.get("files") or [])
+                if isinstance(item, dict)
+            ]
+            preview_source_path = str(
+                preview.get("relative_path")
+                or preview.get("source_path")
+                or preview.get("file_name")
+                or ""
+            )
+            for file_state in progress_files:
+                explicit_source_path = str(
+                    file_state.get("source_path")
+                    or file_state.get("relative_path")
+                    or ""
+                )
+                file_name = str(file_state.get("file_name") or "")
+                if explicit_source_path:
+                    file_source_path = explicit_source_path
+                elif (
+                    len(progress_files) == 1
+                    and preview_source_path
+                    and (
+                        not file_name
+                        or Path(preview_source_path).name == Path(file_name).name
+                    )
+                ):
+                    file_source_path = preview_source_path
+                else:
+                    file_source_path = file_name or source_path_for(file_state)
+                progress_source_paths.append(file_source_path)
+                file_source_file = file_name or Path(file_source_path).name
                 for page in file_state.get("pages") or []:
-                    add_page(page)
+                    add_page(
+                        page,
+                        source_path=file_source_path,
+                        source_file=file_source_file,
+                    )
+        unique_progress_sources = list(dict.fromkeys(filter(None, progress_source_paths)))
+        failed_page_fallback = unique_progress_sources[0] if len(unique_progress_sources) == 1 else ""
         for page in preview.get("failed_pages") or []:
-            add_page(page, default_status="skipped")
-        return [by_page_number[number] for number in sorted(by_page_number)]
+            add_page(
+                page,
+                default_status="skipped",
+                source_path=failed_page_fallback,
+            )
+        return [
+            by_page[key]
+            for key in sorted(by_page, key=lambda item: (item[0], item[1]))
+        ]
 
     def _write_problem_pages(
         self,
@@ -1336,31 +1595,77 @@ class OpsRuntime:
         output_dir: Path,
         *,
         output_prefix: str,
+        selected_pages: list[ProblemPageSelection] | None = None,
     ) -> dict[str, Any]:
         artifacts = self.batch_artifacts(record)
         originals_by_path = {
             str(item.get("path") or ""): item
             for item in artifacts["originals"]
         }
-        problem_sources = []
+        problem_sources: dict[str, dict[str, Any]] = {}
+        available_pages: dict[tuple[str, int], dict[str, Any]] = {}
         for preview in artifacts["previews"]:
             pages = self._problem_pages_from_preview(preview)
-            if pages:
-                problem_sources.append((preview, pages))
+            for page in pages:
+                source_path = str(page.get("source_path") or "")
+                source_file = str(page.get("source_file") or Path(source_path).name)
+                key = (source_path, int(page["page_number"]))
+                available_pages[key] = page
+                group = problem_sources.setdefault(
+                    source_path,
+                    {
+                        "preview": preview,
+                        "source_path": source_path,
+                        "source_file": source_file,
+                        "pages": [],
+                    },
+                )
+                group["pages"].append(page)
         if not problem_sources:
             raise HTTPException(status_code=404, detail="no skipped or failed pages are available")
+
+        if selected_pages is not None:
+            if not selected_pages:
+                raise HTTPException(status_code=400, detail="select at least one problem page")
+            selected_keys = {
+                (selection.source_path, selection.page_number)
+                for selection in selected_pages
+            }
+            missing_keys = sorted(selected_keys - set(available_pages))
+            if missing_keys:
+                examples = ", ".join(f"{path} p{page}" for path, page in missing_keys[:5])
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"selected page is not skipped or failed: {examples}",
+                )
+            filtered_sources: dict[str, dict[str, Any]] = {}
+            for source_path, group in problem_sources.items():
+                selected_for_source = [
+                    page
+                    for page in group["pages"]
+                    if (str(page.get("source_path") or ""), int(page["page_number"])) in selected_keys
+                ]
+                if selected_for_source:
+                    filtered_sources[source_path] = {
+                        **group,
+                        "pages": selected_for_source,
+                    }
+            problem_sources = filtered_sources
 
         shutil.rmtree(output_dir, ignore_errors=True)
         output_dir.mkdir(parents=True, exist_ok=True)
         manifest_rows: list[dict[str, Any]] = []
 
-        for position, (preview, pages) in enumerate(problem_sources, start=1):
-            relative_path = str(preview.get("relative_path") or preview.get("file_name") or "")
+        for position, group in enumerate(problem_sources.values(), start=1):
+            preview = group["preview"]
+            pages = group["pages"]
+            relative_path = str(group["source_path"])
+            source_file = str(group["source_file"] or Path(relative_path).name)
             original = originals_by_path.get(relative_path)
             if original is None:
                 same_name = [
                     item for item in artifacts["originals"]
-                    if str(item.get("name") or "") == str(preview.get("file_name") or "")
+                    if str(item.get("name") or "") == source_file
                 ]
                 if len(same_name) == 1:
                     original = same_name[0]
@@ -1371,12 +1676,14 @@ class OpsRuntime:
                     "status": str(page.get("status") or "unknown"),
                     "error_type": page.get("error_type"),
                     "error": page.get("error"),
+                    "vlm_request_seconds": page.get("vlm_request_seconds"),
+                    "total_seconds": page.get("total_seconds"),
                 }
                 for page in pages
             ]
             row: dict[str, Any] = {
                 "source_path": relative_path,
-                "source_file": str(preview.get("file_name") or Path(relative_path).name),
+                "source_file": source_file,
                 "task_id": preview.get("task_id"),
                 "original_page_numbers": page_numbers,
                 "exported_page_count": 0,
@@ -1529,6 +1836,7 @@ class OpsRuntime:
                 record,
                 staging_dir,
                 output_prefix="",
+                selected_pages=overrides.selected_pages,
             )
             if extraction["exported_pdf_count"] == 0:
                 errors = [
@@ -2849,6 +3157,20 @@ def create_app() -> FastAPI:
         authorize(request)
         return await config_agent_call("config_history")
 
+    @app.get("/api/config/status")
+    async def config_status_view(request: Request):
+        authorize(request)
+        return await config_agent_call("config_status", timeout=45)
+
+    @app.get("/api/audit")
+    async def audit_logs_view(
+        request: Request,
+        limit: int = 100,
+        offset: int = 0,
+    ):
+        authorize(request)
+        return runtime.store.list_audit_logs(limit=limit, offset=offset)
+
     @app.get("/api/services")
     async def services_view(request: Request):
         authorize(request)
@@ -2862,6 +3184,16 @@ def create_app() -> FastAPI:
             if not agent_result.get("ok"):
                 service["agent_error"] = agent_result.get("error")
         return health_results
+
+    @app.get("/api/diagnostics/runtime")
+    async def runtime_diagnostics_view(request: Request):
+        authorize(request)
+        return await asyncio.to_thread(runtime.runtime_diagnostics)
+
+    @app.get("/api/diagnostics/deep")
+    async def deep_diagnostics_view(request: Request):
+        authorize(request)
+        return await config_agent_call("deep_diagnostics", timeout=90)
 
     @app.post("/api/services/{service_name}/actions/{action}")
     async def service_action(service_name: str, action: str, request: Request):

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MinerU 运维控制台</title>
-  <link rel="stylesheet" href="/assets/ops.css?v=ui11">
+  <link rel="stylesheet" href="/assets/ops.css?v=ui13">
 </head>
 <body>
   <div class="shell">
@@ -77,6 +77,26 @@
           </div>
         </div>
         <div id="services-table" class="table-wrap panel"></div>
+        <section class="panel runtime-diagnostics-panel">
+          <div class="section-heading">
+            <div>
+              <h2>运行时诊断</h2>
+              <p class="muted">只读取当前 ops 容器可见配置、模型路径和设备信息，不联网、不下载模型。</p>
+            </div>
+            <button id="runtime-diagnostics-refresh" type="button" class="secondary-button">刷新诊断</button>
+          </div>
+          <div id="runtime-diagnostics"><div class="empty-state">进入服务页后读取诊断信息</div></div>
+        </section>
+        <section class="panel deep-diagnostics-panel">
+          <div class="section-heading">
+            <div>
+              <h2>跨容器深度诊断</h2>
+              <p class="muted">由宿主机 Agent 检查 API、Router 和 Ops 的实际配置、模型目录、挂载及设备；不会联网或加载模型。</p>
+            </div>
+            <button id="deep-diagnostics-refresh" type="button" class="secondary-button">刷新深度诊断</button>
+          </div>
+          <div id="deep-diagnostics"><div class="empty-state">进入服务页后读取深度诊断</div></div>
+        </section>
       </section>
 
       <section id="view-tasks" class="view">
@@ -184,7 +204,7 @@
       <section id="view-config" class="view">
         <section class="feature-hero config-hero">
           <div>
-            <span class="feature-kicker">安全、可解释的现场配置 <b class="ui8-badge">UI11</b></span>
+            <span class="feature-kicker">安全、可解释的现场配置 <b class="ui8-badge">UI13</b></span>
             <h2>配置中心</h2>
             <p>从宿主机 Agent 读取当前 env 配置，先预览差异，再通过 Compose 校验安全应用；失败会自动回滚。</p>
           </div>
@@ -195,8 +215,22 @@
           <div><span>工作模式</span><strong id="config-mode">安全应用</strong></div>
           <div><span>Agent 通道</span><strong id="config-agent-status">读取中</strong></div>
           <div><span>Env 文件</span><strong id="config-env-file">-</strong></div>
+          <div><span>Env 版本</span><strong id="config-version">-</strong></div>
+          <div><span>Env SHA256</span><strong id="config-sha256">-</strong></div>
+          <div><span>配置 Hash</span><strong id="config-hash">-</strong></div>
           <div><span>修改时间</span><strong id="config-modified-at">-</strong></div>
+          <div><span>配置应用状态</span><strong id="config-application-overall">读取中</strong></div>
         </div>
+        <section class="panel config-application-panel">
+          <div class="section-heading">
+            <div>
+              <h2>配置实际生效状态</h2>
+              <p class="muted">对比 env.multi 和各容器实际加载的环境变量；敏感值只显示是否一致。</p>
+            </div>
+            <button id="config-status-refresh" type="button" class="secondary-button">刷新生效状态</button>
+          </div>
+          <div id="config-application-status"><div class="empty-state">正在读取配置生效状态...</div></div>
+        </section>
         <div class="toolbar config-toolbar">
           <button id="config-reload" type="button" class="secondary-button">重新读取</button>
           <button id="config-validate" type="button" class="secondary-button">校验候选配置</button>
@@ -212,6 +246,16 @@
             <div id="config-history" class="config-history"><div class="empty-state">正在读取...</div></div>
           </aside>
         </div>
+        <section class="panel audit-panel">
+          <div class="section-heading">
+            <div>
+              <h2>操作审计</h2>
+              <p class="muted">记录配置、服务和批量任务操作，不展示敏感原值。</p>
+            </div>
+            <button id="audit-refresh" type="button" class="secondary-button">刷新</button>
+          </div>
+          <div id="audit-log"><div class="empty-state">进入配置页后读取审计记录</div></div>
+        </section>
       </section>
 
       <section id="view-logs" class="view">
@@ -255,7 +299,17 @@
     </header>
     <form id="problem-pages-retry-form" class="problem-pages-retry-form">
       <input name="run_id" type="hidden">
-      <p class="retry-explanation">系统会从原 PDF 中截取状态为“跳过”或“失败”的页面，创建一个新的批次。原批次和原文件不会被修改。</p>
+      <p class="retry-explanation">系统会从原 PDF 中截取选中的“跳过”或“失败”页面，创建一个新的批次。原批次和原文件不会被修改。</p>
+      <section class="problem-page-selector">
+        <div class="problem-page-actions">
+          <button id="problem-pages-select-all" type="button" class="secondary-button">全选</button>
+          <button id="problem-pages-select-none" type="button" class="secondary-button">取消全选</button>
+          <button id="problem-pages-select-timeout" type="button" class="secondary-button">仅超时页</button>
+          <button id="problem-pages-select-failed" type="button" class="secondary-button">仅失败页</button>
+        </div>
+        <div id="problem-page-selection-summary" class="problem-page-selection-summary">正在读取异常页...</div>
+        <div id="problem-pages-list" class="problem-pages-list"><div class="empty-state">正在读取异常页...</div></div>
+      </section>
       <label><span>VLM 单次请求超时（秒）</span><input name="page_timeout_seconds" type="number" value="1200" min="1" max="7200" step="1" required><small>例如原来 600 秒超时，可改成 1200 秒继续测试；不能超过底层 HTTP 硬超时。</small></label>
       <label><span>控制台等待上限（秒）</span><input name="task_timeout" type="number" value="7200" min="60" max="86400" step="1" required><small>提交时会自动保证至少比单页超时多 60 秒；达到上限不会取消 MinerU 后台任务。</small></label>
       <label><span>连接错误重试次数</span><input name="page_connect_max_retries" type="number" value="0" min="0" max="3" step="1" required><small>测量这一页真实处理时间时建议保持 0，避免重试耗时干扰结果。</small></label>
@@ -301,6 +355,6 @@
     </div>
   </dialog>
 
-  <script src="/assets/ops.js?v=ui11"></script>
+  <script src="/assets/ops.js?v=ui13"></script>
 </body>
 </html>
