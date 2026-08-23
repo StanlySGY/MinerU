@@ -1,4 +1,78 @@
-# Session handoff — 2026-08-22
+# Session handoff — 2026-08-23
+
+## 2026-08-23 完成：UI14 配置最终态核验与失败自动回滚可视化
+
+本轮把配置中心从“写入 env.multi 并重建服务”提升为“验证最终生效值、分步展示执行过程、失败后自动恢复”的闭环，目标是让现场人员能够确认配置究竟是否被 API/Router 实际采用，而不是只看到配置文件已经保存。
+
+### 最终有效配置
+
+- 新增 Agent action `config_effective` 和后端接口 `GET /api/config/effective`；原有 `GET /api/config/status` 继续兼容保留。
+- 对 `mineru-api`、`mineru-api-*`、Router 和 Ops 的适用配置逐项展示配置值、容器环境变量、命令行参数、已知默认值及最终有效值。
+- 最终值按 `Docker 实际启动 command > 容器环境变量 > 已知默认值` 推断。这里是基于 `docker inspect` 的可解释推断，不是直接进入 Python 进程读取变量。
+- 支持解析 `--flag value` 和 `--flag=value`，覆盖 API 的 `--max-concurrency`、`--max-retries`、`--http-timeout`。
+- 新增并纳入配置中心：`MINERU_VLM_CLIENT_MAX_CONCURRENCY`、`MINERU_VLM_CLIENT_MAX_RETRIES`、`MINERU_VLM_CLIENT_HTTP_TIMEOUT`。
+- 多 API 实例最终值不同会显示 `inconsistent`；HTTP client timeout 小于 page timeout 会显示 `conflict`；Compose 状态无法读取时整体状态为 `unknown`，不再误报已生效。
+- `docker inspect` 中的敏感环境变量和命令行参数在进入响应前即脱敏，返回结构再递归脱敏，避免运行容器中的旧 token/password/secret 泄漏。
+
+### 安全应用与回滚
+
+配置 Apply/Restore 统一展示七步执行结果：
+
+1. 配置校验；
+2. Compose 校验；
+3. 配置备份；
+4. 写入配置；
+5. 重建服务；
+6. 健康检查；
+7. 最终生效验证。
+
+- 每一步标记 `completed`、`failed`、`skipped` 或 `pending`。
+- 最终有效值与目标值不一致会判定应用失败并触发自动回滚。
+- 失败返回并展示 `rollback_status`、`env_restored`、`services_restored`、`original_error`、`rollback_error` 和 `manual_actions`。
+- 自动恢复不完整时，控制台会给出现场手工操作命令，并提供复制按钮。
+- `MINERU_OPS_*` 仍不会由当前请求自重启 Ops，界面会明确提示现场手工重启，避免中断自身请求。
+- Compose 服务状态读取失败时，健康等待会快速失败，不再无意义等待完整超时时间。
+
+### UI 与版本
+
+- 配置中心新增“最终有效配置”和七步 Apply/Restore 结果区域，支持来源、实例状态、health、warning、冲突和不一致展示。
+- 业务失败保留 Agent 返回的结构化步骤和回滚信息；浏览器网络异常也会生成统一失败结果。
+- 配置最终态会自动刷新；移动端布局同步适配。
+- 首页徽标更新为 `UI14`，静态资源为 `ops.js?v=ui14`、`ops.css?v=ui14`。
+- 目标镜像：`mineru-code:v3.4.2-ops-ui14`。
+- 导出文件：`/data/maas/sgy_arm/gd-dev/MinerU/docker/base/export/mineru-code-v3.4.2-ops-ui14.tar.gz`。
+
+### 本轮正式文件
+
+```text
+docker/multi/mineru-ops-agent.py
+mineru/cli/ops.py
+mineru/ops/static/index.html
+mineru/ops/static/ops.js
+mineru/ops/static/ops.css
+tests/unit/test_ops_agent_config.py
+tests/unit/test_ops_console.py
+handoff.md
+```
+
+### 验证结果
+
+```text
+python -m py_compile docker/multi/mineru-ops-agent.py mineru/cli/ops.py   # 通过
+node --check mineru/ops/static/ops.js                                    # 通过
+python -m pytest -o addopts='' tests/unit/test_ops_agent_config.py tests/unit/test_ops_console.py -q
+# 73 passed
+python -m pytest -o addopts='' tests/unit/test_ops_console.py tests/unit/test_ops_agent_config.py tests/unit/test_api_request.py tests/unit/test_vlm_resilience.py tests/unit/test_batch_router_diagnose.py -q
+# 106 passed
+git diff --check                                                         # 通过
+```
+
+### 现场升级提示
+
+- 若使用共享 `/app` code volume，必须按现场既有流程刷新或重建 code volume；只更新镜像标签仍可能运行旧代码。
+- `mineru-ops-agent.py` 属于宿主机 Agent 部署内容时，也要同步本轮文件并重启 Agent。
+- 重建 `mineru-ops`、受影响 API 及 Router 后，浏览器执行 `Ctrl+F5`，确认加载 `ops.js?v=ui14`、`ops.css?v=ui14`。
+- 配置变更只影响重建后的新进程和新请求；正在运行的请求不会动态继承新配置。
 
 ## 2026-08-22 完成：独立版双环境 PDF 解析性能报告
 

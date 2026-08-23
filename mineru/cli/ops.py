@@ -3123,6 +3123,12 @@ def create_app() -> FastAPI:
                     "keys": sorted(payload.values),
                     "affected_services": result.get("affected_services", []),
                     "rolled_back": result.get("rolled_back"),
+                    "rollback_status": result.get("rollback_status"),
+                    "verification_overall": (
+                        result.get("verification", {}).get("overall")
+                        if isinstance(result.get("verification"), dict)
+                        else None
+                    ),
                 },
                 ensure_ascii=False,
             ),
@@ -3146,6 +3152,12 @@ def create_app() -> FastAPI:
                     "source": payload.name,
                     "affected_services": result.get("affected_services", []),
                     "rolled_back": result.get("rolled_back"),
+                    "rollback_status": result.get("rollback_status"),
+                    "verification_overall": (
+                        result.get("verification", {}).get("overall")
+                        if isinstance(result.get("verification"), dict)
+                        else None
+                    ),
                 },
                 ensure_ascii=False,
             ),
@@ -3161,6 +3173,11 @@ def create_app() -> FastAPI:
     async def config_status_view(request: Request):
         authorize(request)
         return await config_agent_call("config_status", timeout=45)
+
+    @app.get("/api/config/effective")
+    async def config_effective_view(request: Request):
+        authorize(request)
+        return await config_agent_call("config_effective", timeout=60)
 
     @app.get("/api/audit")
     async def audit_logs_view(

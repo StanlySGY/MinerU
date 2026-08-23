@@ -31,6 +31,7 @@ const state = {
   configValidationErrors: {},
   configPlan: null,
   configApplying: false,
+  configApplyResult: null,
   labSubmitting: false,
   problemPages: [],
   selectedProblemPages: new Set(),
@@ -65,7 +66,8 @@ const statusText = {
   healthy: "健康", unavailable: "不可用", unknown: "未知", success: "成功", partial: "部分成功",
   client_error: "客户端错误", wait_timeout: "停止等待（后台可能仍在运行）",
   monitoring_stopped: "停止监控", applied: "已生效", pending_restart: "等待重启生效",
-  partially_applied: "部分服务已生效", not_created: "容器未创建"
+  partially_applied: "部分服务已生效", not_created: "容器未创建", skipped: "已跳过",
+  conflict: "配置冲突", inconsistent: "实例不一致"
 };
 
 const tokenInput = document.getElementById("token");
@@ -83,8 +85,8 @@ function esc(value) {
 function badge(value) {
   const text = statusText[value] || value || "未知";
   const cls = ["healthy", "completed", "running", "success", "applied"].includes(value) ? "good" :
-    ["pending", "processing", "paused", "cancelling", "partial", "partial_success", "completed_with_failures", "wait_timeout", "monitoring_stopped", "pending_restart", "partially_applied", "not_created"].includes(value) ? "warn" :
-    ["failed", "unhealthy", "unavailable", "cancelled", "interrupted"].includes(value) ? "bad" : "";
+    ["pending", "processing", "paused", "cancelling", "partial", "partial_success", "completed_with_failures", "wait_timeout", "monitoring_stopped", "pending_restart", "partially_applied", "not_created", "skipped", "inconsistent"].includes(value) ? "warn" :
+    ["failed", "unhealthy", "unavailable", "cancelled", "interrupted", "conflict"].includes(value) ? "bad" : "";
   return `<span class="badge ${cls}">${esc(text)}</span>`;
 }
 
@@ -1736,21 +1738,17 @@ function configMismatchHtml(item) {
   return `<li class="config-mismatch-item"><strong>${esc(mismatch.key || "未知配置")}</strong>${detail}</li>`;
 }
 
-function renderConfigStatus(payload = state.configStatus) {
-  const target = document.getElementById("config-application-status");
-  if (!target) return;
-  if (!payload) {
-    target.innerHTML = `<div class="empty-state">暂无配置生效状态</div>`;
-    return;
-  }
-  if (payload.load_error || payload.ok === false) {
-    target.innerHTML = `<div class="empty-state bad-text">配置生效状态读取失败：${esc(payload.load_error || payload.error || "未知错误")}</div>`;
-    return;
-  }
+const CONFIG_SOURCE_LABELS = {
+  command: "命令行参数",
+  environment: "容器环境变量",
+  default: "已知默认值",
+  unknown: "未知",
+};
+
+function renderLegacyConfigStatus(payload) {
   const env = payload.env_file || {};
   const summary = payload.summary || {};
   const services = payload.services && typeof payload.services === "object" ? payload.services : {};
-  const serviceEntries = Object.entries(services);
   const counts = [
     ["已生效", summary.applied || 0, "good"],
     ["等待重启", summary.pending_restart || 0, "warn"],
@@ -1758,20 +1756,52 @@ function renderConfigStatus(payload = state.configStatus) {
     ["容器未创建", summary.not_created || 0, "warn"],
   ];
   const countHtml = counts.map(([label, value, cls]) => `<div class="config-status-count"><span>${label}</span><strong class="${cls}">${esc(value)}</strong></div>`).join("");
+  const serviceEntries = Object.entries(services);
   const serviceHtml = serviceEntries.length ? serviceEntries.map(([name, service]) => {
     const mismatches = Array.isArray(service.mismatched_keys) ? service.mismatched_keys : [];
     const missing = Array.isArray(service.missing_keys) ? service.missing_keys : [];
     const warnings = Array.isArray(service.warnings) ? service.warnings : [];
-    const stateText = configStatusValue(service.state);
-    const healthText = configStatusValue(service.health);
-    const restartText = service.status === "applied"
-      ? "无需重启"
-      : service.status === "pending_restart"
-        ? "需要重启"
-        : "暂无法确认";
-    return `<article class="config-service-status"><div class="section-heading"><div><h3>${esc(name)}</h3><p class="muted mono">${esc(service.container || "容器未创建")}</p></div>${badge(service.status || "unknown")}</div><dl><div><dt>容器状态</dt><dd>${esc(stateText)}</dd></div><div><dt>健康状态</dt><dd>${esc(healthText)}</dd></div><div><dt>配置应用</dt><dd>${esc(restartText)}</dd></div><div><dt>比对变量</dt><dd>${esc(service.compared_keys?.length || 0)} 项（匹配 ${esc(service.matching_keys?.length || 0)}）</dd></div></dl>${mismatches.length || missing.length ? `<div class="config-mismatch-list"><strong>不一致项</strong><ul>${mismatches.map(configMismatchHtml).join("")}${missing.map(key => configMismatchHtml({key, sensitive: false, missing: true})).join("")}</ul></div>` : `<p class="muted">${service.status === "applied" ? "已比对白名单变量，未发现不一致。" : "暂无法确认配置是否已生效。"}</p>`}${warnings.length ? `<div class="config-diagnostic-warning"><strong>提示</strong><ul>${warnings.map(item => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}</article>`;
+    return `<article class="config-service-status"><div class="section-heading"><div><h3>${esc(name)}</h3><p class="muted mono">${esc(service.container || "容器未创建")}</p></div>${badge(service.status || "unknown")}</div><dl><div><dt>容器状态</dt><dd>${esc(configStatusValue(service.state))}</dd></div><div><dt>健康状态</dt><dd>${esc(configStatusValue(service.health))}</dd></div><div><dt>比对变量</dt><dd>${esc(service.compared_keys?.length || 0)} 项（匹配 ${esc(service.matching_keys?.length || 0)}）</dd></div></dl>${mismatches.length || missing.length ? `<div class="config-mismatch-list"><strong>不一致项</strong><ul>${mismatches.map(configMismatchHtml).join("")}${missing.map(key => configMismatchHtml({key, sensitive: false, missing: true})).join("")}</ul></div>` : ""}${warnings.length ? `<div class="config-diagnostic-warning"><strong>提示</strong><ul>${warnings.map(item => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}</article>`;
   }).join("") : `<div class="empty-state">没有可检查的服务。</div>`;
-  target.innerHTML = `<div class="config-status-meta"><span>检查时间：${esc(formatDate(payload.generated_at))}</span><span>Env 版本：${esc(env.version || "-")}</span><span title="${esc(env.sha256 || "")}">SHA256：${esc(env.sha256 ? env.sha256.slice(0, 12) : "-")}</span><span title="${esc(env.config_hash || "")}">配置 Hash：${esc(env.config_hash ? env.config_hash.slice(0, 12) : "-")}</span></div><div class="config-status-counts">${countHtml}</div><div class="config-status-grid">${serviceHtml}</div>${Array.isArray(payload.warnings) && payload.warnings.length ? `<div class="config-diagnostic-warning"><strong>整体提示</strong><ul>${payload.warnings.map(item => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}`;
+  return `<div class="config-status-meta"><span>兼容模式：旧版配置状态接口</span><span>检查时间：${esc(formatDate(payload.generated_at))}</span><span>Env 版本：${esc(env.version || "-")}</span></div><div class="config-status-counts">${countHtml}</div><div class="config-status-grid">${serviceHtml}</div>`;
+}
+
+function renderConfigStatus(payload = state.configStatus) {
+  const target = document.getElementById("config-application-status");
+  if (!target) return;
+  if (!payload) {
+    target.innerHTML = `<div class="empty-state">暂无最终有效配置</div>`;
+    return;
+  }
+  if (payload.load_error || payload.ok === false) {
+    target.innerHTML = `<div class="empty-state bad-text">最终有效配置读取失败：${esc(payload.load_error || payload.error || "未知错误")}</div>`;
+    return;
+  }
+  if (!Array.isArray(payload.items) && payload.services) {
+    target.innerHTML = renderLegacyConfigStatus(payload);
+    return;
+  }
+  const env = payload.env_file || {};
+  const summary = payload.summary || {};
+  const counts = [
+    ["已生效", summary.applied || 0, "good"],
+    ["等待重启", summary.pending_restart || 0, "warn"],
+    ["配置冲突", summary.conflict || 0, "bad"],
+    ["实例不一致", summary.inconsistent || 0, "warn"],
+    ["未知", summary.unknown || 0, "bad"],
+    ["容器未创建", summary.not_created || 0, "warn"],
+  ];
+  const countHtml = counts.map(([label, value, cls]) => `<div class="config-status-count"><span>${label}</span><strong class="${cls}">${esc(value)}</strong></div>`).join("");
+  const itemHtml = (payload.items || []).map(item => {
+    const services = Object.entries(item.services || {});
+    const serviceHtml = services.map(([name, detail]) => {
+      const source = CONFIG_SOURCE_LABELS[detail.effective_source] || detail.effective_source_label || "未知";
+      const warnings = Array.isArray(detail.warnings) ? detail.warnings : [];
+      return `<article class="config-effective-service"><div class="section-heading"><div><h4>${esc(name)}</h4><p class="muted mono">${esc(detail.container || "容器未创建")}</p></div>${badge(detail.status || "unknown")}</div><dl><div><dt>最终有效值</dt><dd class="mono">${esc(configStatusValue(detail.effective_value))}</dd></div><div><dt>值来源</dt><dd><span class="config-source">${esc(source)}</span>${detail.inferred ? " · 推断值" : ""}</dd></div><div><dt>容器状态</dt><dd>${esc(configStatusValue(detail.state))}</dd></div><div><dt>健康状态</dt><dd>${esc(configStatusValue(detail.health))}</dd></div></dl>${warnings.length ? `<div class="config-diagnostic-warning"><strong>提示</strong><ul>${warnings.map(warning => `<li>${esc(warning)}</li>`).join("")}</ul></div>` : ""}</article>`;
+    }).join("");
+    return `<article class="config-effective-item"><div class="section-heading"><div><h3 class="mono">${esc(item.key)}</h3><p class="muted">${esc(item.description || item.label || "")}</p></div></div><div class="config-effective-configured"><span>env.multi 配置值</span><code>${esc(configStatusValue(item.configured_value))}</code></div><div class="config-effective-services">${serviceHtml || `<div class="empty-state">没有适用的运行服务。</div>`}</div></article>`;
+  }).join("");
+  target.innerHTML = `<div class="config-status-meta"><span>检查时间：${esc(formatDate(payload.generated_at))}</span><span>总体状态：${badge(payload.overall || "unknown")}</span><span>Env 版本：${esc(env.version || "-")}</span><span title="${esc(env.sha256 || "")}">SHA256：${esc(env.sha256 ? env.sha256.slice(0, 12) : "-")}</span><span>说明：最终值为 Docker inspect、容器环境变量和已知默认值的推断结果</span></div><div class="config-status-counts">${countHtml}</div><div class="config-effective-list">${itemHtml || `<div class="empty-state">没有可展示的最终配置。</div>`}</div>${Array.isArray(payload.warnings) && payload.warnings.length ? `<div class="config-diagnostic-warning"><strong>整体提示</strong><ul>${payload.warnings.map(item => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}`;
 }
 
 async function loadConfigStatus({force = false} = {}) {
@@ -1785,9 +1815,17 @@ async function loadConfigStatus({force = false} = {}) {
   const button = document.getElementById("config-status-refresh");
   state.configStatusLoading = true;
   if (button) button.disabled = true;
-  if (target) target.innerHTML = `<div class="empty-state">正在读取配置实际生效状态...</div>`;
+  if (target) target.innerHTML = `<div class="empty-state">正在读取最终有效配置...</div>`;
   try {
-    state.configStatus = await api("/api/config/status");
+    try {
+      state.configStatus = await api("/api/config/effective");
+    } catch (effectiveError) {
+      try {
+        state.configStatus = await api("/api/config/status");
+      } catch (legacyError) {
+        throw new Error(`${effectiveError.message}；兼容接口同样失败：${legacyError.message}`);
+      }
+    }
     renderConfigStatus();
     renderConfig();
   } catch (error) {
@@ -1878,6 +1916,75 @@ function renderConfigPlan() {
     ${plan.requires_ops_restart ? `<p class="config-plan-warning">涉及 mineru-ops 自身配置：业务服务应用后，请现场手工重启 mineru-ops。</p>` : ""}`;
 }
 
+function configApplyStepLabel(step) {
+  return step?.label || step?.name || step?.key || "未命名步骤";
+}
+
+function configApplyStatusMeta(status) {
+  const values = {
+    completed: {label: "已完成", cls: "good"},
+    failed: {label: "失败", cls: "bad"},
+    skipped: {label: "已跳过", cls: "warn"},
+    pending: {label: "等待执行", cls: "unknown"},
+  };
+  return values[status] || {label: status || "未知", cls: "unknown"};
+}
+
+function manualActionParts(action) {
+  if (typeof action === "string") {
+    return {label: "现场手工操作", message: "", command: action};
+  }
+  const value = action && typeof action === "object" ? action : {};
+  return {
+    label: value.label || "现场手工操作",
+    message: value.message || "",
+    command: value.command || value.cmd || "",
+  };
+}
+
+function renderConfigApplyResult(result = state.configApplyResult) {
+  const target = document.getElementById("config-apply-result");
+  if (!target) return;
+  if (!result) {
+    target.innerHTML = "";
+    target.classList.add("hidden");
+    return;
+  }
+
+  const rollbackStatus = result.rollback_status;
+  const isRestore = Object.prototype.hasOwnProperty.call(result, "restored");
+  const actionLabel = isRestore ? "配置回滚" : "配置应用";
+  let title = `${actionLabel}执行完成`;
+  if (!result.ok && rollbackStatus === "completed") title = `${actionLabel}失败，已自动回滚`;
+  else if (!result.ok && rollbackStatus === "partial") title = `${actionLabel}失败，自动回滚不完整`;
+  else if (!result.ok) title = `${actionLabel}失败`;
+
+  const steps = Array.isArray(result.steps) ? result.steps : [];
+  const stepHtml = steps.map(step => {
+    const meta = configApplyStatusMeta(step?.status);
+    return `<div class="config-apply-step ${esc(meta.cls)}"><div><strong>${esc(configApplyStepLabel(step))}</strong>${step?.detail ? `<div class="config-apply-step-detail">${esc(step.detail)}</div>` : ""}</div><span class="diagnostic-state ${esc(meta.cls)}">${esc(meta.label)}</span></div>`;
+  }).join("");
+  const originalError = result.original_error || result.error || result.message || "";
+  const rollbackLabel = {
+    completed: "已完成",
+    partial: "部分完成",
+    failed: "失败",
+  }[rollbackStatus] || (rollbackStatus || "未触发");
+  const booleanLabel = value => value === true ? "是" : value === false ? "否" : "-";
+  const showRollback = Boolean(rollbackStatus || result.rolled_back || result.rollback_error)
+    || Object.prototype.hasOwnProperty.call(result, "env_restored")
+    || Object.prototype.hasOwnProperty.call(result, "services_restored");
+  const rollbackHtml = showRollback ? `<div class="config-rollback-summary"><div><span>自动回滚状态</span><strong>${esc(rollbackLabel)}</strong></div><div><span>env 已恢复</span><strong>${esc(booleanLabel(result.env_restored))}</strong></div><div><span>服务已恢复</span><strong>${esc(booleanLabel(result.services_restored))}</strong></div></div>` : "";
+  const actions = Array.isArray(result.manual_actions) ? result.manual_actions : [];
+  const actionsHtml = actions.map((action, index) => {
+    const parts = manualActionParts(action);
+    return `<div class="manual-action"><div class="manual-action-head"><div><strong>${esc(parts.label)}</strong>${parts.message ? `<div class="config-apply-step-detail">${esc(parts.message)}</div>` : ""}</div>${parts.command ? `<button type="button" class="secondary-button" data-copy-command-index="${index}">复制命令</button>` : ""}</div>${parts.command ? `<pre class="manual-action-command">${esc(parts.command)}</pre>` : ""}</div>`;
+  }).join("");
+
+  target.classList.remove("hidden");
+  target.innerHTML = `<div class="config-apply-result-header"><div><h2>${esc(title)}</h2><p class="muted">${result.ok ? "执行结果已保留，可继续核对最终有效配置。" : "请核对失败步骤、回滚状态和现场手工操作。"}</p></div>${badge(result.ok ? "completed" : "failed")}</div>${steps.length ? `<div class="config-apply-steps">${stepHtml}</div>` : ""}${originalError ? `<div class="config-diagnostic-warning"><strong>原始错误</strong><div>${esc(originalError)}</div></div>` : ""}${result.rollback_error ? `<div class="config-diagnostic-warning"><strong>回滚错误</strong><div>${esc(result.rollback_error)}</div></div>` : ""}${rollbackHtml}${actionsHtml}`;
+}
+
 function renderConfigHistory() {
   const target = document.getElementById("config-history");
   if (!state.configHistory.length) {
@@ -1913,6 +2020,7 @@ async function loadConfig() {
   renderConfig();
   renderConfigHistory();
   renderConfigPlan();
+  renderConfigApplyResult();
   setConfigBusy(false);
   void loadConfigStatus({force: true});
   const status = document.getElementById("config-validation-status");
@@ -2073,15 +2181,34 @@ async function applyConfig() {
   setConfigBusy(true, "正在写入配置并重建受影响服务，请勿关闭页面...");
   try {
     const result = await api("/api/config/apply", {method: "POST", body: JSON.stringify({values: state.configDraft})});
+    state.configApplyResult = result;
+    renderConfigApplyResult(result);
     if (!result.ok) {
-      const prefix = result.rolled_back ? "应用失败，已自动回滚" : "应用失败";
-      throw new Error(`${prefix}：${result.error || result.message || "未知错误"}`);
+      dialog.close();
+      const message = result.rollback_status === "completed"
+        ? "应用失败，已自动回滚"
+        : result.rollback_status === "partial"
+          ? "应用失败，自动回滚不完整"
+          : "应用失败，请查看执行详情";
+      document.getElementById("config-validation-status").textContent = message;
+      document.getElementById("config-validation-status").classList.add("bad-text");
+      notice(`${message}：${result.error || result.original_error || "未知错误"}`);
+      void loadConfigStatus({force: true});
+      return;
     }
     dialog.close();
     const restartHint = result.requires_ops_restart ? "；请现场手工重启 mineru-ops" : "";
     notice(`配置已安全应用${restartHint}`, false);
     await loadConfig();
   } catch (error) {
+    state.configApplyResult = {
+      ok: false,
+      original_error: error.message,
+      error: error.message,
+      steps: [],
+      manual_actions: [],
+    };
+    renderConfigApplyResult();
     document.getElementById("config-validation-status").textContent = error.message;
     document.getElementById("config-validation-status").classList.add("bad-text");
     notice(error.message);
@@ -2096,14 +2223,33 @@ async function restoreConfig(name) {
   setConfigBusy(true, `正在回滚到 ${name}...`);
   try {
     const result = await api("/api/config/restore", {method: "POST", body: JSON.stringify({name})});
+    state.configApplyResult = {...result, restored: result.ok};
+    renderConfigApplyResult(state.configApplyResult);
     if (!result.ok) {
-      const prefix = result.rolled_back ? "回滚失败，已恢复回滚前配置" : "回滚失败";
-      throw new Error(`${prefix}：${result.error || result.message || "未知错误"}`);
+      const message = result.rollback_status === "completed"
+        ? "回滚失败，已恢复回滚前配置"
+        : result.rollback_status === "partial"
+          ? "回滚失败，恢复过程不完整"
+          : "回滚失败，请查看执行详情";
+      document.getElementById("config-validation-status").textContent = message;
+      document.getElementById("config-validation-status").classList.add("bad-text");
+      notice(`${message}：${result.error || result.original_error || "未知错误"}`);
+      void loadConfigStatus({force: true});
+      return;
     }
     const restartHint = result.requires_ops_restart ? "；请现场手工重启 mineru-ops" : "";
     notice(`已回滚到 ${name}${restartHint}`, false);
     await loadConfig();
   } catch (error) {
+    state.configApplyResult = {
+      ok: false,
+      restored: false,
+      original_error: error.message,
+      error: error.message,
+      steps: [],
+      manual_actions: [],
+    };
+    renderConfigApplyResult();
     document.getElementById("config-validation-status").textContent = error.message;
     document.getElementById("config-validation-status").classList.add("bad-text");
     notice(error.message);
@@ -2139,6 +2285,28 @@ document.getElementById("config-groups").addEventListener("change", event => {
 document.getElementById("config-history").addEventListener("click", event => {
   const button = event.target.closest("[data-config-restore]");
   if (button) restoreConfig(button.dataset.configRestore);
+});
+document.getElementById("config-apply-result")?.addEventListener("click", async event => {
+  const button = event.target.closest("[data-copy-command-index]");
+  if (!button) return;
+
+  const actions = Array.isArray(state.configApplyResult?.manual_actions)
+    ? state.configApplyResult.manual_actions
+    : [];
+  const action = actions[Number(button.dataset.copyCommandIndex)];
+  const command = typeof action === "string"
+    ? action
+    : action?.command || action?.cmd || "";
+  if (!command) {
+    notice("没有可复制的命令");
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(command);
+    notice("命令已复制", false);
+  } catch {
+    notice("复制失败，请手动复制命令");
+  }
 });
 document.getElementById("runtime-diagnostics-refresh").addEventListener("click", () => {
   void loadRuntimeDiagnostics({force: true});

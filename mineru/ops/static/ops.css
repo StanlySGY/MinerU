@@ -491,6 +491,139 @@ button:disabled { cursor: wait; opacity: .58; }
 .audit-detail { max-width: 480px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .audit-load-more { margin-top: 12px; }
 
+.config-effective-list {
+  display: grid;
+  gap: 12px;
+}
+.config-effective-item {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-alt);
+}
+.config-effective-item h3 { overflow-wrap: anywhere; }
+.config-effective-configured {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 10px 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--surface);
+}
+.config-effective-configured code { overflow-wrap: anywhere; }
+.config-effective-services {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 10px;
+}
+.config-effective-service {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+}
+.config-effective-service h4 {
+  margin-bottom: 6px;
+  overflow-wrap: anywhere;
+}
+.config-effective-service dl {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+}
+.config-effective-service dl > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+.config-effective-service dt { color: var(--muted); }
+.config-effective-service dd {
+  margin: 0;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+.config-source { color: var(--accent); }
+.config-apply-result {
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-alt);
+}
+.config-apply-result.hidden { display: none; }
+.config-apply-result-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+.config-apply-steps {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+.config-apply-step {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--unknown);
+  border-radius: 6px;
+  background: var(--surface);
+}
+.config-apply-step.good { border-left-color: var(--good); }
+.config-apply-step.bad { border-left-color: var(--bad); }
+.config-apply-step.warn { border-left-color: var(--warn); }
+.config-apply-step-detail {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.config-rollback-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+}
+.config-rollback-summary > div {
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+}
+.config-rollback-summary span,
+.config-rollback-summary strong { display: block; }
+.config-rollback-summary span {
+  color: var(--muted);
+  font-size: 12px;
+}
+.manual-action {
+  margin-top: 12px;
+  padding: 10px;
+  border-radius: 6px;
+  background: #fff8e6;
+}
+.manual-action-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.manual-action-command {
+  margin-top: 6px;
+  padding: 8px;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+}
+
 @media (max-width: 1080px) {
   .lab-metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .summary-strip { grid-template-columns: repeat(3, 1fr); }
@@ -570,4 +703,10 @@ button:disabled { cursor: wait; opacity: .58; }
   .config-diff-arrow { transform: rotate(90deg); justify-self: start; }
   .config-dialog-meta { grid-template-columns: 1fr; }
   .config-apply-dialog { width: calc(100vw - 24px); padding: 14px; }
+  .config-effective-services { grid-template-columns: 1fr; }
+  .config-apply-result-header,
+  .manual-action-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
 }

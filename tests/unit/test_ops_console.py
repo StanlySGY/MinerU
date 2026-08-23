@@ -1250,6 +1250,7 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "/api/audit" in paths
     assert "/api/diagnostics/runtime" in paths
     assert "/api/config/status" in paths
+    assert "/api/config/effective" in paths
     assert "/api/diagnostics/deep" in paths
     assert "/api/batch-runs/{run_id}/artifacts/{kind}/{artifact_path:path}" in paths
     assert "/" in paths
@@ -1271,12 +1272,14 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "experiment_type" in dashboard_js
     assert "32" in dashboard_html
     assert "配置中心" in dashboard_html
-    assert "UI13" in dashboard_html
+    assert "UI14" in dashboard_html
     assert "预览变更" in dashboard_html
     assert "保存并应用" in dashboard_html
+    assert "最终有效配置" in dashboard_html
     assert "config-apply-dialog" in dashboard_html
-    assert "ops.js?v=ui13" in dashboard_html
-    assert "ops.css?v=ui13" in dashboard_html
+    assert "config-apply-result" in dashboard_html
+    assert "ops.js?v=ui14" in dashboard_html
+    assert "ops.css?v=ui14" in dashboard_html
     assert "problem-pages-list" in dashboard_html
     assert "problem-pages-select-all" in dashboard_html
     assert "runtime-diagnostics" in dashboard_html
@@ -1308,6 +1311,10 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "deepDiagnostics" in dashboard_js
     assert "pending_restart" in dashboard_js
     assert "/api/config/status" in dashboard_js
+    assert "/api/config/effective" in dashboard_js
+    assert "configApplyStepLabel" in dashboard_js
+    assert "config-apply-step" in dashboard_js
+    assert "data-copy-command-index" in dashboard_js
     assert "/api/diagnostics/deep" in dashboard_js
     assert "data-problem-pages-retry" in dashboard_js
     assert "selected_pages" in dashboard_js
@@ -1328,6 +1335,9 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "runtime-health" in dashboard_js
     assert "service-endpoint" in dashboard_js
     assert "service-card-metrics" in dashboard_css
+    assert "config-effective-item" in dashboard_css
+    assert "config-apply-result" in dashboard_css
+    assert "manual-action-command" in dashboard_css
     assert "max-width: 1400px" in dashboard_css
     assert "overflow-wrap: anywhere" in dashboard_css
     assert "width: 100vw" in dashboard_css

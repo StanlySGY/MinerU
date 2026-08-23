@@ -212,11 +212,23 @@ def test_config_apply_recreates_services_and_rolls_back_on_failure(tmp_path: Pat
     monkeypatch.setattr(ops_agent, "run_command", fake_run)
     monkeypatch.setattr(agent, "configured_services", lambda: {"mineru-api-1", "mineru-router", "mineru-ops"})
     monkeypatch.setattr(agent, "_recreate_services", lambda services: next(recreate_results))
+    monkeypatch.setattr(
+        agent,
+        "_wait_for_services",
+        lambda services: {"ok": True, "services": {}, "elapsed_seconds": 0.0},
+    )
 
     result = agent.config_apply({"MINERU_VLM_PAGE_TIMEOUT_SECONDS": "1200"})
 
     assert result["ok"] is False
     assert result["rolled_back"] is True
+    assert result["steps"]
+    assert result["original_error"] == "recreate failed"
+    assert result["env_restored"] is True
+    assert result["services_restored"] is True
+    assert result["rollback_status"] == "completed"
+    assert "manual_actions" in result
+    assert "rollback_error" in result
     assert "MINERU_VLM_PAGE_TIMEOUT_SECONDS=600" not in env_file.read_text(encoding="utf-8")
     assert "MINERU_MODEL_SOURCE=local" in env_file.read_text(encoding="utf-8")
 
@@ -234,11 +246,21 @@ def test_ops_only_config_does_not_recreate_api_services(tmp_path: Path, monkeypa
     assert requires_ops_restart is True
 
 
-def _runtime_inspect(env: list[str] | None = None, mounts: list[dict] | None = None) -> dict:
+def _runtime_inspect(
+    env: list[str] | None = None,
+    mounts: list[dict] | None = None,
+    *,
+    path: str = "",
+    args: list[str] | None = None,
+    cmd: list[str] | None = None,
+) -> dict:
     return {
+        "Path": path,
+        "Args": args or [],
         "Config": {
             "Image": "mineru:test",
             "Env": env or [],
+            "Cmd": cmd or [],
         },
         "State": {
             "Status": "running",
@@ -247,6 +269,274 @@ def _runtime_inspect(env: list[str] | None = None, mounts: list[dict] | None = N
         },
         "Mounts": mounts or [],
     }
+
+
+def _effective_item(result: dict, key: str) -> dict:
+    return next(item for item in result["items"] if item["key"] == key)
+
+
+def _mock_effective_runtime(monkeypatch, agent, inspections: dict[str, dict]) -> None:
+    service_names = set(inspections)
+    containers = {service: f"{service}-container" for service in service_names}
+    monkeypatch.setattr(agent, "configured_services", lambda: service_names)
+    monkeypatch.setattr(
+        agent,
+        "services",
+        lambda: {
+            "ok": True,
+            "services": {
+                service: {
+                    "container": container,
+                    "state": "running",
+                    "health": "healthy",
+                }
+                for service, container in containers.items()
+            },
+        },
+    )
+    monkeypatch.setattr(
+        agent,
+        "_inspect_container",
+        lambda container: (
+            inspections[next(service for service, name in containers.items() if name == container)],
+            None,
+        ),
+    )
+
+
+def test_config_effective_reads_space_separated_command_option(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "env.multi").write_text(
+        "MINERU_VLM_CLIENT_HTTP_TIMEOUT=600\n",
+        encoding="utf-8",
+    )
+    agent = make_agent(tmp_path)
+    _mock_effective_runtime(
+        monkeypatch,
+        agent,
+        {
+            "mineru-api-1": _runtime_inspect(
+                ["MINERU_VLM_CLIENT_HTTP_TIMEOUT=600"],
+                path="python",
+                args=["-m", "mineru.cli.client", "--http-timeout", "1200"],
+            )
+        },
+    )
+
+    detail = _effective_item(
+        agent.config_effective(),
+        "MINERU_VLM_CLIENT_HTTP_TIMEOUT",
+    )["services"]["mineru-api-1"]
+
+    assert detail["command_value"] == "1200"
+    assert detail["effective_value"] == "1200"
+    assert detail["effective_source"] == "command"
+
+
+def test_config_effective_reads_equals_command_option(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "env.multi").write_text(
+        "MINERU_VLM_CLIENT_HTTP_TIMEOUT=600\n",
+        encoding="utf-8",
+    )
+    agent = make_agent(tmp_path)
+    _mock_effective_runtime(
+        monkeypatch,
+        agent,
+        {
+            "mineru-api-1": _runtime_inspect(
+                ["MINERU_VLM_CLIENT_HTTP_TIMEOUT=600"],
+                path="python",
+                args=["-m", "mineru.cli.client", "--http-timeout=1200"],
+            )
+        },
+    )
+
+    detail = _effective_item(
+        agent.config_effective(),
+        "MINERU_VLM_CLIENT_HTTP_TIMEOUT",
+    )["services"]["mineru-api-1"]
+
+    assert detail["effective_value"] == "1200"
+    assert detail["effective_source"] == "command"
+
+
+def test_config_effective_command_overrides_container_environment(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "env.multi").write_text(
+        "MINERU_VLM_CLIENT_HTTP_TIMEOUT=1200\n",
+        encoding="utf-8",
+    )
+    agent = make_agent(tmp_path)
+    _mock_effective_runtime(
+        monkeypatch,
+        agent,
+        {
+            "mineru-api-1": _runtime_inspect(
+                ["MINERU_VLM_CLIENT_HTTP_TIMEOUT=900"],
+                path="python",
+                args=["--http-timeout", "1200"],
+            )
+        },
+    )
+
+    detail = _effective_item(
+        agent.config_effective(),
+        "MINERU_VLM_CLIENT_HTTP_TIMEOUT",
+    )["services"]["mineru-api-1"]
+
+    assert detail["container_env_value"] == "900"
+    assert detail["effective_value"] == "1200"
+    assert detail["effective_source"] == "command"
+    assert detail["status"] == "applied"
+
+
+def test_config_effective_uses_known_default_for_single_api_service(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "env.multi").write_text("MINERU_MODEL_SOURCE=local\n", encoding="utf-8")
+    agent = make_agent(tmp_path)
+    _mock_effective_runtime(
+        monkeypatch,
+        agent,
+        {"mineru-api": _runtime_inspect(path="python", args=["-m", "mineru.cli.client"])},
+    )
+
+    detail = _effective_item(
+        agent.config_effective(),
+        "MINERU_VLM_CLIENT_HTTP_TIMEOUT",
+    )["services"]["mineru-api"]
+
+    assert detail["default_value"] == "7200"
+    assert detail["effective_value"] == "7200"
+    assert detail["effective_source"] == "default"
+
+
+def test_config_effective_reports_timeout_conflict(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "env.multi").write_text(
+        "MINERU_VLM_PAGE_TIMEOUT_SECONDS=1200\n"
+        "MINERU_VLM_CLIENT_HTTP_TIMEOUT=600\n",
+        encoding="utf-8",
+    )
+    agent = make_agent(tmp_path)
+    _mock_effective_runtime(
+        monkeypatch,
+        agent,
+        {
+            "mineru-api-1": _runtime_inspect(
+                [
+                    "MINERU_VLM_PAGE_TIMEOUT_SECONDS=1200",
+                    "MINERU_VLM_CLIENT_HTTP_TIMEOUT=600",
+                ]
+            )
+        },
+    )
+
+    result = agent.config_effective()
+    page_detail = _effective_item(
+        result,
+        "MINERU_VLM_PAGE_TIMEOUT_SECONDS",
+    )["services"]["mineru-api-1"]
+    http_detail = _effective_item(
+        result,
+        "MINERU_VLM_CLIENT_HTTP_TIMEOUT",
+    )["services"]["mineru-api-1"]
+
+    assert result["overall"] == "conflict"
+    assert page_detail["status"] == "conflict"
+    assert http_detail["status"] == "conflict"
+
+
+def test_config_effective_reports_inconsistent_api_instances(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "env.multi").write_text(
+        "MINERU_VLM_CLIENT_HTTP_TIMEOUT=1200\n",
+        encoding="utf-8",
+    )
+    agent = make_agent(tmp_path)
+    _mock_effective_runtime(
+        monkeypatch,
+        agent,
+        {
+            "mineru-api-1": _runtime_inspect(
+                path="python",
+                args=["--http-timeout", "1200"],
+            ),
+            "mineru-api-2": _runtime_inspect(
+                path="python",
+                args=["--http-timeout=1800"],
+            ),
+        },
+    )
+
+    result = agent.config_effective()
+    services = _effective_item(
+        result,
+        "MINERU_VLM_CLIENT_HTTP_TIMEOUT",
+    )["services"]
+
+    assert result["overall"] == "inconsistent"
+    assert services["mineru-api-1"]["status"] == "inconsistent"
+    assert services["mineru-api-2"]["status"] == "inconsistent"
+
+
+def test_config_effective_degrades_when_compose_status_is_unavailable(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "env.multi").write_text(
+        "MINERU_VLM_CLIENT_HTTP_TIMEOUT=1200\n",
+        encoding="utf-8",
+    )
+    agent = make_agent(tmp_path)
+    monkeypatch.setattr(agent, "configured_services", lambda: {"mineru-api-1"})
+    monkeypatch.setattr(
+        agent,
+        "services",
+        lambda: {"ok": False, "error": "compose failed"},
+    )
+
+    result = agent.config_effective()
+
+    assert result["ok"] is True
+    assert result["overall"] == "unknown"
+    assert "compose failed" in result["warnings"]
+
+
+def test_wait_for_services_fails_fast_when_compose_status_is_unavailable(tmp_path: Path, monkeypatch) -> None:
+    agent = make_agent(tmp_path)
+    monkeypatch.setattr(
+        agent,
+        "services",
+        lambda: {"ok": False, "error": "compose failed"},
+    )
+
+    result = agent._wait_for_services(
+        ["mineru-api-1"],
+        timeout_seconds=999,
+        poll_interval=0,
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "compose failed"
+    assert result["elapsed_seconds"] < 1
+
+
+def test_wait_for_services_handles_empty_compose_response(tmp_path: Path, monkeypatch) -> None:
+    agent = make_agent(tmp_path)
+    monkeypatch.setattr(agent, "services", lambda: None)
+
+    result = agent._wait_for_services(
+        ["mineru-api-1"],
+        timeout_seconds=1,
+        poll_interval=0,
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "无法读取 Compose 服务状态"
+
+
+def test_redact_payload_masks_secrets_recursively() -> None:
+    payload = {
+        "error": "token=top-secret",
+        "nested": [{"command": "echo top-secret"}],
+    }
+
+    result = ops_agent._redact_payload(payload, ["top-secret"])
+
+    assert "top-secret" not in repr(result)
+    assert ops_agent.MASKED_VALUE in repr(result)
 
 
 def test_sha256_file_is_stable_and_changes_with_contents(tmp_path: Path) -> None:
@@ -473,7 +763,16 @@ def test_deep_diagnostics_degrades_when_container_tools_are_missing(tmp_path: Pa
 def test_agent_handle_dispatches_new_diagnostic_actions(tmp_path: Path, monkeypatch) -> None:
     agent = make_agent(tmp_path)
     monkeypatch.setattr(agent, "config_status", lambda: {"ok": True, "kind": "config"})
+    monkeypatch.setattr(
+        agent,
+        "config_effective",
+        lambda: {"ok": True, "kind": "effective"},
+    )
     monkeypatch.setattr(agent, "deep_diagnostics", lambda: {"ok": True, "kind": "deep"})
 
     assert agent.handle({"action": "config_status"}) == {"ok": True, "kind": "config"}
+    assert agent.handle({"action": "config_effective"}) == {
+        "ok": True,
+        "kind": "effective",
+    }
     assert agent.handle({"action": "deep_diagnostics"}) == {"ok": True, "kind": "deep"}

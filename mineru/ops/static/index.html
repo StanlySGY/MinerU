@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MinerU 运维控制台</title>
-  <link rel="stylesheet" href="/assets/ops.css?v=ui13">
+  <link rel="stylesheet" href="/assets/ops.css?v=ui14">
 </head>
 <body>
   <div class="shell">
@@ -204,7 +204,7 @@
       <section id="view-config" class="view">
         <section class="feature-hero config-hero">
           <div>
-            <span class="feature-kicker">安全、可解释的现场配置 <b class="ui8-badge">UI13</b></span>
+            <span class="feature-kicker">安全、可解释的现场配置 <b class="ui8-badge">UI14</b></span>
             <h2>配置中心</h2>
             <p>从宿主机 Agent 读取当前 env 配置，先预览差异，再通过 Compose 校验安全应用；失败会自动回滚。</p>
           </div>
@@ -224,13 +224,14 @@
         <section class="panel config-application-panel">
           <div class="section-heading">
             <div>
-              <h2>配置实际生效状态</h2>
-              <p class="muted">对比 env.multi 和各容器实际加载的环境变量；敏感值只显示是否一致。</p>
+              <h2>最终有效配置</h2>
+              <p class="muted">最终值根据 Docker inspect、容器环境变量和已知默认值推断；不代表直接读取 Python 进程内部状态。</p>
             </div>
-            <button id="config-status-refresh" type="button" class="secondary-button">刷新生效状态</button>
+            <button id="config-status-refresh" type="button" class="secondary-button">刷新最终配置</button>
           </div>
-          <div id="config-application-status"><div class="empty-state">正在读取配置生效状态...</div></div>
+          <div id="config-application-status"><div class="empty-state">正在读取最终有效配置...</div></div>
         </section>
+        <section id="config-apply-result" class="config-apply-result hidden"></section>
         <div class="toolbar config-toolbar">
           <button id="config-reload" type="button" class="secondary-button">重新读取</button>
           <button id="config-validate" type="button" class="secondary-button">校验候选配置</button>
@@ -355,6 +356,6 @@
     </div>
   </dialog>
 
-  <script src="/assets/ops.js?v=ui13"></script>
+  <script src="/assets/ops.js?v=ui14"></script>
 </body>
 </html>

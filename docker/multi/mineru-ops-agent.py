@@ -13,6 +13,7 @@ import shutil
 import socketserver
 import subprocess
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -183,6 +184,9 @@ API_CONTAINER_ENV_KEYS = {
     "MINERU_VLM_GLOBAL_PAGE_CONCURRENCY",
     "MINERU_VLM_PAGE_TIMEOUT_SECONDS",
     "MINERU_VLM_CONNECT_MAX_RETRIES",
+    "MINERU_VLM_CLIENT_MAX_CONCURRENCY",
+    "MINERU_VLM_CLIENT_MAX_RETRIES",
+    "MINERU_VLM_CLIENT_HTTP_TIMEOUT",
     "MINERU_API_OUTPUT_ROOT",
     "MINERU_FORMULA_ENABLE",
     "MINERU_TABLE_ENABLE",
@@ -203,6 +207,47 @@ OPS_CONTAINER_ENV_KEYS = {
 }
 MASKED_VALUE = "••••••••"
 MAX_COMMAND_OUTPUT = 12000
+API_COMMAND_CONFIG = {
+    "--max-concurrency": "MINERU_VLM_CLIENT_MAX_CONCURRENCY",
+    "--max-retries": "MINERU_VLM_CLIENT_MAX_RETRIES",
+    "--http-timeout": "MINERU_VLM_CLIENT_HTTP_TIMEOUT",
+}
+KNOWN_DEFAULTS = {
+    "mineru-api": {
+        "MINERU_VLM_CLIENT_MAX_CONCURRENCY": "4",
+        "MINERU_VLM_CLIENT_MAX_RETRIES": "0",
+        "MINERU_VLM_CLIENT_HTTP_TIMEOUT": "7200",
+        "MINERU_VLM_PAGE_TIMEOUT_SECONDS": "600",
+        "MINERU_VLM_CONNECT_MAX_RETRIES": "1",
+    },
+    "mineru-router": {
+        "MINERU_VLM_PAGE_TIMEOUT_SECONDS": "600",
+        "MINERU_VLM_CONNECT_MAX_RETRIES": "1",
+    },
+}
+
+
+def _normalize_service_name(service: str) -> str:
+    if service == "mineru-api" or service.startswith("mineru-api-"):
+        return "mineru-api"
+    return service
+
+
+def _parse_command_options(tokens: list[str]) -> dict[str, str]:
+    values: dict[str, str] = {}
+    index = 0
+    while index < len(tokens):
+        token = str(tokens[index])
+        if token.startswith("--"):
+            if "=" in token:
+                option, value = token.split("=", 1)
+                if option in API_COMMAND_CONFIG:
+                    values[API_COMMAND_CONFIG[option]] = value
+            elif token in API_COMMAND_CONFIG and index + 1 < len(tokens):
+                values[API_COMMAND_CONFIG[token]] = str(tokens[index + 1])
+                index += 1
+        index += 1
+    return values
 
 
 def _is_sensitive_config_key(key: str) -> bool:
@@ -211,7 +256,7 @@ def _is_sensitive_config_key(key: str) -> bool:
 
 
 def _service_expected_env_keys(service: str) -> set[str]:
-    if service.startswith("mineru-api-"):
+    if service == "mineru-api" or service.startswith("mineru-api-"):
         return API_CONTAINER_ENV_KEYS
     if service == "mineru-router":
         return ROUTER_CONTAINER_ENV_KEYS
@@ -357,8 +402,38 @@ def _write_atomic(path: Path, content: str, mode: int | None = None) -> None:
 def _redact_text(text: str, secret_values: list[str], limit: int = 4000) -> str:
     redacted = text
     for value in sorted((item for item in secret_values if item), key=len, reverse=True):
-        redacted = redacted.replace(value, "••••••••")
+        redacted = redacted.replace(value, MASKED_VALUE)
     return redacted[:limit]
+
+
+def _redact_payload(value: Any, secret_values: list[str]) -> Any:
+    """Recursively redact secret values before returning Agent payloads."""
+    if isinstance(value, dict):
+        return {key: _redact_payload(item, secret_values) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_payload(item, secret_values) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_payload(item, secret_values) for item in value)
+    if isinstance(value, str):
+        return _redact_text(value, secret_values, limit=max(4000, len(value)))
+    return value
+
+
+def _display_config_value(key: str, value: Any) -> Any:
+    if value is None:
+        return None
+    return MASKED_VALUE if _is_sensitive_config_key(key) else str(value)
+
+
+def _secret_values(*mappings: Any) -> list[str]:
+    values: list[str] = []
+    for mapping in mappings:
+        if not isinstance(mapping, dict):
+            continue
+        for key, value in mapping.items():
+            if _is_sensitive_config_key(str(key)) and value not in (None, "", MASKED_VALUE):
+                values.append(str(value))
+    return values
 
 
 def parse_args() -> argparse.Namespace:
@@ -628,7 +703,9 @@ class Agent:
             return [], requires_ops_restart
         services = sorted(
             service for service in self.configured_services()
-            if service.startswith("mineru-api-") or service == "mineru-router"
+            if service == "mineru-api"
+            or service.startswith("mineru-api-")
+            or service == "mineru-router"
         )
         return services, requires_ops_restart
 
@@ -731,86 +808,474 @@ class Agent:
         except (OSError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
+    @staticmethod
+    def _apply_step(name: str, label: str, status: str = "pending", detail: str | None = None) -> dict[str, Any]:
+        step: dict[str, Any] = {"name": name, "label": label, "status": status}
+        if detail:
+            step["detail"] = detail
+        return step
+
+    @staticmethod
+    def _set_step(steps: list[dict[str, Any]], name: str, status: str, detail: str | None = None) -> None:
+        for step in steps:
+            if step["name"] == name:
+                step["status"] = status
+                if detail:
+                    step["detail"] = detail
+                return
+
+    @staticmethod
+    def _skip_pending_steps(steps: list[dict[str, Any]]) -> None:
+        for step in steps:
+            if step["status"] == "pending":
+                step["status"] = "skipped"
+
+    @staticmethod
+    def _fail_next_pending_step(steps: list[dict[str, Any]], detail: str) -> None:
+        for step in steps:
+            if step["status"] == "pending":
+                step["status"] = "failed"
+                step["detail"] = detail
+                return
+
+    def _manual_ops_restart_actions(self) -> list[dict[str, str]]:
+        command = self.compose_command("up", "-d", "--no-deps", "--force-recreate", "mineru-ops")
+        rendered = " ".join(shlex.quote(part) for part in command)
+        return [{
+            "label": "重建运维控制台以加载 MINERU_OPS_* 配置",
+            "command": f"cd {shlex.quote(str(self.project_dir))} && {rendered}",
+        }]
+
+    def _wait_for_services(
+        self,
+        services: list[str],
+        *,
+        timeout_seconds: float = 120,
+        poll_interval: float = 2,
+    ) -> dict[str, Any]:
+        if not services:
+            return {"ok": True, "services": {}, "elapsed_seconds": 0.0}
+        started = time.monotonic()
+        latest: dict[str, Any] = {}
+        while True:
+            result = self.services()
+            latest = result.get("services", {}) if isinstance(result, dict) else {}
+            if not isinstance(result, dict) or not result.get("ok"):
+                service_error = (
+                    str(result.get("error") or "无法读取 Compose 服务状态")
+                    if isinstance(result, dict)
+                    else "无法读取 Compose 服务状态"
+                )
+                return {
+                    "ok": False,
+                    "services": latest,
+                    "failures": {service: service_error for service in services},
+                    "error": service_error,
+                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                }
+            failures: dict[str, str] = {}
+            pending = False
+            for service in services:
+                runtime = latest.get(service, {}) if isinstance(latest, dict) else {}
+                state = str(runtime.get("state") or "unknown").lower()
+                health = str(runtime.get("health") or "none").lower()
+                if state == "running" and health in {"healthy", "none", ""}:
+                    continue
+                if state in {"exited", "dead", "removing"} or health == "unhealthy":
+                    failures[service] = f"state={state}, health={health}"
+                else:
+                    pending = True
+            elapsed = time.monotonic() - started
+            if failures:
+                return {"ok": False, "services": latest, "failures": failures, "elapsed_seconds": round(elapsed, 3)}
+            if not pending:
+                return {"ok": True, "services": latest, "elapsed_seconds": round(elapsed, 3)}
+            if elapsed >= timeout_seconds:
+                return {"ok": False, "services": latest, "failures": {service: "健康检查超时" for service in services}, "elapsed_seconds": round(elapsed, 3)}
+            time.sleep(poll_interval)
+
+    def _verify_config_values(self, changed_keys: list[str], services: list[str]) -> dict[str, Any]:
+        effective = self.config_effective()
+        if not effective.get("ok"):
+            return {"ok": False, "overall": "unknown", "error": effective.get("error"), "effective": effective}
+        failures: list[dict[str, Any]] = []
+        for item in effective.get("items", []):
+            if item.get("key") not in changed_keys:
+                continue
+            for service, detail in (item.get("services") or {}).items():
+                if service not in services:
+                    continue
+                if detail.get("status") != "applied":
+                    failures.append({"key": item.get("key"), "service": service, "status": detail.get("status"), "warnings": detail.get("warnings", [])})
+        return {
+            "ok": not failures,
+            "overall": "applied" if not failures else str(effective.get("overall") or "unknown"),
+            "failures": failures,
+            "effective": effective,
+        }
+
+    def _restore_after_apply_failure(self, path: Path, backup: Path, services: list[str]) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "env_restored": False,
+            "services_restored": False,
+            "rolled_back": False,
+            "rollback_status": "failed",
+            "rollback_error": None,
+            "rollback_recreate": None,
+            "rollback_health": None,
+        }
+        try:
+            _write_atomic(path, backup.read_text(encoding="utf-8"), backup.stat().st_mode & 0o777)
+            result["env_restored"] = True
+        except (OSError, UnicodeError) as exc:
+            result["rollback_error"] = f"恢复 env 文件失败：{exc}"
+            return result
+        recreated = self._recreate_services(services)
+        result["rollback_recreate"] = recreated
+        if not recreated.get("ok"):
+            result["rollback_status"] = "partial"
+            result["rollback_error"] = str(recreated.get("error") or "恢复服务失败")
+            return result
+        health = self._wait_for_services(services)
+        result["rollback_health"] = health
+        result["services_restored"] = bool(health.get("ok"))
+        result["rolled_back"] = result["env_restored"] and result["services_restored"]
+        result["rollback_status"] = "completed" if result["rolled_back"] else "partial"
+        if not result["services_restored"]:
+            result["rollback_error"] = "env 文件已恢复，但恢复后的服务健康检查失败"
+        return result
+
     def config_apply(self, values: Any) -> dict[str, Any]:
+        steps = [
+            self._apply_step("validate", "配置校验"),
+            self._apply_step("compose", "Compose 校验"),
+            self._apply_step("backup", "备份配置"),
+            self._apply_step("save", "写入配置"),
+            self._apply_step("recreate", "重建服务"),
+            self._apply_step("health", "健康检查"),
+            self._apply_step("verify", "生效验证"),
+        ]
+        secret_values: list[str] = []
+        path: Path | None = None
+        backup: Path | None = None
+        services: list[str] = []
+        config_written = False
+
+        def finish(payload: dict[str, Any]) -> dict[str, Any]:
+            self._skip_pending_steps(steps)
+            payload.setdefault("steps", steps)
+            payload.setdefault("affected_services", services)
+            payload.setdefault("requires_ops_restart", False)
+            payload.setdefault("manual_actions", [])
+            payload.setdefault("rolled_back", False)
+            payload.setdefault("rollback_status", None)
+            payload.setdefault("env_restored", False)
+            payload.setdefault("services_restored", False)
+            return _redact_payload(payload, secret_values)
+
         try:
             path = self.config_path()
             if not path.is_file():
-                return {"ok": False, "error": f"configured env file does not exist: {path.name}"}
+                self._set_step(steps, "validate", "failed")
+                return finish({"ok": False, "error": f"configured env file does not exist: {path.name}"})
             updates, errors, current = self._config_updates(values)
+            secret_values = _secret_values(current, updates)
             if errors:
-                return {"ok": False, "valid": False, "errors": errors, "message": "候选配置存在错误。"}
+                self._set_step(steps, "validate", "failed")
+                return finish({"ok": False, "valid": False, "errors": errors, "message": "候选配置存在错误。"})
+            candidate_values = dict(current)
+            candidate_values.update(updates)
+            page_timeout = int(candidate_values.get(
+                "MINERU_VLM_PAGE_TIMEOUT_SECONDS",
+                KNOWN_DEFAULTS["mineru-api"]["MINERU_VLM_PAGE_TIMEOUT_SECONDS"],
+            ))
+            http_timeout = int(candidate_values.get(
+                "MINERU_VLM_CLIENT_HTTP_TIMEOUT",
+                KNOWN_DEFAULTS["mineru-api"]["MINERU_VLM_CLIENT_HTTP_TIMEOUT"],
+            ))
+            if http_timeout < page_timeout:
+                message = (
+                    "HTTP 请求超时小于单页软超时，请求可能提前断开。"
+                    "请将 MINERU_VLM_CLIENT_HTTP_TIMEOUT 调整为不小于页级超时。"
+                )
+                self._set_step(steps, "validate", "failed", message)
+                return finish({"ok": False, "valid": False, "conflict": True, "error": message})
+            self._set_step(steps, "validate", "completed")
+
             changes = self._build_config_changes(updates, current)
             if not changes:
-                return {"ok": True, "applied": False, "no_changes": True, "changes": [], "affected_services": [], "requires_ops_restart": False}
+                return finish({
+                    "ok": True,
+                    "applied": False,
+                    "no_changes": True,
+                    "changes": [],
+                })
+
             candidate_content = _render_env_file(path, updates)
-            candidate = path.parent / f".{path.name}.apply-{os.getpid()}-{datetime.now(timezone.utc).timestamp():.6f}"
-            secret_values = [
-                value
-                for key in updates
-                if _is_sensitive_config_key(key)
-                for value in (current.get(key, ""), updates.get(key, ""))
-            ]
+            candidate = path.parent / (
+                f".{path.name}.apply-{os.getpid()}-"
+                f"{datetime.now(timezone.utc).timestamp():.6f}"
+            )
             try:
                 candidate.write_text(candidate_content, encoding="utf-8")
                 compose = self._compose_validate(candidate, secret_values)
                 if not compose["ok"]:
-                    return {"ok": False, "valid": True, "compose_valid": False, "error": compose["error"] or "Compose 配置校验失败"}
+                    self._set_step(steps, "compose", "failed")
+                    return finish({
+                        "ok": False,
+                        "valid": True,
+                        "compose_valid": False,
+                        "error": compose["error"] or "Compose 配置校验失败",
+                    })
+                self._set_step(steps, "compose", "completed")
+
                 backup = self._backup_config(path)
+                self._set_step(steps, "backup", "completed", backup.name)
                 _write_atomic(path, candidate_content, path.stat().st_mode & 0o777)
+                config_written = True
+                self._set_step(steps, "save", "completed")
+
                 changed_keys = [item["key"] for item in changes]
                 services, requires_ops_restart = self._affected_services(changed_keys)
+                manual_actions = self._manual_ops_restart_actions() if requires_ops_restart else []
+                base = {
+                    "applied": False,
+                    "backup": backup.name,
+                    "changes": changes,
+                    "affected_services": services,
+                    "requires_ops_restart": requires_ops_restart,
+                    "manual_actions": manual_actions,
+                }
+
                 recreated = self._recreate_services(services)
-                if not recreated["ok"]:
-                    _write_atomic(path, backup.read_text(encoding="utf-8"), backup.stat().st_mode & 0o777)
-                    self._recreate_services(services)
-                    return {"ok": False, "applied": False, "rolled_back": True, "backup": backup.name, "error": _redact_text(str(recreated.get("error") or "服务重建失败"), secret_values)}
-                return {"ok": True, "applied": True, "no_changes": False, "rolled_back": False, "backup": backup.name, "changes": changes, "affected_services": services, "requires_ops_restart": requires_ops_restart}
+                if not recreated.get("ok"):
+                    self._set_step(steps, "recreate", "failed")
+                    original_error = str(recreated.get("error") or "服务重建失败")
+                    rollback = self._restore_after_apply_failure(path, backup, services)
+                    return finish({
+                        **base,
+                        "ok": False,
+                        "recreate": recreated,
+                        "original_error": original_error,
+                        "error": original_error,
+                        **rollback,
+                    })
+                self._set_step(steps, "recreate", "completed" if services else "skipped")
+
+                health = self._wait_for_services(services)
+                if not health.get("ok"):
+                    self._set_step(steps, "health", "failed")
+                    original_error = "服务健康检查失败"
+                    rollback = self._restore_after_apply_failure(path, backup, services)
+                    return finish({
+                        **base,
+                        "ok": False,
+                        "recreate": recreated,
+                        "health": health,
+                        "original_error": original_error,
+                        "error": original_error,
+                        **rollback,
+                    })
+                self._set_step(steps, "health", "completed" if services else "skipped")
+
+                verification = self._verify_config_values(changed_keys, services)
+                if not verification.get("ok"):
+                    self._set_step(steps, "verify", "failed")
+                    original_error = "最终配置验证失败"
+                    rollback = self._restore_after_apply_failure(path, backup, services)
+                    return finish({
+                        **base,
+                        "ok": False,
+                        "recreate": recreated,
+                        "health": health,
+                        "verification": verification,
+                        "original_error": original_error,
+                        "error": original_error,
+                        **rollback,
+                    })
+                self._set_step(steps, "verify", "completed" if services else "skipped")
+                return finish({
+                    **base,
+                    "ok": True,
+                    "applied": True,
+                    "no_changes": False,
+                    "recreate": recreated,
+                    "health": health,
+                    "verification": verification,
+                })
             finally:
                 candidate.unlink(missing_ok=True)
-        except (OSError, ValueError) as exc:
-            return {"ok": False, "error": str(exc)}
+        except (OSError, UnicodeError, ValueError) as exc:
+            original_error = str(exc)
+            self._fail_next_pending_step(steps, original_error)
+            payload: dict[str, Any] = {
+                "ok": False,
+                "applied": False,
+                "original_error": original_error,
+                "error": original_error,
+            }
+            if config_written and path is not None and backup is not None:
+                payload.update(self._restore_after_apply_failure(path, backup, services))
+                payload["backup"] = backup.name
+            return finish(payload)
 
     def config_restore(self, name: str) -> dict[str, Any]:
+        steps = [
+            self._apply_step("validate", "配置校验"),
+            self._apply_step("compose", "Compose 校验"),
+            self._apply_step("backup", "备份配置"),
+            self._apply_step("save", "写入配置"),
+            self._apply_step("recreate", "重建服务"),
+            self._apply_step("health", "健康检查"),
+            self._apply_step("verify", "生效验证"),
+        ]
+        secret_values: list[str] = []
+        path: Path | None = None
+        safety_backup: Path | None = None
+        services: list[str] = []
+        config_written = False
+
+        def finish(payload: dict[str, Any]) -> dict[str, Any]:
+            self._skip_pending_steps(steps)
+            payload.setdefault("steps", steps)
+            payload.setdefault("source", name)
+            payload.setdefault("affected_services", services)
+            payload.setdefault("requires_ops_restart", False)
+            payload.setdefault("manual_actions", [])
+            payload.setdefault("rolled_back", False)
+            payload.setdefault("rollback_status", None)
+            payload.setdefault("env_restored", False)
+            payload.setdefault("services_restored", False)
+            return _redact_payload(payload, secret_values)
+
         try:
             path = self.config_path()
             if Path(name).name != name or not re.fullmatch(
                 re.escape(path.name) + r"\.bak-\d{8}-\d{6}-\d{6}",
                 name,
             ):
-                return {"ok": False, "error": "invalid configuration backup name"}
+                self._set_step(steps, "validate", "failed")
+                return finish({"ok": False, "restored": False, "error": "invalid configuration backup name"})
             backup = (path.parent / name).resolve()
             backup.relative_to(path.parent.resolve())
             if not backup.is_file():
-                return {"ok": False, "error": "configuration backup does not exist"}
+                self._set_step(steps, "validate", "failed")
+                return finish({"ok": False, "restored": False, "error": "configuration backup does not exist"})
+
             current = _parse_env_file(path)
             target = _parse_env_file(backup)
+            secret_values = _secret_values(current, target)
             changed_keys = sorted(
                 key for key in set(current) | set(target)
                 if current.get(key) != target.get(key)
             )
+            self._set_step(steps, "validate", "completed")
             if not changed_keys:
-                return {"ok": True, "restored": False, "no_changes": True, "source": name, "affected_services": [], "requires_ops_restart": False}
-            secret_values = [
-                value
-                for key in changed_keys
-                if _is_sensitive_config_key(key)
-                for value in (current.get(key, ""), target.get(key, ""))
-            ]
+                return finish({
+                    "ok": True,
+                    "restored": False,
+                    "no_changes": True,
+                    "changed_keys": [],
+                })
+
             compose = self._compose_validate(backup, secret_values)
             if not compose["ok"]:
-                return {"ok": False, "compose_valid": False, "error": compose["error"] or "Compose 配置校验失败"}
+                self._set_step(steps, "compose", "failed")
+                return finish({
+                    "ok": False,
+                    "restored": False,
+                    "compose_valid": False,
+                    "error": compose["error"] or "Compose 配置校验失败",
+                })
+            self._set_step(steps, "compose", "completed")
+
             safety_backup = self._backup_config(path)
+            self._set_step(steps, "backup", "completed", safety_backup.name)
             content = backup.read_text(encoding="utf-8")
             _write_atomic(path, content, safety_backup.stat().st_mode & 0o777)
+            config_written = True
+            self._set_step(steps, "save", "completed")
+
             services, requires_ops_restart = self._affected_services(changed_keys)
+            manual_actions = self._manual_ops_restart_actions() if requires_ops_restart else []
+            base = {
+                "restored": False,
+                "backup": safety_backup.name,
+                "changed_keys": changed_keys,
+                "affected_services": services,
+                "requires_ops_restart": requires_ops_restart,
+                "manual_actions": manual_actions,
+            }
+
             recreated = self._recreate_services(services)
-            if not recreated["ok"]:
-                _write_atomic(path, safety_backup.read_text(encoding="utf-8"), safety_backup.stat().st_mode & 0o777)
-                self._recreate_services(services)
-                return {"ok": False, "restored": False, "rolled_back": True, "backup": safety_backup.name, "error": _redact_text("服务重建失败，已恢复当前配置", secret_values)}
-            return {"ok": True, "restored": True, "no_changes": False, "backup": safety_backup.name, "source": name, "changed_keys": changed_keys, "affected_services": services, "requires_ops_restart": requires_ops_restart}
-        except (OSError, ValueError) as exc:
-            return {"ok": False, "error": str(exc)}
+            if not recreated.get("ok"):
+                self._set_step(steps, "recreate", "failed")
+                original_error = str(recreated.get("error") or "服务重建失败")
+                rollback = self._restore_after_apply_failure(path, safety_backup, services)
+                return finish({
+                    **base,
+                    "ok": False,
+                    "recreate": recreated,
+                    "original_error": original_error,
+                    "error": original_error,
+                    **rollback,
+                })
+            self._set_step(steps, "recreate", "completed" if services else "skipped")
+
+            health = self._wait_for_services(services)
+            if not health.get("ok"):
+                self._set_step(steps, "health", "failed")
+                original_error = "服务健康检查失败"
+                rollback = self._restore_after_apply_failure(path, safety_backup, services)
+                return finish({
+                    **base,
+                    "ok": False,
+                    "recreate": recreated,
+                    "health": health,
+                    "original_error": original_error,
+                    "error": original_error,
+                    **rollback,
+                })
+            self._set_step(steps, "health", "completed" if services else "skipped")
+
+            verification = self._verify_config_values(changed_keys, services)
+            if not verification.get("ok"):
+                self._set_step(steps, "verify", "failed")
+                original_error = "最终配置验证失败"
+                rollback = self._restore_after_apply_failure(path, safety_backup, services)
+                return finish({
+                    **base,
+                    "ok": False,
+                    "recreate": recreated,
+                    "health": health,
+                    "verification": verification,
+                    "original_error": original_error,
+                    "error": original_error,
+                    **rollback,
+                })
+            self._set_step(steps, "verify", "completed" if services else "skipped")
+            return finish({
+                **base,
+                "ok": True,
+                "restored": True,
+                "no_changes": False,
+                "recreate": recreated,
+                "health": health,
+                "verification": verification,
+            })
+        except (OSError, UnicodeError, ValueError) as exc:
+            original_error = str(exc)
+            self._fail_next_pending_step(steps, original_error)
+            payload: dict[str, Any] = {
+                "ok": False,
+                "restored": False,
+                "original_error": original_error,
+                "error": original_error,
+            }
+            if config_written and path is not None and safety_backup is not None:
+                payload.update(self._restore_after_apply_failure(path, safety_backup, services))
+                payload["backup"] = safety_backup.name
+            return finish(payload)
 
     def config_history(self) -> dict[str, Any]:
         try:
@@ -850,12 +1315,25 @@ class Agent:
         state = inspect.get("State") if isinstance(inspect.get("State"), dict) else {}
         health = state.get("Health") if isinstance(state.get("Health"), dict) else {}
         config = inspect.get("Config") if isinstance(inspect.get("Config"), dict) else {}
+        path = str(inspect.get("Path") or "")
+        args = [str(item) for item in inspect.get("Args", [])] if isinstance(inspect.get("Args"), list) else []
+        cmd = [str(item) for item in config.get("Cmd", [])] if isinstance(config.get("Cmd"), list) else []
+        entrypoint = [str(item) for item in config.get("Entrypoint", [])] if isinstance(config.get("Entrypoint"), list) else []
+        actual_tokens = [item for item in [path, *args] if item]
+        fallback_tokens = [item for item in [*entrypoint, *cmd] if item]
+        command_options = _parse_command_options(fallback_tokens)
+        command_options.update(_parse_command_options(actual_tokens))
         return {
             "state": state.get("Status") or "unknown",
             "health": health.get("Status") or "none",
             "image": config.get("Image") or inspect.get("Image"),
             "started_at": state.get("StartedAt"),
             "finished_at": state.get("FinishedAt"),
+            "path": path,
+            "args": args,
+            "command": actual_tokens or fallback_tokens,
+            "command_options": command_options,
+            "container_env": _parse_environment_list(config.get("Env")),
         }
 
     def _service_config_status(
@@ -890,7 +1368,15 @@ class Agent:
             base["status"] = "unknown"
             base["warnings"].append(error or "无法读取容器信息")
             return base
-        base.update(self._inspect_runtime(inspect))
+        runtime_info = self._inspect_runtime(inspect)
+        # Keep raw values only for the local comparison below. docker inspect may
+        # contain an old secret that is no longer present in env.multi, so redact
+        # the whole runtime snapshot before it becomes part of the response.
+        runtime_secrets = _secret_values(
+            runtime_info.get("command_options"),
+            runtime_info.get("container_env"),
+        )
+        base.update(_redact_payload(runtime_info, runtime_secrets))
         actual = _parse_environment_list((inspect.get("Config") or {}).get("Env"))
         expected_keys = _service_expected_env_keys(service)
         if not expected_keys:
@@ -945,6 +1431,189 @@ class Agent:
             "version": f"{modified.strftime('%Y%m%d-%H%M%S')}-{sha256[:8]}",
         }
 
+    def config_effective(self) -> dict[str, Any]:
+        """Report the final value inferred from command, env, and defaults."""
+        try:
+            path = self.config_path()
+            if not path.is_file():
+                return {"ok": False, "error": f"configured env file does not exist: {path.name}"}
+            current = _parse_env_file(path)
+            metadata = self._config_file_metadata(path, current)
+        except (OSError, UnicodeError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+
+        service_result = self.services()
+        service_read_ok = (
+            isinstance(service_result, dict)
+            and bool(service_result.get("ok"))
+        )
+        runtime_services = (
+            service_result.get("services", {})
+            if service_read_ok
+            else {}
+        )
+        service_error = (
+            str(service_result.get("error") or "无法读取 Compose 服务状态")
+            if isinstance(service_result, dict)
+            else "无法读取 Compose 服务状态"
+        )
+        configured = sorted(
+            service for service in self.configured_services()
+            if service == "mineru-api"
+            or service.startswith("mineru-api-")
+            or service in {"mineru-router", "mineru-ops"}
+        )
+        items: list[dict[str, Any]] = []
+        summary = {key: 0 for key in ("applied", "pending_restart", "conflict", "inconsistent", "unknown", "not_created")}
+        warnings: list[str] = []
+
+        for schema in CONFIG_SCHEMA:
+            key = str(schema["key"])
+            sensitive = _is_sensitive_config_key(key)
+            configured_value = current.get(key)
+            item_services: dict[str, Any] = {}
+            applicable = [service for service in configured if key in _service_expected_env_keys(service)]
+            for service in applicable:
+                runtime = runtime_services.get(service, {}) if isinstance(runtime_services, dict) else {}
+                container = runtime.get("container") if isinstance(runtime, dict) else None
+                detail: dict[str, Any] = {
+                    "container": container,
+                    "state": runtime.get("state") if isinstance(runtime, dict) else "unknown",
+                    "health": runtime.get("health") if isinstance(runtime, dict) else "unknown",
+                    "container_env_value": None,
+                    "command_value": None,
+                    "default_value": None,
+                    "effective_value": None,
+                    "effective_source": "unknown",
+                    "effective_source_label": "未知",
+                    "inferred": True,
+                    "status": "unknown",
+                    "warnings": [],
+                }
+                if not service_read_ok:
+                    detail["state"] = "unknown"
+                    detail["status"] = "unknown"
+                    detail["warnings"].append(service_error)
+                    item_services[service] = detail
+                    continue
+                if not container:
+                    detail["state"] = "not-created"
+                    detail["status"] = "not_created"
+                    detail["warnings"].append("容器尚未创建，无法确认最终有效配置")
+                    item_services[service] = detail
+                    continue
+                inspect, error = self._inspect_container(str(container))
+                if inspect is None:
+                    detail["warnings"].append(error or "无法读取容器信息")
+                    item_services[service] = detail
+                    continue
+                runtime_info = self._inspect_runtime(inspect)
+                detail.update({
+                    "state": runtime_info.get("state") or detail["state"],
+                    "health": runtime_info.get("health") or detail["health"],
+                    "command_value": runtime_info.get("command_options", {}).get(key),
+                    "container_env_value": runtime_info.get("container_env", {}).get(key),
+                })
+                defaults = KNOWN_DEFAULTS.get(_normalize_service_name(service), {})
+                detail["default_value"] = defaults.get(key)
+                if detail["command_value"] is not None:
+                    detail["effective_value"] = detail["command_value"]
+                    detail["effective_source"] = "command"
+                    detail["effective_source_label"] = "命令行参数"
+                elif detail["container_env_value"] is not None:
+                    detail["effective_value"] = detail["container_env_value"]
+                    detail["effective_source"] = "environment"
+                    detail["effective_source_label"] = "容器环境变量"
+                elif detail["default_value"] is not None:
+                    detail["effective_value"] = detail["default_value"]
+                    detail["effective_source"] = "default"
+                    detail["effective_source_label"] = "已知默认值"
+                else:
+                    detail["warnings"].append("未发现命令行参数、容器环境变量或已知默认值")
+                if configured_value is not None and detail["effective_value"] is not None:
+                    detail["status"] = "applied" if configured_value == detail["effective_value"] else "pending_restart"
+                    if detail["status"] == "pending_restart":
+                        detail["warnings"].append("最终有效值与 env.multi 配置值不一致，可能需要重启或检查启动参数")
+                elif detail["effective_value"] is not None:
+                    detail["status"] = "applied"
+                item_services[service] = detail
+
+            if not item_services:
+                continue
+            api_services = {
+                service: detail
+                for service, detail in item_services.items()
+                if service == "mineru-api" or service.startswith("mineru-api-")
+            }
+            effective_values = {
+                str(detail.get("effective_value"))
+                for detail in api_services.values()
+                if detail.get("effective_value") is not None
+            }
+            if len(api_services) >= 2 and len(effective_values) > 1:
+                for detail in api_services.values():
+                    if detail.get("status") not in {"unknown", "not_created"}:
+                        detail["status"] = "inconsistent"
+                        detail["warnings"].append("多个 API 实例最终有效值不一致")
+            page_value = current.get(
+                "MINERU_VLM_PAGE_TIMEOUT_SECONDS",
+                KNOWN_DEFAULTS["mineru-api"]["MINERU_VLM_PAGE_TIMEOUT_SECONDS"],
+            )
+            http_value = current.get(
+                "MINERU_VLM_CLIENT_HTTP_TIMEOUT",
+                KNOWN_DEFAULTS["mineru-api"]["MINERU_VLM_CLIENT_HTTP_TIMEOUT"],
+            )
+            if key in {"MINERU_VLM_PAGE_TIMEOUT_SECONDS", "MINERU_VLM_CLIENT_HTTP_TIMEOUT"} and page_value and http_value:
+                try:
+                    if int(http_value) < int(page_value):
+                        for service, detail in item_services.items():
+                            if service.startswith("mineru-api") or service == "mineru-router":
+                                detail["status"] = "conflict"
+                                detail["warnings"].append("HTTP 请求超时小于单页超时，配置存在冲突")
+                except ValueError:
+                    pass
+            item_warnings = sorted({warning for detail in item_services.values() for warning in detail.get("warnings", [])})
+            item = dict(schema)
+            item.update({
+                "configured_value": _display_config_value(key, configured_value),
+                "sensitive": sensitive,
+                "services": item_services,
+                "warnings": item_warnings,
+            })
+            items.append(item)
+
+        for item in items:
+            key = str(item.get("key") or "")
+            for detail in item.get("services", {}).values():
+                status = detail.get("status", "unknown")
+                summary[status if status in summary else "unknown"] += 1
+                warnings.extend(detail.get("warnings", []))
+                for value_key in ("command_value", "container_env_value", "default_value", "effective_value"):
+                    detail[value_key] = _display_config_value(key, detail.get(value_key))
+        if summary["conflict"]:
+            overall = "conflict"
+        elif summary["inconsistent"]:
+            overall = "inconsistent"
+        elif summary["pending_restart"]:
+            overall = "pending_restart"
+        elif summary["unknown"] or summary["not_created"]:
+            overall = "unknown"
+        else:
+            overall = "applied"
+        if not service_read_ok:
+            warnings.append(service_error)
+            overall = "unknown"
+        result = {
+            "ok": True,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "env_file": metadata,
+            "overall": overall,
+            "summary": summary,
+            "items": items,
+            "warnings": sorted(set(warnings)),
+        }
+        return _redact_payload(result, _secret_values(current))
+
     def config_status(self) -> dict[str, Any]:
         try:
             path = self.config_path()
@@ -955,26 +1624,47 @@ class Agent:
         except (OSError, UnicodeError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
         service_result = self.services()
-        runtime_services = service_result.get("services", {}) if isinstance(service_result, dict) else {}
+        service_read_ok = isinstance(service_result, dict) and bool(service_result.get("ok"))
+        runtime_services = service_result.get("services", {}) if service_read_ok else {}
+        service_error = (
+            str(service_result.get("error") or "无法读取 Compose 服务状态")
+            if isinstance(service_result, dict)
+            else "无法读取 Compose 服务状态"
+        )
         configured = sorted(self.configured_services())
         statuses: dict[str, Any] = {}
         for service in configured:
             runtime = runtime_services.get(service, {}) if isinstance(runtime_services, dict) else {}
-            statuses[service] = self._service_config_status(service, runtime, current)
+            if service_read_ok:
+                statuses[service] = self._service_config_status(service, runtime, current)
+            else:
+                status = self._service_config_status(service, {}, current)
+                status.update(
+                    {
+                        "state": "unknown",
+                        "status": "unknown",
+                        "requires_restart": None,
+                        "matches_current_env": None,
+                        "warnings": [service_error],
+                    }
+                )
+                statuses[service] = status
         counts = {key: 0 for key in ("applied", "pending_restart", "unknown", "not_created")}
         for status in statuses.values():
-            value = status.get("status", "unknown")
+            value = status.get("status", "unknown") if isinstance(status, dict) else "unknown"
             counts[value if value in counts else "unknown"] += 1
-        if counts["pending_restart"]:
+        if not service_read_ok:
+            overall = "unknown"
+        elif counts["pending_restart"]:
             overall = "pending_restart" if not counts["applied"] else "partially_applied"
         elif counts["unknown"] or counts["not_created"]:
             overall = "unknown" if not counts["applied"] else "partially_applied"
         else:
             overall = "applied"
         warnings = []
-        if not service_result.get("ok"):
-            warnings.append(str(service_result.get("error") or "无法读取 Compose 服务状态"))
-        return {
+        if not service_read_ok:
+            warnings.append(service_error)
+        result = {
             "ok": True,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "env_file": metadata,
@@ -983,6 +1673,7 @@ class Agent:
             "services": statuses,
             "warnings": warnings,
         }
+        return _redact_payload(result, _secret_values(current))
 
     def _inspect_path(self, container: str, path: str) -> dict[str, Any]:
         quoted = shlex.quote(path)
@@ -1008,15 +1699,19 @@ class Agent:
 
     def deep_diagnostics(self) -> dict[str, Any]:
         status_result = self.config_status()
+        if not isinstance(status_result, dict):
+            return {"ok": False, "error": "无法读取配置状态"}
         if not status_result.get("ok"):
             return status_result
         try:
             current = _parse_env_file(self.config_path())
-        except (OSError, ValueError) as exc:
-            return {"ok": False, "error": str(exc)}
-        services = status_result.get("services", {})
+        except (OSError, UnicodeError, ValueError):
+            current = {}
+        services = status_result.get("services", {}) if isinstance(status_result.get("services"), dict) else {}
         details: dict[str, Any] = {}
         for service, config_status in services.items():
+            if not isinstance(config_status, dict):
+                config_status = {"container": None, "warnings": ["配置状态格式无效"]}
             container = config_status.get("container")
             detail = dict(config_status)
             detail["environment"] = {}
@@ -1053,7 +1748,7 @@ class Agent:
                 model = self._inspect_path(str(container), path)
                 model["key"] = key
                 detail["models"].append(model)
-            if service.startswith("mineru-api-") or service == "mineru-router":
+            if service == "mineru-api" or service.startswith("mineru-api-") or service == "mineru-router":
                 for name, command in (("npu", "npu-smi info"), ("gpu", "nvidia-smi")):
                     result = _trim_command_result(run_command(["docker", "exec", str(container), "sh", "-c", command], self.project_dir, timeout=30))
                     detail["devices"][name] = {
@@ -1063,7 +1758,7 @@ class Agent:
                         "error": result.get("error"),
                     }
             details[service] = detail
-        return {
+        result = {
             "ok": True,
             "generated_at": status_result.get("generated_at"),
             "env_file": status_result.get("env_file"),
@@ -1071,6 +1766,7 @@ class Agent:
             "services": details,
             "warnings": status_result.get("warnings", []),
         }
+        return _redact_payload(result, _secret_values(current))
 
     def handle(self, request: dict[str, Any]) -> dict[str, Any]:
         action = request.get("action")
@@ -1090,6 +1786,8 @@ class Agent:
             return self.config_history()
         if action == "config_status":
             return self.config_status()
+        if action == "config_effective":
+            return self.config_effective()
         if action == "deep_diagnostics":
             return self.deep_diagnostics()
         if action == "services":
@@ -1190,7 +1888,11 @@ class Agent:
 
     def diagnostics(self, tail: int) -> dict[str, Any]:
         services = sorted(
-            service for service in self.configured_services() if service == "mineru-router" or service.startswith("mineru-api-")
+            service
+            for service in self.configured_services()
+            if service == "mineru-api"
+            or service.startswith("mineru-api-")
+            or service == "mineru-router"
         )
         logs = {service: self.logs(service, tail) for service in services}
         npu_smi = run_command(["npu-smi", "info"], self.project_dir, timeout=30)
@@ -1199,12 +1901,17 @@ class Agent:
             self.project_dir,
             timeout=30,
         )
-        return {
+        result = {
             "ok": True,
             "logs": logs,
             "npu_smi": npu_smi,
             "docker_version": docker_info,
         }
+        try:
+            current = _parse_env_file(self.config_path())
+        except (OSError, UnicodeError, ValueError):
+            current = {}
+        return _redact_payload(result, _secret_values(current))
 
 
 class AgentRequestHandler(socketserver.StreamRequestHandler):
