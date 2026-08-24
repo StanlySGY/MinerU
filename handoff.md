@@ -1,5 +1,71 @@
 # Session handoff — 2026-08-23
 
+## 2026-08-24：UI19 日志排除过滤、批量删除与配置界面整理
+
+### 本轮完成
+
+- 日志页新增“排除关键词”输入框，支持逗号分隔多个排除词；默认隐藏 `GET /health`、`/ready`、`/live` 等成功探活日志，仍可关闭隐藏并查看原始行。
+- 批量测试页新增可删除终态记录的多选和批量删除；新增 `POST /api/batch-runs/bulk-delete`，逐条返回 `deleted`/`failed`，活动中的记录不会被删除。
+- 性能实验室新增“选择当前筛选”和批量删除，复用批量删除接口；删除后自动刷新实验归档和批量测试记录。
+- 批量测试关联 Task 链接统一进入任务页并立即调用 `loadTaskDetail`，跳转后直接打开对应任务详情。
+- 配置最终有效值卡片调整为更明确的分层卡片布局；配置项帮助按钮增加兜底说明和使用提示，缺失 schema `help` 时不再出现空白弹窗。
+- 静态资源版本更新为 `ui19`。
+
+### 修改文件
+
+```text
+mineru/cli/ops.py
+mineru/ops/static/index.html
+mineru/ops/static/ops.js
+mineru/ops/static/ops.css
+tests/unit/test_ops_console.py
+handoff.md
+```
+
+### 验证
+
+```text
+python -m pytest -o addopts='' tests/unit/test_ops_console.py -q
+# 43 passed
+python -m py_compile mineru/cli/ops.py
+node --check mineru/ops/static/ops.js
+git diff --check
+```
+
+### 注意
+
+- 批量删除只接受终态记录；运行中、暂停中或仍有本地批处理进程的记录会返回失败原因，需要先停止。
+- 日志过滤在浏览器端对已拉取的 tail 内容生效，不改变服务端日志采集范围；排查时可先增大 tail，再组合包含/排除条件。
+
+### 提交与服务器构建发布流程
+
+- 本轮完成后需要提交并推送 GitHub `dev` 分支；后续每轮完成也沿用该流程。
+- 服务器项目目录固定为：`/data/maas/sgy_arm/gd-dev/MinerU`。
+- 服务器拉取代码：
+
+```bash
+cd /data/maas/sgy_arm/gd-dev/MinerU
+git fetch origin dev
+git checkout dev
+git pull --ff-only origin dev
+```
+
+- 代码镜像版本按小版本号递增。上次示例为 `mineru-code:v3.4.2-ops-ui17`；如果下一次发布使用 UI18，服务器构建命令为：
+
+```bash
+cd /data/maas/sgy_arm/gd-dev/MinerU
+docker build -t mineru-code:v3.4.2-ops-ui18 -f docker/base/Dockerfile.code .
+```
+
+- 保存镜像：
+
+```bash
+docker save mineru-code:v3.4.2-ops-ui18 | gzip > /data/maas/sgy_arm/gd-dev/MinerU/docker/base/export/mineru-code-v3.4.2-ops-ui18.tar.gz
+```
+
+- 以后继续递增 `ops-ui18`、`ops-ui19`、`ops-ui20`，构建标签和导出文件名必须保持一致。本轮工作区静态资源已更新为 `ui19`，若部署本轮代码应使用 `mineru-code:v3.4.2-ops-ui19` 和对应的 `mineru-code-v3.4.2-ops-ui19.tar.gz`。
+- 若服务器使用共享 `/app` code volume，构建镜像后仍需按现场流程刷新或重建 code volume，并重建 `mineru-ops`、API、Router 等相关服务；部署后浏览器执行 `Ctrl+F5`。
+
 ## 2026-08-23 完成：UI15 性能实验档案、统计与对比导出
 
 本轮把运维控制台的性能实验从“临时批量测试”提升为可复盘的实验档案闭环，方便现场对不同 batch、超时和重试策略进行对比，而不需要手工抄录结果。

@@ -10,6 +10,7 @@ const state = {
   taskTimingOffset: 0,
   taskRefreshLoading: false,
   batches: [],
+  selectedBatchRuns: new Set(),
   uploadItems: [],
   activeBatchId: null,
   activeBatchDetail: null,
@@ -200,6 +201,13 @@ function switchView(view) {
   requestAnimationFrame(() => {
     if (state.view === view && !state.viewAbortController.signal.aborted) void refreshCurrent();
   });
+}
+
+function openTaskInTasks(taskId) {
+  if (!taskId) return;
+  state.activeTaskId = taskId;
+  switchView("tasks");
+  requestAnimationFrame(() => void loadTaskDetail(taskId));
 }
 
 document.getElementById("nav").addEventListener("click", event => {
@@ -435,7 +443,7 @@ document.getElementById("tasks-table").addEventListener("click", event => {
 });
 document.getElementById("overview-tasks").addEventListener("click", event => {
   const row = event.target.closest("[data-task]");
-  if (row) { switchView("tasks"); setTimeout(() => loadTaskDetail(row.dataset.task), 0); }
+  if (row) openTaskInTasks(row.dataset.task);
 });
 
 const phaseText = {
@@ -653,7 +661,7 @@ function batchActions(run) {
 
 function compactBatchRows(items, limit = 100) {
   if (!items.length) return `<div class="empty-state">暂无批量测试</div>`;
-  return `<table><thead><tr><th>输入 / 任务</th><th>状态</th><th>PDF</th><th>开始时间</th><th>记录</th><th>操作</th></tr></thead><tbody>${items.slice(0, limit).map(run => {
+  return `<table><thead><tr><th>选择</th><th>输入 / 任务</th><th>状态</th><th>PDF</th><th>开始时间</th><th>记录</th><th>操作</th></tr></thead><tbody>${items.slice(0, limit).map(run => {
     const previewText = run.input_preview_ready || run.result_preview_ready ? "可预览" : "";
     const retrySource = run.settings?.source_type === "problem_page_retry" && run.settings?.retry_of_run_id
       ? `<div class="muted">异常页重试 · 来源 ${esc(run.settings.retry_of_run_id)}</div>`
@@ -662,16 +670,39 @@ function compactBatchRows(items, limit = 100) {
     const taskLinks = links.length
       ? links.map(task => `<button class="text-button" data-task-link="${esc(task.task_id)}" title="打开任务">${esc(task.display_name || task.file_name || task.task_id)}</button>`).join("")
       : `<span class="muted">任务尚未登记</span>`;
-    return `<tr><td><strong>${esc(run.settings?.input_path || run.input_path)}</strong>${retrySource}<div class="mono muted">${esc(run.run_id)}</div><div class="batch-task-links">${taskLinks}</div></td><td>${badge(run.status)}${previewText ? `<div class="muted">${previewText}</div>` : ""}</td><td>${run.settings?.pdf_count || "-"}</td><td>${esc(formatDate(run.started_at || run.created_at))}</td><td><button class="text-button" data-batch-detail="${esc(run.run_id)}">查看记录</button></td><td><div class="actions">${batchActions(run)}</div></td></tr>`;
+    const deletable = LAB_TERMINAL_STATES.has(run.status);
+    return `<tr><td>${deletable ? `<input type="checkbox" data-batch-select="${esc(run.run_id)}" ${state.selectedBatchRuns.has(run.run_id) ? "checked" : ""} aria-label="选择 ${esc(run.run_id)}">` : "-"}</td><td><strong>${esc(run.settings?.input_path || run.input_path)}</strong>${retrySource}<div class="mono muted">${esc(run.run_id)}</div><div class="batch-task-links">${taskLinks}</div></td><td>${badge(run.status)}${previewText ? `<div class="muted">${previewText}</div>` : ""}</td><td>${run.settings?.pdf_count || "-"}</td><td>${esc(formatDate(run.started_at || run.created_at))}</td><td><button class="text-button" data-batch-detail="${esc(run.run_id)}">查看记录</button></td><td><div class="actions">${batchActions(run)}</div></td></tr>`;
   }).join("")}</tbody></table>`;
 }
 
 async function loadBatches() {
   const data = await api("/api/batch-runs");
   state.batches = data.items || [];
+  state.selectedBatchRuns = new Set([...state.selectedBatchRuns].filter(id => state.batches.some(run => run.run_id === id)));
   const storage = data.storage || {};
   document.getElementById("batch-storage").textContent = storage.max_bytes ? `产物空间 ${formatBytes(storage.used_bytes || 0)} / ${formatBytes(storage.max_bytes)}（${storage.usage_percent || 0}%），保留 ${storage.retention_days} 天` : "默认串行提交 PDF";
   document.getElementById("batch-table").innerHTML = compactBatchRows(state.batches);
+  updateBatchSelectionUi();
+}
+
+function updateBatchSelectionUi() {
+  const count = document.getElementById("batch-selection-count");
+  const button = document.getElementById("batch-delete-selected");
+  if (count) count.textContent = `已选择 ${state.selectedBatchRuns.size} 条`;
+  if (button) button.disabled = !state.selectedBatchRuns.size;
+}
+
+async function deleteBatchRuns(runIds) {
+  const ids = [...new Set(runIds)].filter(Boolean);
+  if (!ids.length) return;
+  if (!confirm(`确认删除 ${ids.length} 条批量记录？仅终态记录会被删除，产物也会一并移除。`)) return;
+  try {
+    const result = await api("/api/batch-runs/bulk-delete", {method: "POST", body: JSON.stringify({run_ids: ids})});
+    state.selectedBatchRuns.clear();
+    notice(`已删除 ${result.deleted?.length || 0} 条记录${result.failed?.length ? `，${result.failed.length} 条未删除` : ""}`, result.failed?.length > 0);
+    await loadBatches();
+    if (state.view === "lab") await loadLab();
+  } catch (error) { notice(error.message); }
 }
 
 const batchFilesInput = document.getElementById("batch-files");
@@ -856,8 +887,7 @@ async function handleBatchTableClick(event) {
   const taskLink = event.target.closest("[data-task-link]");
   if (taskLink) {
     const taskId = taskLink.dataset.taskLink;
-    switchView("tasks");
-    requestAnimationFrame(() => void loadTaskDetail(taskId));
+    openTaskInTasks(taskId);
     return;
   }
   const problemRetryButton = event.target.closest("[data-problem-pages-retry]");
@@ -885,6 +915,19 @@ async function handleBatchTableClick(event) {
 
 document.getElementById("batch-table").addEventListener("click", handleBatchTableClick);
 document.getElementById("overview-batches").addEventListener("click", handleBatchTableClick);
+document.getElementById("batch-table").addEventListener("change", event => {
+  const checkbox = event.target.closest("[data-batch-select]");
+  if (!checkbox) return;
+  if (checkbox.checked) state.selectedBatchRuns.add(checkbox.dataset.batchSelect);
+  else state.selectedBatchRuns.delete(checkbox.dataset.batchSelect);
+  updateBatchSelectionUi();
+});
+document.getElementById("batch-select-visible").addEventListener("click", () => {
+  state.batches.filter(run => LAB_TERMINAL_STATES.has(run.status)).forEach(run => state.selectedBatchRuns.add(run.run_id));
+  document.getElementById("batch-table").innerHTML = compactBatchRows(state.batches);
+  updateBatchSelectionUi();
+});
+document.getElementById("batch-delete-selected").addEventListener("click", () => deleteBatchRuns(state.selectedBatchRuns));
 
 const problemPagesRetryDialog = document.getElementById("problem-pages-retry-dialog");
 const problemPagesRetryForm = document.getElementById("problem-pages-retry-form");
@@ -1524,8 +1567,18 @@ async function loadSelectedServiceLogs({showLoading = false} = {}) {
 function renderFilteredLogs() {
   const output = document.getElementById("log-output");
   const filter = document.getElementById("log-filter")?.value.trim().toLowerCase() || "";
+  const excluded = (document.getElementById("log-exclude")?.value || "")
+    .split(",").map(value => value.trim().toLowerCase()).filter(Boolean);
+  const hideHealth = Boolean(document.getElementById("log-hide-health")?.checked);
   const lines = state.logRawText.split("\n");
-  const visible = filter ? lines.filter(line => line.toLowerCase().includes(filter)) : lines;
+  const isHealthProbe = line => /\"(?:GET|HEAD) \/(?:health|ready|readiness|live|liveness)(?:\?|\s|\")/i.test(line)
+    || /(?:GET|HEAD) \/health\b.*\b(?:200|204)\s+(?:OK)?/i.test(line);
+  const visible = lines.filter(line => {
+    const normalized = line.toLowerCase();
+    return (!filter || normalized.includes(filter))
+      && (!hideHealth || !isHealthProbe(line))
+      && !excluded.some(term => normalized.includes(term));
+  });
   output.textContent = visible.join("\n") || "没有匹配的日志。";
   const service = document.getElementById("log-service")?.value || "日志";
   setLogStatus(`${service} · ${visible.length}/${lines.length} 行`);
@@ -1550,6 +1603,8 @@ document.getElementById("log-follow").addEventListener("change", event => {
   }
 });
 document.getElementById("log-filter").addEventListener("input", renderFilteredLogs);
+document.getElementById("log-exclude").addEventListener("input", renderFilteredLogs);
+document.getElementById("log-hide-health").addEventListener("change", renderFilteredLogs);
 
 function labRunSettings(run) {
   return run.settings || run.config || {};
@@ -1658,6 +1713,7 @@ function renderLabRuns() {
   status.textContent = `${runs.length}/${state.labRuns.length} 条性能实验记录`;
   document.getElementById("lab-selection-count").textContent = `已选择 ${state.labSelectedRuns.size} 条`;
   document.getElementById("lab-compare").disabled = state.labSelectedRuns.size < 2 || state.labComparing;
+  document.getElementById("lab-delete-selected").disabled = state.labSelectedRuns.size === 0;
   summary.innerHTML = `<div class="lab-metric"><span>归档实验</span><strong>${state.labRuns.length}</strong></div><div class="lab-metric"><span>已完成</span><strong>${completeRuns.length}</strong></div><div class="lab-metric"><span>当前筛选</span><strong>${runs.length}</strong></div><div class="lab-metric"><span>已选可见</span><strong>${selectedVisible}</strong></div>`;
   if (!runs.length) {
     table.innerHTML = `<div class="empty-state">没有符合条件的性能实验。可以清除筛选，或先填写服务器目录开始实验。</div>`;
@@ -1672,7 +1728,8 @@ function renderLabRuns() {
     const deleteAction = ["completed", "completed_with_failures", "failed", "cancelled", "interrupted"].includes(run.status)
       ? `<button class="text-button danger-text" data-batch="${esc(run.run_id)}" data-batch-action="delete">删除</button>`
       : "";
-    return `<tr><td><input class="lab-checkbox" type="checkbox" data-lab-select="${esc(run.run_id)}" ${selected ? "checked" : ""} aria-label="选择 ${esc(run.experiment_name || run.run_id)}"></td><td><strong>${esc(run.experiment_name || "未命名实验")}</strong><div>${esc(run.environment_name || "未标记环境")} · ${esc(labHardwareLabel(run.hardware_type))}</div><div class="mono muted">${esc(run.run_id || "")} · ${esc(settings.input_path || run.input_path || "-")}</div></td><td>${esc(settings.vlm_batch_size ?? "-")}</td><td>${esc(metrics.total_pages ?? "-")}</td><td>${esc(metrics.successful_pages ?? 0)} / <span class="${metrics.failed_pages ? "lab-failure" : ""}">${esc(metrics.failed_pages ?? 0)}</span> / <span class="${metrics.timeout_pages ? "lab-failure" : ""}">${esc(metrics.timeout_pages ?? 0)}</span></td><td class="lab-table-number">${labMetric(metrics.pages_per_minute)} 页/分</td><td class="lab-table-number">${labMetric(metrics.p50_page_seconds)} / ${labMetric(metrics.p95_page_seconds)} / ${labMetric(metrics.max_page_seconds)}</td><td>${labMetric(metrics.retry_overhead_seconds)} 秒<div class="muted">${esc(metrics.retry_pages ?? 0)} 页重试</div></td><td>${esc(labRunElapsed(run))}<div class="muted">页面请求累计 ${labMetric(metrics.with_retry_seconds)} 秒</div></td><td>${badge(run.status)}<div class="muted">${statusText}</div>${metrics.pending_pages ? `<div class="muted">待处理 ${esc(metrics.pending_pages)} 页</div>` : ""}</td><td><button class="text-button" data-batch-detail="${esc(run.run_id)}">查看记录</button>${deleteAction}</td></tr>`;
+    const canDelete = LAB_TERMINAL_STATES.has(run.status);
+    return `<tr><td><input class="lab-checkbox" type="checkbox" data-lab-select="${esc(run.run_id)}" ${selected ? "checked" : ""}${canDelete ? "" : " disabled"} aria-label="选择 ${esc(run.experiment_name || run.run_id)}"></td><td><strong>${esc(run.experiment_name || "未命名实验")}</strong><div>${esc(run.environment_name || "未标记环境")} · ${esc(labHardwareLabel(run.hardware_type))}</div><div class="mono muted">${esc(run.run_id || "")} · ${esc(settings.input_path || run.input_path || "-")}</div></td><td>${esc(settings.vlm_batch_size ?? "-")}</td><td>${esc(metrics.total_pages ?? "-")}</td><td>${esc(metrics.successful_pages ?? 0)} / <span class="${metrics.failed_pages ? "lab-failure" : ""}">${esc(metrics.failed_pages ?? 0)}</span> / <span class="${metrics.timeout_pages ? "lab-failure" : ""}">${esc(metrics.timeout_pages ?? 0)}</span></td><td class="lab-table-number">${labMetric(metrics.pages_per_minute)} 页/分</td><td class="lab-table-number">${labMetric(metrics.p50_page_seconds)} / ${labMetric(metrics.p95_page_seconds)} / ${labMetric(metrics.max_page_seconds)}</td><td>${labMetric(metrics.retry_overhead_seconds)} 秒<div class="muted">${esc(metrics.retry_pages ?? 0)} 页重试</div></td><td>${esc(labRunElapsed(run))}<div class="muted">页面请求累计 ${labMetric(metrics.with_retry_seconds)} 秒</div></td><td>${badge(run.status)}<div class="muted">${statusText}</div>${metrics.pending_pages ? `<div class="muted">待处理 ${esc(metrics.pending_pages)} 页</div>` : ""}</td><td><button class="text-button" data-batch-detail="${esc(run.run_id)}">查看记录</button>${deleteAction}</td></tr>`;
   }).join("")}</tbody></table>`;
   renderLabComparison();
 }
@@ -1731,7 +1788,10 @@ async function loadLab() {
   const data = await api("/api/performance-experiments");
   state.labRuns = data.items || [];
   const available = new Set(state.labRuns.map(run => run.run_id));
-  state.labSelectedRuns = new Set([...state.labSelectedRuns].filter(runId => available.has(runId)));
+  state.labSelectedRuns = new Set([...state.labSelectedRuns].filter(runId => {
+    const run = state.labRuns.find(item => item.run_id === runId);
+    return run && LAB_TERMINAL_STATES.has(run.status);
+  }));
   populateLabEnvironments();
   renderLabRuns();
 }
@@ -1839,6 +1899,11 @@ document.getElementById("lab-filter-hardware").addEventListener("change", event 
   renderLabRuns();
 });
 document.getElementById("lab-compare").addEventListener("click", compareLabRuns);
+document.getElementById("lab-select-visible").addEventListener("click", () => {
+  filteredLabRuns().filter(run => LAB_TERMINAL_STATES.has(run.status)).forEach(run => state.labSelectedRuns.add(run.run_id));
+  renderLabRuns();
+});
+document.getElementById("lab-delete-selected").addEventListener("click", () => deleteBatchRuns(state.labSelectedRuns));
 document.getElementById("lab-clear-selection").addEventListener("click", clearLabSelection);
 document.querySelectorAll("[data-lab-export]").forEach(button => button.addEventListener("click", () => exportLabRuns(button.dataset.labExport)));
 document.getElementById("lab-table").addEventListener("change", event => {
@@ -1876,7 +1941,8 @@ function configControl(item) {
       control = `<input type="${type}" data-config-key="${key}" value="${esc(candidate || "")}" placeholder="${esc(placeholder || "")}"${bounds}>`;
     }
   }
-  return `<div class="config-item${error ? " has-error" : ""}"><div class="config-key">${key}<span>${readonly ? "只读" : "可编辑"}</span><button type="button" class="config-help" data-config-help="${key}" title="查看详细说明" aria-label="查看 ${key} 说明">?</button></div><div class="config-control">${control}</div><p class="config-description">${esc(item.description || "")}</p>${error ? `<p class="config-error">${esc(error)}</p>` : ""}</div>`;
+  const helpText = item.help || item.description || `用于控制 ${item.label || item.key}。修改前请先预览变更，应用后按提示重建受影响服务。`;
+  return `<div class="config-item${error ? " has-error" : ""}"><div class="config-key"><span class="config-key-name">${key}</span><span>${readonly ? "只读" : "可编辑"}</span><button type="button" class="config-help" data-config-help="${key}" title="查看详细说明" aria-label="查看 ${key} 说明">?</button></div><div class="config-control">${control}</div><p class="config-description">${esc(item.description || helpText)}</p>${error ? `<p class="config-error">${esc(error)}</p>` : ""}</div>`;
 }
 
 function renderConfig() {
@@ -1913,9 +1979,9 @@ document.getElementById("config-groups").addEventListener("click", event => {
   const items = state.configSchema?.items || state.config?.items || [];
   const item = items.find(candidate => candidate.key === button.dataset.configHelp);
   if (!item) return;
-  document.getElementById("config-help-title").textContent = item.description || "配置说明";
+  document.getElementById("config-help-title").textContent = item.label || item.description || "配置说明";
   document.getElementById("config-help-key").textContent = item.key;
-  document.getElementById("config-help-body").textContent = item.help || item.description || "暂无详细说明。";
+  document.getElementById("config-help-body").innerHTML = `<p>${esc(item.help || item.description || `用于控制 ${item.label || item.key}。修改前请先预览变更，应用后按提示重建受影响服务。`)}</p><div class="config-help-tip"><strong>使用提示</strong><span>如果最终有效值与 env.multi 不一致，请先查看来源、容器状态和健康状态，再决定是否重建服务。</span></div>`;
   configHelpDialog.showModal();
 });
 document.getElementById("config-help-close").addEventListener("click", () => configHelpDialog.close());

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MinerU 运维控制台</title>
-  <link rel="stylesheet" href="/assets/ops.css?v=ui18">
+  <link rel="stylesheet" href="/assets/ops.css?v=ui19">
 </head>
 <body>
   <div class="shell">
@@ -151,6 +151,11 @@
           </form>
         </section>
         <div class="section-heading"><h2>测试记录</h2><span id="batch-storage">默认串行提交 PDF</span></div>
+        <div class="batch-bulk-toolbar">
+          <span id="batch-selection-count" class="muted">已选择 0 条</span>
+          <button id="batch-select-visible" type="button" class="text-button">选择当前可删除记录</button>
+          <button id="batch-delete-selected" type="button" class="danger-button" disabled>批量删除</button>
+        </div>
         <div id="batch-table" class="table-wrap panel"></div>
       </section>
 
@@ -210,6 +215,8 @@
           </div>
           <div class="lab-selection-actions">
             <span id="lab-selection-count" class="muted">已选择 0 条</span>
+            <button id="lab-select-visible" type="button" class="text-button">选择当前筛选</button>
+            <button id="lab-delete-selected" type="button" class="danger-button" disabled>批量删除</button>
             <button id="lab-compare" type="button" class="secondary-button" disabled>比较所选</button>
             <button id="lab-clear-selection" type="button" class="text-button">清除选择</button>
             <button type="button" class="text-button" data-lab-export="json">导出 JSON</button>
@@ -225,7 +232,7 @@
       <section id="view-config" class="view">
         <section class="feature-hero config-hero">
           <div>
-            <span class="feature-kicker">安全、可解释的现场配置 <b class="ui8-badge">UI18</b></span>
+            <span class="feature-kicker">安全、可解释的现场配置 <b class="ui8-badge">UI19</b></span>
             <h2>配置中心</h2>
             <p>从宿主机 Agent 读取当前 env 配置，先预览差异，再通过 Compose 校验安全应用；失败会自动回滚。</p>
           </div>
@@ -285,6 +292,8 @@
           <select id="log-service"></select>
           <select id="log-tail"><option value="200">最近 200 行</option><option value="500">最近 500 行</option><option value="1000">最近 1000 行</option><option value="2000">最近 2000 行</option></select>
           <input id="log-filter" type="search" placeholder="筛选关键词或字段，例如 ERROR、timeout、task_id" aria-label="日志关键词筛选">
+          <input id="log-exclude" type="search" placeholder="排除关键词，用逗号分隔，例如 GET /health,200 OK" aria-label="排除日志关键词">
+          <label class="inline-check"><input id="log-hide-health" type="checkbox" checked><span>隐藏健康探活</span></label>
           <label class="inline-check"><input id="log-live" type="checkbox" checked><span>动态刷新</span></label>
           <label class="inline-check"><input id="log-follow" type="checkbox" checked><span>跟随最新</span></label>
           <button id="load-logs" class="secondary-button">立即刷新</button>
@@ -385,6 +394,6 @@
     </header>
     <div id="config-help-body" class="config-help-body"></div>
   </dialog>
-  <script src="/assets/ops.js?v=ui18"></script>
+  <script src="/assets/ops.js?v=ui19"></script>
 </body>
 </html>

@@ -898,6 +898,10 @@ class ExperimentCompareRequest(BaseModel):
     run_ids: list[str] = Field(default_factory=list)
 
 
+class BatchRunsBulkDeleteRequest(BaseModel):
+    run_ids: list[str] = Field(default_factory=list, min_length=1, max_length=200)
+
+
 class ProblemPageSelection(BaseModel):
     source_path: str = Field(min_length=1, max_length=4096)
     page_number: int = Field(ge=1)
@@ -4116,6 +4120,31 @@ def create_app() -> FastAPI:
             "items": items,
             "storage": runtime.artifact_storage_status(),
         }
+
+    @app.post("/api/batch-runs/bulk-delete")
+    async def bulk_delete_batch_runs(payload: BatchRunsBulkDeleteRequest, request: Request):
+        authorize(request, write=True)
+        deleted: list[str] = []
+        failed: list[dict[str, str]] = []
+        for run_id in dict.fromkeys(str(item).strip() for item in payload.run_ids if str(item).strip()):
+            record = runtime.store.get_batch_run(run_id)
+            if record is None:
+                failed.append({"run_id": run_id, "error": "batch run not found"})
+                continue
+            status = str(record.get("status") or "")
+            process = runtime.batch_processes.get(run_id)
+            if status in ACTIVE_BATCH_STATES or runtime.batch_tasks.get(run_id) is not None or (process is not None and process.returncode is None):
+                failed.append({"run_id": run_id, "error": "cancel the active batch run before deleting it"})
+                continue
+            try:
+                shutil.rmtree(runtime.run_dir_for_record(record), ignore_errors=False)
+                runtime.store.delete_batch_run(run_id)
+                runtime.store.audit("batch_delete", run_id, True)
+                deleted.append(run_id)
+            except Exception as exc:
+                runtime.store.audit("batch_delete", run_id, False, str(exc))
+                failed.append({"run_id": run_id, "error": str(exc)})
+        return {"ok": not failed, "deleted": deleted, "failed": failed}
 
     @app.post("/api/batch-runs", status_code=202)
     async def create_batch_run(payload: BatchRunRequest, request: Request):
