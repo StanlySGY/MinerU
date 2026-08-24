@@ -139,3 +139,31 @@ def test_parse_request_form_rejects_vlm_batch_size_above_32():
 
     assert exc_info.value.status_code == 400
     assert exc_info.value.detail == "vlm_batch_size must be between 1 and 32"
+
+
+def test_parse_request_form_accepts_per_request_processing_window():
+    options = asyncio.run(
+        parse_request_form(
+            _request_for_parse_form(),
+            [UploadFile(filename="sample.pdf", file=BytesIO(b"%PDF-test"))],
+            backend="pipeline",
+            vlm_batch_size=32,
+            processing_window_size=32,
+        )
+    )
+
+    assert options.processing_window_size == 32
+
+
+def test_parse_request_form_rejects_processing_window_above_128():
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            parse_request_form(
+                _request_for_parse_form(),
+                [UploadFile(filename="sample.pdf", file=BytesIO(b"%PDF-test"))],
+                backend="pipeline",
+                processing_window_size=129,
+            )
+        )
+
+    assert exc_info.value.detail == "processing_window_size must be between 1 and 128"

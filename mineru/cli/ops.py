@@ -53,10 +53,16 @@ TERMINAL_BATCH_STATES = {
 }
 ACTIVE_BATCH_STATES = {"pending", "running", "paused", "cancelling"}
 BATCH_PROCESS_TERMINATE_TIMEOUT_SECONDS = 5.0
+ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def clean_terminal_text(value: str) -> str:
+    """Remove terminal cursor controls before logs are stored or shown as plain text."""
+    return ANSI_ESCAPE_RE.sub("", value).replace("\r", "\n")
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -3434,6 +3440,8 @@ class OpsRuntime:
             str(preview_dir),
             "--no-collect-diagnostics",
         ]
+        if request.experiment_type == "performance_lab":
+            command.extend(["--processing-window-size", str(request.vlm_batch_size)])
         command.append("--save-result-images" if self.save_result_images else "--no-save-result-images")
         if request.recursive:
             command.append("--recursive")
@@ -3466,7 +3474,7 @@ class OpsRuntime:
                         line = await process.stdout.readline()
                         if not line:
                             break
-                        log_file.write(line.decode("utf-8", errors="replace"))
+                        log_file.write(clean_terminal_text(line.decode("utf-8", errors="replace")))
                         log_file.flush()
             exit_code = await process.wait()
             current = self.store.get_batch_run(run_id) or {}

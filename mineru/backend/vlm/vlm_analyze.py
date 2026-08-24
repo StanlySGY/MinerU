@@ -439,6 +439,7 @@ def doc_analyze(
     client_side_output_generation = bool(
         kwargs.pop("client_side_output_generation", False)
     )
+    requested_window_size = kwargs.pop("processing_window_size", None)
     if predictor is None:
         predictor = ModelSingleton().get_model(backend, model_path, server_url, **kwargs)
     predictor = _maybe_enable_serial_execution(predictor, backend)
@@ -450,7 +451,9 @@ def doc_analyze(
     try:
         page_count = get_pdfium_document_page_count(pdf_doc)
         configured_window_size = get_processing_window_size(default=64)
-        effective_window_size = min(page_count, configured_window_size) if page_count else 0
+        requested_window_size = int(requested_window_size or 0)
+        effective_window_size = max(configured_window_size, requested_window_size)
+        effective_window_size = min(page_count, effective_window_size) if page_count else 0
         total_windows = (
             (page_count + effective_window_size - 1) // effective_window_size
             if effective_window_size
@@ -458,7 +461,9 @@ def doc_analyze(
         )
         logger.info(
             f'VLM processing-window run. page_count={page_count}, '
-            f'window_size={configured_window_size}, total_windows={total_windows}'
+            f'configured_window_size={configured_window_size}, '
+            f'requested_window_size={requested_window_size or None}, '
+            f'effective_window_size={effective_window_size}, total_windows={total_windows}'
         )
 
         infer_start = time.time()
@@ -541,6 +546,7 @@ async def aio_doc_analyze(
     page_timeout_seconds = kwargs.pop("page_timeout_seconds", None)
     page_connect_max_retries = kwargs.pop("page_connect_max_retries", None)
     vlm_batch_size = kwargs.pop("vlm_batch_size", 1)
+    requested_window_size = kwargs.pop("processing_window_size", None)
     client_side_output_generation = bool(
         kwargs.pop("client_side_output_generation", False)
     )
@@ -555,7 +561,9 @@ async def aio_doc_analyze(
     try:
         page_count = get_pdfium_document_page_count(pdf_doc)
         configured_window_size = get_processing_window_size(default=64)
-        effective_window_size = min(page_count, configured_window_size) if page_count else 0
+        requested_window_size = int(requested_window_size or 0)
+        effective_window_size = max(configured_window_size, requested_window_size)
+        effective_window_size = min(page_count, effective_window_size) if page_count else 0
         total_windows = (
             (page_count + effective_window_size - 1) // effective_window_size
             if effective_window_size
@@ -563,7 +571,9 @@ async def aio_doc_analyze(
         )
         logger.info(
             f'VLM processing-window run. page_count={page_count}, '
-            f'window_size={configured_window_size}, total_windows={total_windows}'
+            f'configured_window_size={configured_window_size}, '
+            f'requested_window_size={requested_window_size or None}, '
+            f'effective_window_size={effective_window_size}, total_windows={total_windows}'
         )
         if (
             backend == "http-client"

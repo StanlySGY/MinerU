@@ -57,6 +57,7 @@ class ParseRequestOptions:
     page_timeout_seconds: float
     page_connect_max_retries: int
     vlm_batch_size: int
+    processing_window_size: Optional[int]
 
 
 def validate_parse_method(parse_method: str) -> str:
@@ -145,6 +146,9 @@ def apply_effective_vlm_request_controls(
                 str(request_options.page_connect_max_retries),
             )
         )
+    processing_window_size = getattr(request_options, "processing_window_size", None)
+    if processing_window_size is not None and "processing_window_size" not in existing_names:
+        fields.append(("processing_window_size", str(processing_window_size)))
 
 
 async def parse_request_form(
@@ -289,6 +293,15 @@ async def parse_request_form(
         int,
         Form(description="Pages per VLM micro-batch (1-32)"),
     ] = 1,
+    processing_window_size: Annotated[
+        Optional[int],
+        Form(
+            description=(
+                "Optional per-request processing window size (1-128). "
+                "When omitted, use MINERU_PROCESSING_WINDOW_SIZE."
+            )
+        ),
+    ] = None,
 ) -> ParseRequestOptions:
     """解析 API/Router 共用的 multipart 表单，并保持 Swagger 参数同源。"""
     backend = validate_parse_backend(backend)
@@ -316,6 +329,8 @@ async def parse_request_form(
     )
     if not 1 <= vlm_batch_size <= 32:
         raise HTTPException(status_code=400, detail="vlm_batch_size must be between 1 and 32")
+    if processing_window_size is not None and not 1 <= processing_window_size <= 128:
+        raise HTTPException(status_code=400, detail="processing_window_size must be between 1 and 128")
 
     effective_return_original_file = return_original_file and response_format_zip
     return ParseRequestOptions(
@@ -341,4 +356,5 @@ async def parse_request_form(
         page_timeout_seconds=page_timeout_seconds,
         page_connect_max_retries=page_connect_max_retries,
         vlm_batch_size=vlm_batch_size,
+        processing_window_size=processing_window_size,
     )

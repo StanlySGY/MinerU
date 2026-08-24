@@ -1733,6 +1733,22 @@ async function loadLab() {
   renderLabRuns();
 }
 
+const LAB_TERMINAL_STATES = new Set(["completed", "completed_with_failures", "failed", "cancelled", "interrupted"]);
+
+function sleep(milliseconds) {
+  return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+async function waitForBatchRun(runId, timeoutSeconds) {
+  const deadline = Date.now() + timeoutSeconds * 1000;
+  while (Date.now() < deadline) {
+    const run = await api(`/api/batch-runs/${encodeURIComponent(runId)}`);
+    if (LAB_TERMINAL_STATES.has(run.status)) return run;
+    await sleep(2000);
+  }
+  throw new Error(`实验 ${runId} 等待超过 ${timeoutSeconds} 秒`);
+}
+
 async function startLabExperiment(event) {
   event.preventDefault();
   if (state.labSubmitting) return;
@@ -1746,8 +1762,17 @@ async function startLabExperiment(event) {
     notice("服务器测试目录必须填写测试根目录下的相对路径，例如 . 或 company-set-01");
     return;
   }
+  const batchSizes = form.getAll("vlm_batch_sizes")
+    .map(value => Number(value))
+    .filter(value => Number.isInteger(value) && value >= 1 && value <= 32)
+    .sort((left, right) => left - right);
+  if (!batchSizes.length) {
+    notice("请至少选择一个 VLM micro-batch 页数");
+    return;
+  }
   const submitButton = document.getElementById("lab-submit");
-  const payload = {
+  const sequenceStatus = document.getElementById("lab-sequence-status");
+  const basePayload = {
     input_path: inputPath,
     experiment_name: String(form.get("experiment_name") || "").trim(),
     environment_name: String(form.get("environment_name") || "").trim(),
@@ -1759,7 +1784,6 @@ async function startLabExperiment(event) {
     task_timeout: Number(form.get("task_timeout")),
     page_timeout_seconds: Number(form.get("page_timeout_seconds")),
     page_connect_max_retries: Number(form.get("page_connect_max_retries")),
-    vlm_batch_size: Number(form.get("vlm_batch_size")),
     experiment_type: "performance_lab",
     server_url: String(form.get("server_url") || "").trim() || null,
     recursive: form.get("recursive") === "on",
@@ -1769,13 +1793,29 @@ async function startLabExperiment(event) {
   };
   state.labSubmitting = true;
   submitButton.disabled = true;
-  submitButton.textContent = "正在启动实验";
+  submitButton.textContent = "正在执行实验序列";
   try {
-    await api("/api/batch-runs", {method: "POST", body: JSON.stringify(payload)});
-    notice("性能实验已开始", false);
-    await loadLab();
+    const originalName = basePayload.experiment_name;
+    for (let index = 0; index < batchSizes.length; index += 1) {
+      const batchSize = batchSizes[index];
+      sequenceStatus.textContent = `正在执行第 ${index + 1}/${batchSizes.length} 个实验：batch-${batchSize}`;
+      const payload = {
+        ...basePayload,
+        vlm_batch_size: batchSize,
+        experiment_name: originalName ? `${originalName} · batch-${batchSize}` : `batch-${batchSize}`,
+      };
+      const created = await api("/api/batch-runs", {method: "POST", body: JSON.stringify(payload)});
+      await loadLab();
+      const completed = await waitForBatchRun(created.run_id, payload.task_timeout + 300);
+      await loadLab();
+      if (["failed", "cancelled", "interrupted"].includes(completed.status)) {
+        throw new Error(`batch-${batchSize} 实验以“${statusText[completed.status] || completed.status}”结束，序列已停止`);
+      }
+    }
+    sequenceStatus.textContent = `已完成 ${batchSizes.length} 个 batch 实验`;
+    notice(`性能实验序列已完成：${batchSizes.join("、")}`, false);
   } catch (error) {
-    notice(error.message);
+    if (error.name !== "AbortError") notice(error.message);
   } finally {
     state.labSubmitting = false;
     submitButton.disabled = false;

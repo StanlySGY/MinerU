@@ -71,6 +71,7 @@ class RunConfig:
     page_timeout_seconds: float
     page_connect_max_retries: int
     vlm_batch_size: int
+    processing_window_size: int | None
     pause_seconds: float
     submit_retries: int
     curl_bin: str
@@ -677,6 +678,8 @@ def build_submit_forms(config: RunConfig) -> list[tuple[str, str]]:
         ("page_connect_max_retries", str(config.page_connect_max_retries)),
         ("vlm_batch_size", str(config.vlm_batch_size)),
     ]
+    if config.processing_window_size is not None:
+        forms.append(("processing_window_size", str(config.processing_window_size)))
     if config.server_url:
         forms.append(("server_url", config.server_url))
     return forms
@@ -1193,6 +1196,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--page-connect-max-retries", type=int, default=0)
     parser.add_argument("--vlm-batch-size", type=int, default=1)
+    parser.add_argument(
+        "--processing-window-size",
+        type=int,
+        default=None,
+        help="Optional per-request processing window size (default: API environment)",
+    )
     parser.add_argument("--pause-seconds", type=float, default=2.0)
     parser.add_argument("--submit-retries", type=int, default=2)
     parser.add_argument("--limit", type=int, default=0)
@@ -1270,6 +1279,10 @@ def build_config(args: argparse.Namespace) -> RunConfig:
         page_timeout_seconds=min(7200.0, max(1.0, args.page_timeout_seconds)),
         page_connect_max_retries=min(3, max(0, args.page_connect_max_retries)),
         vlm_batch_size=min(32, max(1, args.vlm_batch_size)),
+        processing_window_size=(
+            None if args.processing_window_size is None
+            else min(128, max(1, args.processing_window_size))
+        ),
         pause_seconds=max(0.0, args.pause_seconds),
         submit_retries=max(0, args.submit_retries),
         curl_bin=args.curl_bin,

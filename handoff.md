@@ -1390,3 +1390,64 @@ python -m pytest -o addopts='' \
 - 构建并部署 UI16 后，需要刷新 `mineru-code-sync` 共享代码卷，并重建 `mineru-ops`、`mineru-api`、`mineru-router` 等实际使用代码卷的服务。
 - 现场修改配置后，应在服务页分别查看 HTTP 健康和配置应用状态；两者同时显示“健康”和“等待重启生效”是可能且有意义的。
 - 性能实验目录填写 `.` 或测试根目录下的相对目录，例如 `company-set-01`，不能填写宿主机路径。
+
+## 2026-08-24：UI17 性能实验 batch 序列、窗口覆盖与日志清理
+
+本轮根据现场性能实验反馈完成 UI17。实现了多 batch 顺序测试，并修复 batch=32 在 `MINERU_PROCESSING_WINDOW_SIZE=8` 时实际仍只能按 8 页窗口运行的问题。
+
+### 本轮完成
+
+1. **性能实验室支持多选 batch 串行执行**
+   - `1、2、4、8、16、32` 改为复选框，可一次选择多个值。
+   - 控制台按数值从小到大逐个创建实验；前一个实验进入终态后才启动下一个，不会并发压测。
+   - 每个 batch 保存为独立记录，实验名称自动追加 `batch-N`。
+   - 页面显示当前序列进度，某个实验失败、取消或中断时停止后续 batch。
+
+2. **性能实验支持请求级处理窗口**
+   - 性能实验请求会传递 `processing_window_size=vlm_batch_size`。
+   - API 端使用 `max(MINERU_PROCESSING_WINDOW_SIZE, 请求窗口)`，因此现场 env 为 8 时，batch=32 会使用 32 页窗口；batch=1/2/4/8 仍由 micro-batch 参数决定实际 VLM 批量。
+   - 该覆盖只由 `performance_lab` 使用，普通批量测试和外部 Router 调用仍遵循 env 配置，不会被控制台实验改变。
+   - VLM/Hybrid 日志现在记录 `configured_window_size`、`requested_window_size`、`effective_window_size` 和窗口数量。
+   - resilience 日志新增 `event=vlm_micro_batch requested=... effective=...`，便于确认实际批量。
+
+3. **清理日志中的终端控制字符**
+   - 运维控制台读取 Compose 日志时移除 ANSI 控制序列和回车覆盖符。
+   - 性能实验 `batch.log` 落盘前也清理这些字符。
+   - `tqdm` 日志中的 `][A`、问号方块等浏览器显示污染不再出现；进度会按普通文本换行保存。
+
+### 重要说明
+
+- 你提供的日志中 `queue_seconds=105.68`、`118.8` 是页面等待前序处理窗口的排队时间，不是 VLM 单页请求耗时；对应批次的 `vlm_request_seconds` 约为 11 秒。
+- 性能实验 batch=32 的日志应出现类似：`configured_window_size=8, requested_window_size=32, effective_window_size=32`，窗口日志中的 `(... pages)` 应最多为 32 页。
+- 该功能仍受 VLM 服务自身显存/NPU 能力限制；batch=16/32 可能增加内存压力或触发服务端失败，应按 1、2、4、8、16、32 逐档观察。
+- `env.multi` 不需要新增变量；性能实验的请求级窗口由控制台自动传递。
+
+### 验证
+
+```bash
+python -m py_compile \
+  mineru/cli/ops.py \
+  mineru/cli/api_request.py \
+  mineru/cli/fast_api.py \
+  mineru/backend/vlm/vlm_analyze.py \
+  mineru/backend/vlm/resilience.py \
+  mineru/backend/hybrid/hybrid_analyze.py \
+  docker/multi/mineru-ops-agent.py \
+  docker/multi/batch-router-diagnose.py
+node --check mineru/ops/static/ops.js
+git diff --check
+python -m pytest -o addopts='' \
+  tests/unit/test_ops_console.py \
+  tests/unit/test_ops_agent_config.py \
+  tests/unit/test_api_request.py \
+  tests/unit/test_vlm_resilience.py \
+  tests/unit/test_batch_router_diagnose.py -q
+# 114 passed
+```
+
+### 部署
+
+- UI 版本：`ui17`
+- 代码镜像建议标签：`mineru-code:v3.4.2-ops-ui17`
+- 代码镜像导出文件：`mineru-code-v3.4.2-ops-ui17.tar.gz`
+- 本轮提交前会保留用户工作区已有的无关诊断文件，不纳入提交。

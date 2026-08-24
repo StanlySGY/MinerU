@@ -171,6 +171,12 @@ async def aio_extract_pages_with_failure_isolation(
         else min(3, max(0, int(connect_max_retries)))
     )
     effective_batch_size = min(32, max(1, int(batch_size)))
+    logger.info(
+        "event=vlm_micro_batch requested={} effective={} window_pages={}",
+        batch_size,
+        min(effective_batch_size, len(images)) if images else 0,
+        len(images),
+    )
     task_progress_registry.queue_pages(
         task_id,
         source_file_name,

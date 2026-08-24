@@ -148,6 +148,7 @@ def _run_config(tmp_path: Path):
         page_timeout_seconds=600.0,
         page_connect_max_retries=0,
         vlm_batch_size=1,
+        processing_window_size=None,
         pause_seconds=0.0,
         submit_retries=1,
         curl_bin="curl",
@@ -237,6 +238,16 @@ def test_build_submit_forms_includes_page_request_controls(tmp_path: Path) -> No
     assert forms["page_timeout_seconds"] == "600.0"
     assert forms["page_connect_max_retries"] == "0"
     assert forms["vlm_batch_size"] == "1"
+    assert "processing_window_size" not in forms
+
+
+def test_build_submit_forms_includes_per_request_window(tmp_path: Path) -> None:
+    config = _run_config(tmp_path)
+    config = MODULE.RunConfig(**{**config.__dict__, "processing_window_size": 32})
+
+    forms = dict(MODULE.build_submit_forms(config))
+
+    assert forms["processing_window_size"] == "32"
 
 
 def test_poll_task_timeout_preserves_last_remote_progress(tmp_path: Path, monkeypatch) -> None:

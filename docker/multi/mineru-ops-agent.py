@@ -19,6 +19,14 @@ from pathlib import Path
 from typing import Any
 
 
+ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+
+def clean_log_text(value: str) -> str:
+    """Normalize terminal-oriented Docker output for browser plain-text rendering."""
+    return ANSI_ESCAPE_RE.sub("", value).replace("\r", "\n")
+
+
 CONFIG_SCHEMA: list[dict[str, Any]] = [
     {
         "key": "MINERU_MODEL_SOURCE",
@@ -2015,7 +2023,7 @@ class Agent:
         return {
             "ok": result["ok"],
             "service": service,
-            "logs": result.get("output", ""),
+            "logs": clean_log_text(result.get("output", "")),
             "error": result.get("error"),
         }
 

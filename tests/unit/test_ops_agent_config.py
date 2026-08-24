@@ -22,6 +22,17 @@ def make_agent(project_dir: Path, env_file: str = "env.multi"):
     return agent
 
 
+def test_clean_log_text_removes_ansi_cursor_controls() -> None:
+    value = "Two Step Extraction: 5/8\r\x1b[AProcessing pages: 6/8\x1b[0m"
+
+    cleaned = ops_agent.clean_log_text(value)
+
+    assert "\x1b" not in cleaned
+    assert "\r" not in cleaned
+    assert "[A" not in cleaned
+    assert "Two Step Extraction: 5/8\nProcessing pages: 6/8" == cleaned
+
+
 def test_parse_env_file_supports_comments_export_and_quotes(tmp_path: Path) -> None:
     env_file = tmp_path / "env.multi"
     env_file.write_text(

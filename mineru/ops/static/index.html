@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MinerU 运维控制台</title>
-  <link rel="stylesheet" href="/assets/ops.css?v=ui16">
+  <link rel="stylesheet" href="/assets/ops.css?v=ui17">
 </head>
 <body>
   <div class="shell">
@@ -177,14 +177,14 @@
               <fieldset class="lab-wide lab-batch-options">
                 <legend>VLM micro-batch 页数</legend>
                 <div class="lab-option-row">
-                  <label class="lab-option"><input type="radio" name="vlm_batch_size" value="1" checked><span>1</span></label>
-                  <label class="lab-option"><input type="radio" name="vlm_batch_size" value="2"><span>2</span></label>
-                  <label class="lab-option"><input type="radio" name="vlm_batch_size" value="4"><span>4</span></label>
-                  <label class="lab-option"><input type="radio" name="vlm_batch_size" value="8"><span>8</span></label>
-                  <label class="lab-option"><input type="radio" name="vlm_batch_size" value="16"><span>16</span></label>
-                  <label class="lab-option"><input type="radio" name="vlm_batch_size" value="32"><span>32</span></label>
+                  <label class="lab-option"><input type="checkbox" name="vlm_batch_sizes" value="1" checked><span>1</span></label>
+                  <label class="lab-option"><input type="checkbox" name="vlm_batch_sizes" value="2"><span>2</span></label>
+                  <label class="lab-option"><input type="checkbox" name="vlm_batch_sizes" value="4"><span>4</span></label>
+                  <label class="lab-option"><input type="checkbox" name="vlm_batch_sizes" value="8"><span>8</span></label>
+                  <label class="lab-option"><input type="checkbox" name="vlm_batch_sizes" value="16"><span>16</span></label>
+                  <label class="lab-option"><input type="checkbox" name="vlm_batch_sizes" value="32"><span>32</span></label>
                 </div>
-                <small>这是一次 VLM 请求处理的页数，不是 Router 同时处理的任务数；整批失败或返回页数异常时会自动回退逐页隔离。</small>
+                <small>可多选，控制台会按数值从小到大串行执行。性能实验会为每个任务临时把处理窗口提升到所选 batch，普通 Router 调用不受影响。</small>
               </fieldset>
               <label><span>单页请求超时（秒）</span><input name="page_timeout_seconds" type="number" value="600" min="1" max="7200" required><small>可放大到 1200 秒观察现场慢页真实完成时间。</small></label>
               <label><span>任务等待上限（秒）</span><input name="task_timeout" type="number" value="7200" min="60" max="86400" required></label>
@@ -192,7 +192,7 @@
               <label><span>VLM Server URL</span><input name="server_url" placeholder="可选"></label>
               <label class="lab-wide"><span>实验备注</span><textarea name="notes" rows="2" maxlength="500" placeholder="例如：同一数据集，观察 batch-8 是否增加显存或失败率"></textarea></label>
               <label class="lab-wide check-label"><input name="recursive" type="checkbox" checked><span>包含子目录</span></label>
-              <div class="lab-wide lab-submit-row"><p>当前控制台自动执行仍使用 MinerU；RAGFlow/其他仅作为实验归档标签。建议先做 batch=1 基线，再逐步测试 2、4、8。</p><button id="lab-submit" type="submit" class="primary-button">开始性能实验</button></div>
+              <div class="lab-wide lab-submit-row"><p id="lab-sequence-status">当前控制台自动执行仍使用 MinerU；RAGFlow/其他仅作为实验归档标签。多选后将依次完成每个 batch，再启动下一个。</p><button id="lab-submit" type="submit" class="primary-button">开始性能实验</button></div>
             </form>
           </section>
           <aside class="panel lab-guide">
@@ -224,7 +224,7 @@
       <section id="view-config" class="view">
         <section class="feature-hero config-hero">
           <div>
-            <span class="feature-kicker">安全、可解释的现场配置 <b class="ui8-badge">UI16</b></span>
+            <span class="feature-kicker">安全、可解释的现场配置 <b class="ui8-badge">UI17</b></span>
             <h2>配置中心</h2>
             <p>从宿主机 Agent 读取当前 env 配置，先预览差异，再通过 Compose 校验安全应用；失败会自动回滚。</p>
           </div>
@@ -384,6 +384,6 @@
     </header>
     <div id="config-help-body" class="config-help-body"></div>
   </dialog>
-  <script src="/assets/ops.js?v=ui16"></script>
+  <script src="/assets/ops.js?v=ui17"></script>
 </body>
 </html>
