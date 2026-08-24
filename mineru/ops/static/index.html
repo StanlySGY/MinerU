@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MinerU 运维控制台</title>
-  <link rel="stylesheet" href="/assets/ops.css?v=ui17">
+  <link rel="stylesheet" href="/assets/ops.css?v=ui18">
 </head>
 <body>
   <div class="shell">
@@ -200,7 +200,8 @@
             <ol><li><strong>基线</strong><span>micro-batch 1，重试 0，记录完整快照。</span></li><li><strong>提高吞吐</strong><span>依次测试 2、4、8，并与同数据集基线比较。</span></li><li><strong>观察拐点</strong><span>关注 P95、慢页、超时页和失败页，而不只看平均速度。</span></li><li><strong>复盘现场</strong><span>导出 Markdown/CSV，报告中保留数据集和配置哈希。</span></li><li><strong>压力档位</strong><span>16 / 32 仅用于压力测试，可能增加显存占用、耗时和失败概率。</span></li></ol>
           </aside>
         </div>
-        <div class="section-heading"><h2>实验归档</h2><span id="lab-status" class="muted">读取中</span></div>
+            <div class="section-heading"><h2>实验归档</h2><span id="lab-status" class="muted">读取中</span></div>
+            <p class="muted lab-metric-note">说明：总耗时是整批 wall time；P50/P95/max 是 VLM 请求延迟（micro-batch 内页面会共享一次请求耗时）；页面请求累计是并发请求耗时求和，不能与总耗时直接比较。</p>
         <div class="lab-archive-toolbar panel">
           <div class="lab-filter-grid">
             <label><span>搜索</span><input id="lab-filter-query" placeholder="实验、环境、备注或 run id"></label>
@@ -224,7 +225,7 @@
       <section id="view-config" class="view">
         <section class="feature-hero config-hero">
           <div>
-            <span class="feature-kicker">安全、可解释的现场配置 <b class="ui8-badge">UI17</b></span>
+            <span class="feature-kicker">安全、可解释的现场配置 <b class="ui8-badge">UI18</b></span>
             <h2>配置中心</h2>
             <p>从宿主机 Agent 读取当前 env 配置，先预览差异，再通过 Compose 校验安全应用；失败会自动回滚。</p>
           </div>
@@ -384,6 +385,6 @@
     </header>
     <div id="config-help-body" class="config-help-body"></div>
   </dialog>
-  <script src="/assets/ops.js?v=ui17"></script>
+  <script src="/assets/ops.js?v=ui18"></script>
 </body>
 </html>

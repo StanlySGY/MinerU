@@ -829,7 +829,7 @@ document.getElementById("batch-form").addEventListener("submit", async event => 
       await api("/api/batch-runs", {method: "POST", body: JSON.stringify(payload)});
     }
     notice("批量测试已开始", false);
-    await loadBatches();
+    await Promise.all([loadBatches(), loadLab()]);
   } catch (error) {
     notice(error.message);
   } finally {
@@ -1635,7 +1635,7 @@ function renderLabComparison() {
   const warnings = comparison.warnings || [];
   const rows = comparison.items || [];
   panel.classList.remove("hidden");
-  panel.innerHTML = `<div class="section-heading"><h3>实验对比</h3><span class="muted">基线：${esc(comparison.baseline_run_id || "-")}</span></div>${warnings.length ? `<div class="lab-warning-list"><strong>比较提醒</strong>${warnings.map(item => `<span>• ${esc(item)}</span>`).join("")}</div>` : `<p class="lab-comparison-ok">当前所选实验没有发现明显的可比性提醒。</p>`}<div class="lab-comparison-table"><table><thead><tr><th>实验</th><th>环境 / 硬件</th><th>batch</th><th>页数</th><th>成功 / 失败 / 超时</th><th>吞吐</th><th>P50 / P95 / max</th><th>含重试 / 不含重试</th><th>相对基线</th><th>提醒</th></tr></thead><tbody>${rows.map(item => {
+  panel.innerHTML = `<div class="section-heading"><h3>实验对比</h3><span class="muted">基线：${esc(comparison.baseline_run_id || "-")}</span></div>${warnings.length ? `<div class="lab-warning-list"><strong>比较提醒</strong>${warnings.map(item => `<span>• ${esc(item)}</span>`).join("")}</div>` : `<p class="lab-comparison-ok">当前所选实验没有发现明显的可比性提醒。</p>`}<div class="lab-comparison-table"><table><thead><tr><th>实验</th><th>环境 / 硬件</th><th>batch</th><th>页数</th><th>成功 / 失败 / 超时</th><th>吞吐</th><th>请求延迟 P50 / P95 / max</th><th>页面请求累计（含重试 / 不含重试）</th><th>相对基线</th><th>提醒</th></tr></thead><tbody>${rows.map(item => {
     const settings = labRunSettings(item);
     const metrics = labRunMetrics(item);
     const warningText = (item.warnings || []).join("；");
@@ -1664,12 +1664,15 @@ function renderLabRuns() {
     renderLabComparison();
     return;
   }
-  table.innerHTML = `<table><thead><tr><th>选择</th><th>实验 / 环境 / 硬件</th><th>batch</th><th>页数</th><th>成功 / 异常 / 超时</th><th>吞吐</th><th>P50 / P95 / max</th><th>重试开销</th><th>总耗时</th><th>状态</th><th>记录</th></tr></thead><tbody>${runs.map(run => {
+  table.innerHTML = `<table><thead><tr><th>选择</th><th>实验 / 环境 / 硬件</th><th>batch</th><th>页数</th><th>成功 / 异常 / 超时</th><th>吞吐</th><th>请求延迟 P50 / P95 / max</th><th>重试开销</th><th>总耗时</th><th>状态</th><th>记录 / 操作</th></tr></thead><tbody>${runs.map(run => {
     const settings = labRunSettings(run);
     const metrics = labRunMetrics(run);
     const selected = state.labSelectedRuns.has(run.run_id);
     const statusText = metrics.complete ? (labIsStable(run) ? "稳定" : "有异常") : "处理中";
-    return `<tr><td><input class="lab-checkbox" type="checkbox" data-lab-select="${esc(run.run_id)}" ${selected ? "checked" : ""} aria-label="选择 ${esc(run.experiment_name || run.run_id)}"></td><td><strong>${esc(run.experiment_name || "未命名实验")}</strong><div>${esc(run.environment_name || "未标记环境")} · ${esc(labHardwareLabel(run.hardware_type))}</div><div class="mono muted">${esc(run.run_id || "")} · ${esc(settings.input_path || run.input_path || "-")}</div></td><td>${esc(settings.vlm_batch_size ?? "-")}</td><td>${esc(metrics.total_pages ?? "-")}</td><td>${esc(metrics.successful_pages ?? 0)} / <span class="${metrics.failed_pages ? "lab-failure" : ""}">${esc(metrics.failed_pages ?? 0)}</span> / <span class="${metrics.timeout_pages ? "lab-failure" : ""}">${esc(metrics.timeout_pages ?? 0)}</span></td><td class="lab-table-number">${labMetric(metrics.pages_per_minute)} 页/分</td><td class="lab-table-number">${labMetric(metrics.p50_page_seconds)} / ${labMetric(metrics.p95_page_seconds)} / ${labMetric(metrics.max_page_seconds)}</td><td>${labMetric(metrics.retry_overhead_seconds)} 秒<div class="muted">${esc(metrics.retry_pages ?? 0)} 页重试</div></td><td>${esc(labRunElapsed(run))}<div class="muted">含重试 ${labMetric(metrics.with_retry_seconds)} 秒</div></td><td>${badge(run.status)}<div class="muted">${statusText}</div>${metrics.pending_pages ? `<div class="muted">待处理 ${esc(metrics.pending_pages)} 页</div>` : ""}</td><td><button class="text-button" data-batch-detail="${esc(run.run_id)}">查看记录</button></td></tr>`;
+    const deleteAction = ["completed", "completed_with_failures", "failed", "cancelled", "interrupted"].includes(run.status)
+      ? `<button class="text-button danger-text" data-batch="${esc(run.run_id)}" data-batch-action="delete">删除</button>`
+      : "";
+    return `<tr><td><input class="lab-checkbox" type="checkbox" data-lab-select="${esc(run.run_id)}" ${selected ? "checked" : ""} aria-label="选择 ${esc(run.experiment_name || run.run_id)}"></td><td><strong>${esc(run.experiment_name || "未命名实验")}</strong><div>${esc(run.environment_name || "未标记环境")} · ${esc(labHardwareLabel(run.hardware_type))}</div><div class="mono muted">${esc(run.run_id || "")} · ${esc(settings.input_path || run.input_path || "-")}</div></td><td>${esc(settings.vlm_batch_size ?? "-")}</td><td>${esc(metrics.total_pages ?? "-")}</td><td>${esc(metrics.successful_pages ?? 0)} / <span class="${metrics.failed_pages ? "lab-failure" : ""}">${esc(metrics.failed_pages ?? 0)}</span> / <span class="${metrics.timeout_pages ? "lab-failure" : ""}">${esc(metrics.timeout_pages ?? 0)}</span></td><td class="lab-table-number">${labMetric(metrics.pages_per_minute)} 页/分</td><td class="lab-table-number">${labMetric(metrics.p50_page_seconds)} / ${labMetric(metrics.p95_page_seconds)} / ${labMetric(metrics.max_page_seconds)}</td><td>${labMetric(metrics.retry_overhead_seconds)} 秒<div class="muted">${esc(metrics.retry_pages ?? 0)} 页重试</div></td><td>${esc(labRunElapsed(run))}<div class="muted">页面请求累计 ${labMetric(metrics.with_retry_seconds)} 秒</div></td><td>${badge(run.status)}<div class="muted">${statusText}</div>${metrics.pending_pages ? `<div class="muted">待处理 ${esc(metrics.pending_pages)} 页</div>` : ""}</td><td><button class="text-button" data-batch-detail="${esc(run.run_id)}">查看记录</button>${deleteAction}</td></tr>`;
   }).join("")}</tbody></table>`;
   renderLabComparison();
 }

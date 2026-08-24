@@ -313,6 +313,7 @@ tbody tr[data-task].selected { background: #edf7f3; box-shadow: inset 3px 0 0 va
 .lab-submit-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-top: 4px; }
 .lab-submit-row p { color: var(--muted); font-size: 13px; line-height: 1.5; }
 .lab-submit-row button { min-width: 150px; }
+.lab-metric-note { margin: 0 0 10px; line-height: 1.5; }
 .lab-guide { padding: 0 16px 16px; }
 .lab-guide ol { display: grid; gap: 12px; margin: 4px 0 0; padding: 0; list-style: none; counter-reset: lab-step; }
 .lab-guide li { position: relative; min-height: 44px; padding-left: 42px; counter-increment: lab-step; }

@@ -1448,19 +1448,21 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "experiment_type" in dashboard_js
     assert "32" in dashboard_html
     assert "配置中心" in dashboard_html
-    assert "UI17" in dashboard_html
+    assert "UI18" in dashboard_html
     assert "预览变更" in dashboard_html
     assert "保存并应用" in dashboard_html
     assert "最终有效配置" in dashboard_html
     assert "config-apply-dialog" in dashboard_html
     assert "config-apply-result" in dashboard_html
-    assert "ops.js?v=ui17" in dashboard_html
-    assert "ops.css?v=ui17" in dashboard_html
+    assert "ops.js?v=ui18" in dashboard_html
+    assert "ops.css?v=ui18" in dashboard_html
     assert dashboard_html.count('name="vlm_batch_sizes"') == 6
     assert 'type="checkbox" name="vlm_batch_sizes"' in dashboard_html
     assert "waitForBatchRun" in dashboard_js
     assert "LAB_TERMINAL_STATES" in dashboard_js
     assert "for (let index = 0; index < batchSizes.length; index += 1)" in dashboard_js
+    assert 'data-batch-action="delete"' in dashboard_js
+    assert "页面请求累计" in dashboard_js
     assert "problem-pages-list" in dashboard_html
     assert "problem-pages-select-all" in dashboard_html
     assert "runtime-diagnostics" in dashboard_html
