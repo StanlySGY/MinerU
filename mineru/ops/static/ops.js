@@ -24,6 +24,8 @@ const state = {
   serviceFilter: "all",
   logRequestId: 0,
   logLoading: false,
+  logRawText: "",
+  viewAbortController: null,
   config: null,
   configSchema: null,
   configHistory: [],
@@ -108,7 +110,8 @@ async function api(path, options = {}) {
   const headers = {...(options.headers || {})};
   if (state.token) headers["X-MinerU-Ops-Token"] = state.token;
   if (options.body && !(options.body instanceof FormData)) headers["Content-Type"] = "application/json";
-  const response = await fetch(path, {...options, headers});
+  const signal = options.signal || state.viewAbortController?.signal;
+  const response = await fetch(path, {...options, headers, ...(signal ? {signal} : {})});
   let payload;
   try { payload = await response.json(); } catch { payload = {detail: await response.text()}; }
   if (!response.ok) throw new Error(apiErrorMessage(payload, `HTTP ${response.status}`));
@@ -118,7 +121,8 @@ async function api(path, options = {}) {
 async function authorizedFetch(path, options = {}) {
   const headers = {...(options.headers || {})};
   if (state.token) headers["X-MinerU-Ops-Token"] = state.token;
-  const response = await fetch(path, {...options, headers});
+  const signal = options.signal || state.viewAbortController?.signal;
+  const response = await fetch(path, {...options, headers, ...(signal ? {signal} : {})});
   if (!response.ok) {
     let payload = {};
     try { payload = await response.json(); } catch {}
@@ -187,11 +191,15 @@ function setConnection(ok, text) {
 }
 
 function switchView(view) {
+  if (state.viewAbortController) state.viewAbortController.abort();
+  state.viewAbortController = new AbortController();
   state.view = view;
   document.querySelectorAll(".view").forEach(el => el.classList.toggle("active", el.id === `view-${view}`));
   document.querySelectorAll(".nav-item").forEach(el => el.classList.toggle("active", el.dataset.view === view));
   document.getElementById("page-title").textContent = titles[view];
-  refreshCurrent();
+  requestAnimationFrame(() => {
+    if (state.view === view && !state.viewAbortController.signal.aborted) void refreshCurrent();
+  });
 }
 
 document.getElementById("nav").addEventListener("click", event => {
@@ -239,7 +247,7 @@ function compactTaskRows(tasks, limit = 6) {
   return `<table><thead><tr><th>文件</th><th>状态</th><th>页进度</th><th>更新时间</th></tr></thead><tbody>${tasks.slice(0, limit).map(task => {
     const progress = task.progress || {};
     const finished = (progress.completed_pages || 0) + (progress.skipped_pages || 0) + (progress.failed_pages || 0);
-    return `<tr data-task="${esc(task.task_id)}"><td>${esc((task.file_names || []).join(", "))}</td><td>${badge(task.partial_success ? "partial_success" : task.status)}</td><td>${finished}/${progress.total_pages || "-"}</td><td>${esc(formatDate(progress.updated_at || task.completed_at || task.created_at))}</td></tr>`;
+    return `<tr data-task="${esc(task.task_id)}"><td>${esc(task.display_name || (task.file_names || []).join(", "))}</td><td>${badge(task.partial_success ? "partial_success" : task.status)}</td><td>${finished}/${progress.total_pages || "-"}</td><td>${esc(formatDate(progress.updated_at || task.completed_at || task.created_at))}</td></tr>`;
   }).join("")}</tbody></table>`;
 }
 
@@ -343,6 +351,7 @@ async function loadRuntimeDiagnostics({force = false} = {}) {
     state.runtimeDiagnostics = await api("/api/diagnostics/runtime");
     renderRuntimeDiagnostics(state.runtimeDiagnostics);
   } catch (error) {
+    if (error.name === "AbortError") return;
     state.runtimeDiagnostics = {load_error: error.message};
     renderRuntimeDiagnostics(state.runtimeDiagnostics);
   } finally {
@@ -411,10 +420,10 @@ async function loadTasks() {
 
 function renderTasks() {
   const query = document.getElementById("task-search").value.trim().toLowerCase();
-  const tasks = state.tasks.filter(task => !query || String(task.task_id).toLowerCase().includes(query) || (task.file_names || []).join(" ").toLowerCase().includes(query));
+  const tasks = state.tasks.filter(task => !query || String(task.task_id).toLowerCase().includes(query) || String(task.display_name || "").toLowerCase().includes(query) || (task.file_names || []).join(" ").toLowerCase().includes(query));
   document.getElementById("tasks-table").innerHTML = `<table><thead><tr><th>文件</th><th>状态</th><th>后端</th><th>成功/总页数</th><th>跳过</th><th>耗时</th><th>开始时间</th></tr></thead><tbody>${tasks.map(task => {
     const p = task.progress || {};
-    return `<tr data-task="${esc(task.task_id)}" class="${task.task_id === state.activeTaskId ? "selected" : ""}"><td><strong>${esc((task.file_names || []).join(", "))}</strong><div class="mono muted">${esc(task.task_id)}</div></td><td>${badge(task.partial_success ? "partial_success" : task.status)}</td><td>${esc(task.backend)}</td><td>${p.completed_pages || 0}/${p.total_pages || "-"}</td><td>${p.skipped_pages || 0}</td><td class="task-elapsed">${esc(formatElapsed(task.started_at || task.created_at, task.completed_at))}</td><td>${esc(formatDate(task.started_at || task.created_at))}</td></tr>`;
+    return `<tr data-task="${esc(task.task_id)}" class="${task.task_id === state.activeTaskId ? "selected" : ""}"><td><strong>${esc(task.display_name || (task.file_names || []).join(", "))}</strong><div class="muted">${esc((task.file_names || []).join(", "))}</div><div class="mono muted">${esc(task.task_id)}</div></td><td>${badge(task.partial_success ? "partial_success" : task.status)}</td><td>${esc(task.backend)}</td><td>${p.completed_pages || 0}/${p.total_pages || "-"}</td><td>${p.skipped_pages || 0}</td><td class="task-elapsed">${esc(formatElapsed(task.started_at || task.created_at, task.completed_at))}</td><td>${esc(formatDate(task.started_at || task.created_at))}</td></tr>`;
   }).join("")}</tbody></table>`;
 }
 
@@ -644,12 +653,16 @@ function batchActions(run) {
 
 function compactBatchRows(items, limit = 100) {
   if (!items.length) return `<div class="empty-state">暂无批量测试</div>`;
-  return `<table><thead><tr><th>目录</th><th>状态</th><th>PDF</th><th>开始时间</th><th>记录</th><th>操作</th></tr></thead><tbody>${items.slice(0, limit).map(run => {
+  return `<table><thead><tr><th>输入 / 任务</th><th>状态</th><th>PDF</th><th>开始时间</th><th>记录</th><th>操作</th></tr></thead><tbody>${items.slice(0, limit).map(run => {
     const previewText = run.input_preview_ready || run.result_preview_ready ? "可预览" : "";
     const retrySource = run.settings?.source_type === "problem_page_retry" && run.settings?.retry_of_run_id
       ? `<div class="muted">异常页重试 · 来源 ${esc(run.settings.retry_of_run_id)}</div>`
       : "";
-    return `<tr><td><strong>${esc(run.settings?.input_path || run.input_path)}</strong>${retrySource}<div class="mono muted">${esc(run.run_id)}</div></td><td>${badge(run.status)}${previewText ? `<div class="muted">${previewText}</div>` : ""}</td><td>${run.settings?.pdf_count || "-"}</td><td>${esc(formatDate(run.started_at || run.created_at))}</td><td><button class="text-button" data-batch-detail="${esc(run.run_id)}">查看记录</button></td><td><div class="actions">${batchActions(run)}</div></td></tr>`;
+    const links = run.task_links?.tasks || [];
+    const taskLinks = links.length
+      ? links.map(task => `<button class="text-button" data-task-link="${esc(task.task_id)}" title="打开任务">${esc(task.display_name || task.file_name || task.task_id)}</button>`).join("")
+      : `<span class="muted">任务尚未登记</span>`;
+    return `<tr><td><strong>${esc(run.settings?.input_path || run.input_path)}</strong>${retrySource}<div class="mono muted">${esc(run.run_id)}</div><div class="batch-task-links">${taskLinks}</div></td><td>${badge(run.status)}${previewText ? `<div class="muted">${previewText}</div>` : ""}</td><td>${run.settings?.pdf_count || "-"}</td><td>${esc(formatDate(run.started_at || run.created_at))}</td><td><button class="text-button" data-batch-detail="${esc(run.run_id)}">查看记录</button></td><td><div class="actions">${batchActions(run)}</div></td></tr>`;
   }).join("")}</tbody></table>`;
 }
 
@@ -840,6 +853,13 @@ async function exportBatch(runId, format) {
 }
 
 async function handleBatchTableClick(event) {
+  const taskLink = event.target.closest("[data-task-link]");
+  if (taskLink) {
+    const taskId = taskLink.dataset.taskLink;
+    switchView("tasks");
+    requestAnimationFrame(() => void loadTaskDetail(taskId));
+    return;
+  }
   const problemRetryButton = event.target.closest("[data-problem-pages-retry]");
   if (problemRetryButton) {
     await openProblemPagesRetry(problemRetryButton.dataset.problemPagesRetry);
@@ -1486,10 +1506,12 @@ async function loadSelectedServiceLogs({showLoading = false} = {}) {
   try {
     const data = await api(`/api/services/${encodeURIComponent(service)}/logs?tail=${tail}`);
     if (requestId !== state.logRequestId || service !== document.getElementById("log-service").value) return;
-    output.textContent = data.logs || "没有日志输出。";
+    state.logRawText = data.logs || "";
+    renderFilteredLogs();
     if (follow || nearBottom) output.scrollTop = output.scrollHeight;
     setLogStatus(`${service} · ${new Date().toLocaleTimeString("zh-CN", {hour12: false})} 已更新`);
   } catch (error) {
+    if (error.name === "AbortError") return;
     if (requestId === state.logRequestId) {
       output.textContent = `日志读取失败：${error.message}`;
       setLogStatus(`${service} · 读取失败`, true);
@@ -1497,6 +1519,16 @@ async function loadSelectedServiceLogs({showLoading = false} = {}) {
   } finally {
     if (requestId === state.logRequestId) state.logLoading = false;
   }
+}
+
+function renderFilteredLogs() {
+  const output = document.getElementById("log-output");
+  const filter = document.getElementById("log-filter")?.value.trim().toLowerCase() || "";
+  const lines = state.logRawText.split("\n");
+  const visible = filter ? lines.filter(line => line.toLowerCase().includes(filter)) : lines;
+  output.textContent = visible.join("\n") || "没有匹配的日志。";
+  const service = document.getElementById("log-service")?.value || "日志";
+  setLogStatus(`${service} · ${visible.length}/${lines.length} 行`);
 }
 
 document.getElementById("load-logs").addEventListener("click", () => loadSelectedServiceLogs({showLoading: true}));
@@ -1517,6 +1549,7 @@ document.getElementById("log-follow").addEventListener("change", event => {
     output.scrollTop = output.scrollHeight;
   }
 });
+document.getElementById("log-filter").addEventListener("input", renderFilteredLogs);
 
 function labRunSettings(run) {
   return run.settings || run.config || {};
@@ -1709,14 +1742,18 @@ async function startLabExperiment(event) {
     notice("请填写服务器测试目录");
     return;
   }
+  if (inputPath.startsWith("/") || /^[A-Za-z]:[\\/]/.test(inputPath)) {
+    notice("服务器测试目录必须填写测试根目录下的相对路径，例如 . 或 company-set-01");
+    return;
+  }
   const submitButton = document.getElementById("lab-submit");
   const payload = {
     input_path: inputPath,
-    experiment_name: String(form.get("experiment_name") || "").trim() || null,
-    environment_name: String(form.get("environment_name") || "").trim() || null,
+    experiment_name: String(form.get("experiment_name") || "").trim(),
+    environment_name: String(form.get("environment_name") || "").trim(),
     hardware_type: form.get("hardware_type"),
     engine: form.get("engine"),
-    notes: String(form.get("notes") || "").trim() || null,
+    notes: String(form.get("notes") || "").trim(),
     backend: form.get("backend"),
     lang: String(form.get("lang") || "ch").trim() || "ch",
     task_timeout: Number(form.get("task_timeout")),
@@ -1796,7 +1833,7 @@ function configControl(item) {
       control = `<input type="${type}" data-config-key="${key}" value="${esc(candidate || "")}" placeholder="${esc(placeholder || "")}"${bounds}>`;
     }
   }
-  return `<div class="config-item${error ? " has-error" : ""}"><div class="config-key">${key}<span>${readonly ? "只读" : "可编辑"}</span></div><div class="config-control">${control}</div><p class="config-description">${esc(item.description || "")}</p>${error ? `<p class="config-error">${esc(error)}</p>` : ""}</div>`;
+  return `<div class="config-item${error ? " has-error" : ""}"><div class="config-key">${key}<span>${readonly ? "只读" : "可编辑"}</span><button type="button" class="config-help" data-config-help="${key}" title="查看详细说明" aria-label="查看 ${key} 说明">?</button></div><div class="config-control">${control}</div><p class="config-description">${esc(item.description || "")}</p>${error ? `<p class="config-error">${esc(error)}</p>` : ""}</div>`;
 }
 
 function renderConfig() {
@@ -1825,6 +1862,20 @@ function renderConfig() {
   for (const item of items) groups.set(item.category || "其他配置", [...(groups.get(item.category || "其他配置") || []), item]);
   document.getElementById("config-groups").innerHTML = [...groups.entries()].map(([category, group]) => `<section class="panel config-group"><div class="section-heading"><h2>${esc(category)}</h2><span>${group.length} 项</span></div>${group.map(item => configControl(item)).join("")}</section>`).join("") || `<div class="empty-state">没有可显示的配置。</div>`;
 }
+
+const configHelpDialog = document.getElementById("config-help-dialog");
+document.getElementById("config-groups").addEventListener("click", event => {
+  const button = event.target.closest("[data-config-help]");
+  if (!button) return;
+  const items = state.configSchema?.items || state.config?.items || [];
+  const item = items.find(candidate => candidate.key === button.dataset.configHelp);
+  if (!item) return;
+  document.getElementById("config-help-title").textContent = item.description || "配置说明";
+  document.getElementById("config-help-key").textContent = item.key;
+  document.getElementById("config-help-body").textContent = item.help || item.description || "暂无详细说明。";
+  configHelpDialog.showModal();
+});
+document.getElementById("config-help-close").addEventListener("click", () => configHelpDialog.close());
 
 function configStatusValue(value) {
   if (value == null || value === "") return "-";
@@ -1965,7 +2016,8 @@ function renderDeepDiagnostics(payload = state.deepDiagnostics) {
     const mounts = Array.isArray(service.mounts) ? service.mounts : [];
     const warnings = Array.isArray(service.warnings) ? service.warnings : [];
     const modelText = models.length ? diagnosticJson(models, "未发现可检查的绝对模型路径") : `<p class="muted">未发现可检查的绝对模型路径</p>`;
-    return `<article class="deep-service-card"><div class="section-heading"><div><h3>${esc(name)}</h3><p class="muted mono">${esc(service.container || "容器未创建")}</p></div>${badge(service.status || "unknown")}</div><dl><div><dt>镜像</dt><dd class="mono">${esc(service.image || "-")}</dd></div><div><dt>运行状态</dt><dd>${esc(service.state || "-")} / ${esc(service.health || "-")}</dd></div><div><dt>配置应用</dt><dd>${service.status === "applied" ? "无需重启" : service.status === "pending_restart" ? "需要重启" : "暂无法确认"}</dd></div></dl><details open><summary>实际环境变量</summary>${diagnosticJson(service.environment, "未读取到可展示的 MinerU 环境变量")}</details><details><summary>模型路径检查</summary>${modelText}</details><details><summary>容器挂载</summary>${diagnosticJson(mounts, "未发现容器挂载")}</details><details><summary>设备检测</summary>${diagnosticJson(service.devices, "未执行设备检测")}</details>${warnings.length ? `<div class="deep-diagnostic-warning"><strong>诊断提示</strong><ul>${warnings.map(item => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}</article>`;
+    const deviceEmptyText = name.includes("code-sync") ? "不适用：一次性代码同步容器" : "未执行设备检测";
+    return `<article class="deep-service-card"><div class="section-heading"><div><h3>${esc(name)}</h3><p class="muted mono">${esc(service.container || "容器未创建")}</p></div>${badge(service.status || "unknown")}</div><dl><div><dt>镜像</dt><dd class="mono">${esc(service.image || "-")}</dd></div><div><dt>运行状态</dt><dd>${esc(service.state || "-")} / ${esc(service.health || "-")}</dd></div><div><dt>配置应用</dt><dd>${service.status === "applied" ? "当前 env.multi 已加载" : service.status === "pending_restart" ? "服务健康，但当前容器尚未加载最新 env.multi，需要重建" : "暂无法确认"}</dd></div></dl><details open><summary>实际环境变量</summary>${diagnosticJson(service.environment, "未读取到可展示的 MinerU 环境变量")}</details><details><summary>模型路径检查</summary>${modelText}</details><details><summary>容器挂载</summary>${diagnosticJson(mounts, "未发现容器挂载")}</details><details><summary>设备检测</summary>${diagnosticJson(service.devices, deviceEmptyText)}</details>${warnings.length ? `<div class="deep-diagnostic-warning"><strong>诊断提示</strong><ul>${warnings.map(item => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}</article>`;
   }).join("");
   target.innerHTML = `<div class="config-status-meta"><span>检查时间：${esc(formatDate(payload.generated_at))}</span><span>Env 文件：${esc(payload.env_file?.path || payload.env_file?.name || "-")}</span><span>总体状态：${badge(payload.overall || "unknown")}</span></div><div class="deep-service-grid">${cards || `<div class="empty-state">没有可诊断的服务。</div>`}</div>${Array.isArray(payload.warnings) && payload.warnings.length ? `<div class="deep-diagnostic-warning"><strong>整体提示</strong><ul>${payload.warnings.map(item => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}`;
 }
@@ -1985,6 +2037,7 @@ async function loadDeepDiagnostics({force = false} = {}) {
     state.deepDiagnostics = await api("/api/diagnostics/deep");
     renderDeepDiagnostics();
   } catch (error) {
+    if (error.name === "AbortError") return;
     state.deepDiagnostics = {load_error: error.message};
     renderDeepDiagnostics();
   } finally {
@@ -2453,6 +2506,7 @@ async function refreshCurrent() {
     }
     setConnection(true, "控制台已连接");
   } catch (error) {
+    if (error.name === "AbortError") return;
     setConnection(false, "连接异常");
     notice(error.message);
   }

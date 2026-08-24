@@ -24,6 +24,7 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
         "key": "MINERU_MODEL_SOURCE",
         "category": "模型与设备",
         "description": "模型来源。离线现场通常使用 local。",
+        "help": "选择模型从哪里读取。离线部署必须使用 local，并且 API 容器内的 /models/pipeline 必须有完整的 PDF-Extract-Kit 模型；modelscope 或 huggingface 会允许程序尝试联网下载。",
         "type": "enum",
         "choices": ["local", "modelscope", "huggingface"],
         "editable": True,
@@ -32,6 +33,7 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
         "key": "MINERU_DEVICE_MODE",
         "category": "模型与设备",
         "description": "运行设备模式，例如 cpu、npu 或 cuda。",
+        "help": "决定 Pipeline 使用 CPU、昇腾 NPU 还是 NVIDIA GPU。改成 npu/cuda 还需要对应的 Compose 硬件叠加文件、驱动和设备映射，不能只修改这一项。",
         "type": "enum",
         "choices": ["cpu", "npu", "cuda"],
         "editable": True,
@@ -40,6 +42,7 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
         "key": "MINERU_VLM_MODEL",
         "category": "模型与设备",
         "description": "VLM 模型名称或本地模型目录。",
+        "help": "发送给外部 VLM 的模型名称，必须与 VLM 的 /v1/models 返回值完全一致；它不是 Pipeline 本地 PDF-Extract-Kit 模型目录。",
         "type": "string",
         "editable": True,
     },
@@ -47,6 +50,7 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
         "key": "MINERU_PROCESSING_WINDOW_SIZE",
         "category": "API 并发",
         "description": "API 处理窗口大小，影响同时保留的任务数。",
+        "help": "API 任务处理窗口，不等于 VLM micro-batch。数值越大可以提高吞吐，但会增加内存、显存或 NPU 压力。",
         "type": "integer",
         "minimum": 1,
         "maximum": 128,
@@ -56,6 +60,7 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
         "key": "MINERU_API_MAX_CONCURRENT_REQUESTS",
         "category": "API 并发",
         "description": "API 同时处理的请求数量。",
+        "help": "限制同时进入 API 的文件解析请求数量；单个请求内部仍可能有页面并发。现场建议从 1 或 3 开始逐步压测。",
         "type": "integer",
         "minimum": 1,
         "maximum": 64,
@@ -65,6 +70,7 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
         "key": "MINERU_VLM_FAILURE_POLICY",
         "category": "VLM 超时与重试",
         "description": "VLM 失败时的处理策略。",
+        "help": "fail_fast 表示任一关键页面失败就尽快结束；skip_page 表示记录失败/超时页面并继续处理其余页面。",
         "type": "enum",
         "choices": ["fail_fast", "skip_page"],
         "editable": True,
@@ -73,6 +79,7 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
         "key": "MINERU_VLM_GLOBAL_PAGE_CONCURRENCY",
         "category": "VLM 超时与重试",
         "description": "VLM 页面级并发数；测试耗时建议先使用 1。",
+        "help": "所有文件共享的 VLM 页面并发上限。提高后可能更快，但会增加外部 VLM 和 NPU 的压力；要测单页真实耗时建议设为 1。",
         "type": "integer",
         "minimum": 1,
         "maximum": 64,
@@ -82,6 +89,7 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
         "key": "MINERU_VLM_PAGE_TIMEOUT_SECONDS",
         "category": "VLM 超时与重试",
         "description": "单页 VLM 请求的软超时时间（秒）。",
+        "help": "每一页等待 VLM 返回的业务层上限。达到后 MinerU 会把这页标记为超时，并按失败策略跳过或失败；它主要控制页面结果如何记录，不保证能取消远端 VLM 已经开始的计算。控制台批量测试/异常页重试可以临时覆盖此值。",
         "type": "integer",
         "minimum": 1,
         "maximum": 7200,
@@ -91,6 +99,7 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
         "key": "MINERU_VLM_CONNECT_MAX_RETRIES",
         "category": "VLM 超时与重试",
         "description": "连接失败时自动重试次数；测量单页真实耗时建议为 0。",
+        "help": "页面级连接错误重试次数，只针对连接中断、502/503/504 等瞬时错误。重试会增加总耗时；测量真实单页耗时建议为 0。",
         "type": "integer",
         "minimum": 0,
         "maximum": 3,
@@ -100,6 +109,7 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
         "key": "MINERU_VLM_CLIENT_MAX_CONCURRENCY",
         "category": "VLM 超时与重试",
         "description": "VLM 客户端请求并发上限。",
+        "help": "API 内部 VLM 客户端同时发起的区域/请求数量。它和页面并发、API 请求并发共同影响实际压力。",
         "type": "integer",
         "minimum": 1,
         "maximum": 64,
@@ -109,6 +119,7 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
         "key": "MINERU_VLM_CLIENT_MAX_RETRIES",
         "category": "VLM 超时与重试",
         "description": "VLM 客户端内部重试次数。",
+        "help": "底层 HTTP 客户端自己的自动重试次数。它会和页面逻辑层重试叠加，通常建议保持 0，统一由页面逻辑层记录和控制。",
         "type": "integer",
         "minimum": 0,
         "maximum": 5,
@@ -117,7 +128,8 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
     {
         "key": "MINERU_VLM_CLIENT_HTTP_TIMEOUT",
         "category": "VLM 超时与重试",
-        "description": "VLM 客户端 HTTP 超时时间（秒）。",
+        "description": "VLM 客户端 HTTP 硬超时时间（秒）。",
+        "help": "底层 HTTP 连接真正等待响应的硬上限。它小于单页软超时时，HTTP 会先断开，页面永远无法等到 soft timeout；因此必须大于或等于准备测试的最大 MINERU_VLM_PAGE_TIMEOUT_SECONDS，建议额外留出 60 秒以上余量。修改后必须重建 API 容器。",
         "type": "integer",
         "minimum": 1,
         "maximum": 14400,
@@ -127,6 +139,7 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
         "key": "MINERU_OPS_PORT",
         "category": "运维控制台",
         "description": "运维控制台监听端口。修改后需要重启服务。",
+        "help": "浏览器访问运维控制台的端口。修改后需要重建或重启 mineru-ops，并同步防火墙/端口映射。",
         "type": "integer",
         "minimum": 1,
         "maximum": 65535,
@@ -136,6 +149,7 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
         "key": "MINERU_OPS_AUTH_TOKEN",
         "category": "运维控制台",
         "description": "运维控制台管理令牌；页面只显示脱敏值。",
+        "help": "控制写入配置、启动/停止服务、批量测试等操作的管理令牌。建议使用随机长字符串，不要使用 1124 这类短口令。",
         "type": "secret",
         "editable": True,
     },
@@ -143,6 +157,7 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
         "key": "MINERU_OPS_TEST_HOST_PATH",
         "category": "运维控制台",
         "description": "宿主机批量测试目录。",
+        "help": "宿主机目录会挂载到 Ops 容器的 /data/mineru-test-pdfs。批量测试和性能实验的 input_path 应填写这个测试根目录下面的相对路径，例如 . 或 company-set-01，而不是宿主机绝对路径。",
         "type": "string",
         "editable": True,
     },
@@ -150,6 +165,7 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
         "key": "MINERU_OPS_DATA_VOLUME",
         "category": "运维控制台",
         "description": "运维数据持久化目录或 volume 名称。",
+        "help": "保存任务记录、日志、报告和预览产物的 Docker volume 名称。不要随意更换，否则页面可能看不到旧记录。",
         "type": "string",
         "editable": False,
     },
@@ -1378,20 +1394,22 @@ class Agent:
         )
         base.update(_redact_payload(runtime_info, runtime_secrets))
         actual = _parse_environment_list((inspect.get("Config") or {}).get("Env"))
+        actual_effective = dict(actual)
+        actual_effective.update(runtime_info.get("command_options") or {})
         expected_keys = _service_expected_env_keys(service)
         if not expected_keys:
             base["warnings"].append("该服务没有配置环境变量比对白名单，无法判断是否已生效")
             return base
         # env.multi 同时包含 API、Router、Ops 的配置；只比较确实会注入
         # 当前服务 Config.Env 的变量，避免跨服务变量制造虚假的重启提示。
-        candidate_keys = sorted(expected_keys & (set(current) | set(actual)))
+        candidate_keys = sorted(expected_keys & (set(current) | set(actual_effective)))
         base["compared_keys"] = candidate_keys
         if not candidate_keys:
             base["warnings"].append("当前 env 文件和容器中都没有可比对的白名单变量")
             return base
         for key in candidate_keys:
             expected = current.get(key)
-            actual_value = actual.get(key)
+            actual_value = actual_effective.get(key)
             if expected is None:
                 continue
             if actual_value is None:
@@ -1414,7 +1432,7 @@ class Agent:
         base["requires_restart"] = mismatch
         base["status"] = "pending_restart" if mismatch else "applied"
         base["config_hash"] = _config_hash(
-            {key: actual.get(key, "") for key in candidate_keys},
+            {key: actual_effective.get(key, "") for key in candidate_keys},
             candidate_keys,
         )
         return base
@@ -1675,14 +1693,110 @@ class Agent:
         }
         return _redact_payload(result, _secret_values(current))
 
+    def runtime_diagnostics(self) -> dict[str, Any]:
+        """Inspect the API container, where MinerU actually loads its runtime config."""
+        service_result = self.services()
+        if not service_result.get("ok"):
+            return {"ok": False, "error": service_result.get("error") or "无法读取 Compose 服务状态"}
+        runtime_services = service_result.get("services", {})
+        candidates = [
+            name for name in sorted(runtime_services)
+            if name == "mineru-api" or name.startswith("mineru-api-")
+        ]
+        target_service = next(
+            (name for name in candidates if runtime_services.get(name, {}).get("container")),
+            candidates[0] if candidates else None,
+        )
+        if not target_service:
+            return {"ok": False, "error": "没有发现 mineru-api 容器"}
+        container = (runtime_services.get(target_service) or {}).get("container")
+        if not container:
+            return {"ok": False, "error": "mineru-api 容器尚未创建"}
+        inspect, error = self._inspect_container(str(container))
+        if inspect is None:
+            return {"ok": False, "error": error or "无法读取 mineru-api 容器信息"}
+
+        actual = _parse_environment_list((inspect.get("Config") or {}).get("Env"))
+        raw_source = actual.get("MINERU_MODEL_SOURCE", "").strip().lower()
+        model_source = raw_source if raw_source in {"local", "modelscope", "huggingface"} else "unknown"
+        model_paths = ["/models/pipeline"]
+        for key in MODEL_PATH_ENV_KEYS:
+            value = actual.get(key, "").strip()
+            if value.startswith("/") and value not in model_paths:
+                model_paths.append(value)
+
+        command_results: dict[str, dict[str, Any]] = {}
+        for key, command in (("nvidia_smi", "nvidia-smi"), ("npu_smi", "npu-smi info")):
+            result = _trim_command_result(
+                run_command(["docker", "exec", str(container), "sh", "-c", command], self.project_dir, timeout=30)
+            )
+            output = str(result.get("output") or "")
+            error_text = str(result.get("error") or "")
+            command_results[key] = {
+                "available": bool(result.get("ok")) or "not found" not in f"{output} {error_text}".lower(),
+                "ok": bool(result.get("ok")),
+                "stdout": output[:MAX_COMMAND_OUTPUT],
+                "stderr": error_text[:4000],
+                "error": error_text or None,
+            }
+
+        models = [{"path": path, **self._inspect_path(str(container), path)} for path in model_paths]
+        devices = []
+        if command_results["nvidia_smi"].get("ok"):
+            devices.append({"type": "gpu", "vendor": "nvidia", "detected": True})
+        if command_results["npu_smi"].get("ok"):
+            devices.append({"type": "npu", "vendor": "ascend", "detected": True})
+
+        warnings: list[str] = []
+        if model_source == "unknown":
+            warnings.append("API 容器未设置或不支持 MINERU_MODEL_SOURCE")
+        if model_source == "local" and not models[0].get("exists"):
+            warnings.append("API 容器配置为本地模型，但 /models/pipeline 不存在")
+        if not devices:
+            warnings.append("API 容器内未检测到可用 GPU/NPU 管理命令；这不代表 Ops 容器故障")
+
+        return _redact_payload(
+            {
+                "ok": True,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "target": {"service": target_service, "container": container},
+                "offline": {
+                    "configured": model_source == "local" or all(
+                        actual.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+                        for name in ("MODELSCOPE_OFFLINE", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")
+                    ),
+                    "model_source": model_source,
+                    "modelscope_disabled": actual.get("MODELSCOPE_OFFLINE", "").lower() in {"1", "true", "yes", "on"},
+                    "huggingface_disabled": actual.get("HF_HUB_OFFLINE", "").lower() in {"1", "true", "yes", "on"},
+                    "transformers_disabled": actual.get("TRANSFORMERS_OFFLINE", "").lower() in {"1", "true", "yes", "on"},
+                    "network_access": "not_checked",
+                },
+                "configuration": {
+                    "tools_config_configured": bool(actual.get("MINERU_TOOLS_CONFIG_JSON", "").strip()),
+                    "vlm_model_configured": bool(actual.get("MINERU_VLM_MODEL", "").strip()),
+                    "cuda_visible_devices_configured": bool(actual.get("CUDA_VISIBLE_DEVICES", "").strip()),
+                    "ascend_visible_devices_configured": bool(
+                        actual.get("ASCEND_RT_VISIBLE_DEVICES", "").strip()
+                        or actual.get("NPU_VISIBLE_DEVICES", "").strip()
+                    ),
+                },
+                "environment": _safe_environment(actual),
+                "models": models,
+                "devices": devices,
+                "commands": command_results,
+                "warnings": warnings,
+            },
+            _secret_values(actual),
+        )
+
     def _inspect_path(self, container: str, path: str) -> dict[str, Any]:
         quoted = shlex.quote(path)
         script = (
-            f"if [ -e {quoted} ]; then "
+            f"if [ -e {quoted} ]; then exists=1; "
             f"test -r {quoted}; readable=$?; "
             f"count=$(find {quoted} -maxdepth 3 -type f 2>/dev/null | head -1001 | wc -l); "
-            f"else readable=1; count=0; fi; "
-            f"printf '%s %s\\n' $readable $count"
+            f"else exists=0; readable=0; count=0; fi; "
+            f"printf '%s %s %s\\n' $exists $readable $count"
         )
         result = run_command(["docker", "exec", container, "sh", "-c", script], self.project_dir, timeout=30)
         if not result.get("ok"):
@@ -1690,12 +1804,20 @@ class Agent:
         parts = str(result.get("output", "")).strip().split()
         if len(parts) < 2:
             return {"path": path, "exists": False, "readable": False, "file_count": 0, "scan_limited": False, "error": "无法解析路径检查结果"}
-        readable = parts[0] == "0"
+        if len(parts) >= 3:
+            exists = parts[0] == "1"
+            readable = parts[1] == "0"
+            count_text = parts[2]
+        else:
+            # Compatibility with older test doubles/agent output.
+            exists = True
+            readable = parts[0] == "0"
+            count_text = parts[1]
         try:
-            count = int(parts[1])
+            count = int(count_text)
         except ValueError:
             count = 0
-        return {"path": path, "exists": True, "readable": readable, "file_count": count, "scan_limited": count >= 1001, "error": None}
+        return {"path": path, "exists": exists, "readable": readable, "file_count": count, "scan_limited": count >= 1001, "error": None}
 
     def deep_diagnostics(self) -> dict[str, Any]:
         status_result = self.config_status()
@@ -1744,6 +1866,9 @@ class Agent:
                 key: value for key, value in actual.items()
                 if key in MODEL_PATH_ENV_KEYS and isinstance(value, str) and value.startswith("/")
             }
+            if service == "mineru-api" or service.startswith("mineru-api-"):
+                model_paths.setdefault("PIPELINE_MODEL_ROOT", "/models/pipeline")
+                model_paths.setdefault("MINERU_TOOLS_CONFIG_JSON", "/etc/mineru/mineru.json")
             for key, path in model_paths.items():
                 model = self._inspect_path(str(container), path)
                 model["key"] = key
@@ -1757,6 +1882,12 @@ class Agent:
                         "output": result.get("output", ""),
                         "error": result.get("error"),
                     }
+            elif service == "mineru-code-sync":
+                detail["device_check"] = "not_applicable"
+                detail["warnings"] = [
+                    warning for warning in detail["warnings"]
+                    if "设备" not in str(warning) and "device" not in str(warning).lower()
+                ]
             details[service] = detail
         result = {
             "ok": True,
@@ -1788,6 +1919,8 @@ class Agent:
             return self.config_status()
         if action == "config_effective":
             return self.config_effective()
+        if action == "runtime_diagnostics":
+            return self.runtime_diagnostics()
         if action == "deep_diagnostics":
             return self.deep_diagnostics()
         if action == "services":

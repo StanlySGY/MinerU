@@ -1500,6 +1500,35 @@ class OpsRuntime:
             "retention_days": self.artifact_retention_days,
         }
 
+    def batch_task_links(
+        self,
+        record: dict[str, Any],
+        artifacts: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        artifacts = artifacts if artifacts is not None else self.batch_artifacts(record)
+        settings = record.get("settings") or {}
+        links: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for preview in artifacts.get("previews") or []:
+            if not isinstance(preview, dict):
+                continue
+            task_id = str(preview.get("task_id") or "")
+            if not task_id or task_id in seen:
+                continue
+            seen.add(task_id)
+            file_name = str(
+                preview.get("file_name")
+                or preview.get("relative_path")
+                or preview.get("source_path")
+                or "unknown.pdf"
+            )
+            links.append({
+                "task_id": task_id,
+                "file_name": file_name,
+                "display_name": f"批量测试 · {file_name}",
+            })
+        return {"task_count": len(links), "tasks": links}
+
     @classmethod
     def _problem_pages_from_preview(cls, preview: dict[str, Any]) -> list[dict[str, Any]]:
         by_page: dict[tuple[str, int], dict[str, Any]] = {}
@@ -2530,6 +2559,7 @@ class OpsRuntime:
                     "task_id": task_id,
                     "status": task_status,
                     "file_names": [str(preview.get("file_name") or "unknown")],
+                    "display_name": f"批量测试 · {str(preview.get('file_name') or 'unknown')}",
                     "backend": (record.get("settings") or {}).get("backend", "vlm-http-client"),
                     "partial_success": bool(preview.get("partial_success")),
                     "created_at": started_at or record.get("created_at"),
@@ -3627,12 +3657,15 @@ def create_app() -> FastAPI:
             progress = task.get("progress") or {}
             skipped_pages += int(progress.get("skipped_pages", 0) or 0)
             failed_pages += int(progress.get("failed_pages", 0) or 0)
+        batch_runs = runtime.store.list_batch_runs(limit=10)
+        for item in batch_runs:
+            item["task_links"] = runtime.batch_task_links(item)
         return {
             "services": services,
             "task_counts": counts,
             "skipped_pages": skipped_pages,
             "failed_pages": failed_pages,
-            "batch_runs": runtime.store.list_batch_runs(limit=10),
+            "batch_runs": batch_runs,
             "updated_at": utc_now_iso(),
         }
 
@@ -3759,7 +3792,7 @@ def create_app() -> FastAPI:
     @app.get("/api/diagnostics/runtime")
     async def runtime_diagnostics_view(request: Request):
         authorize(request)
-        return await asyncio.to_thread(runtime.runtime_diagnostics)
+        return await config_agent_call("runtime_diagnostics", timeout=90)
 
     @app.get("/api/diagnostics/deep")
     async def deep_diagnostics_view(request: Request):
@@ -4069,6 +4102,7 @@ def create_app() -> FastAPI:
         authorize(request)
         items = runtime.store.list_batch_runs()
         for item in items:
+            item["task_links"] = runtime.batch_task_links(item)
             item["metrics"] = runtime.batch_run_metrics(item)
         return {
             "items": items,
@@ -4111,7 +4145,16 @@ def create_app() -> FastAPI:
                 server_url=server_url or None,
                 recursive=recursive,
             )
-            display_path = f"浏览器上传（{uploaded_count} 个 PDF）"
+            uploaded_names = [
+                str(upload.filename or "unknown.pdf").replace("\\", "/").split("/")[-1]
+                for upload in files
+            ]
+            if uploaded_count == 1:
+                display_path = f"浏览器上传：{uploaded_names[0]}"
+            else:
+                preview_names = "、".join(uploaded_names[:3])
+                suffix = " 等" if uploaded_count > 3 else ""
+                display_path = f"浏览器上传：{preview_names}{suffix}（共 {uploaded_count} 个）"
             result = await runtime.start_batch_path(
                 upload_path,
                 payload,
@@ -4188,6 +4231,7 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="batch run not found")
         artifacts = runtime.batch_artifacts(result)
         result["artifacts"] = artifacts
+        result["task_links"] = runtime.batch_task_links(result, artifacts)
         result["metrics"] = runtime.batch_run_metrics(result, artifacts)
         return result
 

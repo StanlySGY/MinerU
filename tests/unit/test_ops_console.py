@@ -1448,14 +1448,14 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "experiment_type" in dashboard_js
     assert "32" in dashboard_html
     assert "配置中心" in dashboard_html
-    assert "UI15" in dashboard_html
+    assert "UI16" in dashboard_html
     assert "预览变更" in dashboard_html
     assert "保存并应用" in dashboard_html
     assert "最终有效配置" in dashboard_html
     assert "config-apply-dialog" in dashboard_html
     assert "config-apply-result" in dashboard_html
-    assert "ops.js?v=ui15" in dashboard_html
-    assert "ops.css?v=ui15" in dashboard_html
+    assert "ops.js?v=ui16" in dashboard_html
+    assert "ops.css?v=ui16" in dashboard_html
     assert "problem-pages-list" in dashboard_html
     assert "problem-pages-select-all" in dashboard_html
     assert "runtime-diagnostics" in dashboard_html

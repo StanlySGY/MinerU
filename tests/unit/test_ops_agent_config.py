@@ -597,6 +597,22 @@ def test_config_status_reports_applied_when_runtime_matches_env(tmp_path: Path, 
     assert result["services"]["mineru-api-1"]["mismatched_keys"] == []
 
 
+def test_config_status_prefers_api_command_options_over_container_env(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "env.multi").write_text("MINERU_VLM_CLIENT_HTTP_TIMEOUT=1200\n", encoding="utf-8")
+    agent = make_agent(tmp_path)
+    monkeypatch.setattr(agent, "configured_services", lambda: {"mineru-api-1"})
+    monkeypatch.setattr(agent, "services", lambda: {"ok": True, "services": {"mineru-api-1": {"container": "api-1"}}})
+    inspect = _runtime_inspect(["MINERU_VLM_CLIENT_HTTP_TIMEOUT=600"])
+    inspect["Path"] = "python"
+    inspect["Args"] = ["-m", "mineru.cli.fast_api", "--http-timeout", "1200"]
+    monkeypatch.setattr(agent, "_inspect_container", lambda container: (inspect, None))
+
+    result = agent.config_status()
+
+    assert result["services"]["mineru-api-1"]["status"] == "applied"
+    assert result["services"]["mineru-api-1"]["mismatched_keys"] == []
+
+
 def test_config_status_reports_pending_restart_for_mismatch(tmp_path: Path, monkeypatch) -> None:
     (tmp_path / "env.multi").write_text("MINERU_VLM_PAGE_TIMEOUT_SECONDS=1200\n", encoding="utf-8")
     agent = make_agent(tmp_path)

@@ -1338,3 +1338,55 @@ git diff --check
 - 本轮代码仍在本地 `dev` 工作区，未执行 `git commit`、`git push`、Docker build 或镜像导出。
 - 现场需要自行拉取代码、构建代码镜像并按既有 Compose 流程重建/刷新共享 code volume 和相关服务。
 - 部署后若页面仍显示旧 UI，浏览器执行强制刷新（如 `Ctrl+F5`），并确认加载的是 `ops.js?v=ui13` 和 `ops.css?v=ui13`。
+
+## 2026-08-24：UI16 诊断准确性、任务联立与控制台交互修复
+
+本轮针对公司服务器现场反馈完成 UI16 修复。当前工作区未执行 commit、push 或 Docker 构建；无关的未跟踪诊断文件和用户已有修改未处理。
+
+### 本轮完成
+
+1. **运行时诊断改查实际 API 容器**
+   - `/api/diagnostics/runtime` 改为通过宿主机 Agent 检查 `mineru-api` 实际容器。
+   - `MINERU_MODEL_SOURCE`、`MINERU_VLM_MODEL`、`/models/pipeline`、`/etc/mineru/mineru.json` 和设备命令不再从 Ops 容器臆测。
+   - 无 GPU/NPU 工具时明确说明是 API 容器能力缺失，不再提示“Ops 容器不可用”。
+   - `mineru-code-sync` 的设备检测标记为不适用，一次性代码同步容器不再显示“未执行设备检测”。
+
+2. **配置状态判断统一有效值优先级**
+   - `config_status` 现在按命令行参数 > 容器环境变量比较实际值，修复 API 启动参数覆盖 env 时的假性“等待重启”。
+   - 服务健康和配置是否已加载继续分开显示：健康只代表进程可用，`pending_restart` 代表当前容器尚未加载 env.multi 新值。
+
+3. **批量测试与任务页面联立**
+   - 浏览器上传记录显示实际 PDF 文件名，不再统一显示“浏览器上传（1 个 PDF）”。
+   - 批量记录返回关联 Task ID 和显示名称，任务页显示“批量测试 · 文件名”。
+   - 批量页可直接点击关联任务跳转任务详情。
+
+4. **性能实验和日志体验**
+   - 性能实验的实验名称、环境名称和备注为空时传空字符串，不再传 `null` 触发 Pydantic `string_type` 错误。
+   - 服务器测试目录明确为相对于 Ops 测试根目录的路径，并拦截宿主机绝对路径输入。
+   - 日志页增加关键词/字段筛选，支持 `ERROR`、`timeout`、`task_id` 等文本过滤并显示匹配行数。
+
+5. **配置帮助和页面切换**
+   - 配置 schema 增加详细 `help`，每个配置项增加问号按钮和说明弹窗，重点解释两个 VLM timeout 的区别。
+   - 左侧页面切换时取消旧页面请求，延迟到下一帧刷新，避免旧诊断/日志请求阻塞新页面。
+   - 静态资源版本更新为 `ops.js?v=ui16`、`ops.css?v=ui16`。
+
+### 验证
+
+```bash
+python -m py_compile mineru/cli/ops.py docker/multi/mineru-ops-agent.py
+node --check mineru/ops/static/ops.js
+git diff --check
+python -m pytest -o addopts='' \
+  tests/unit/test_ops_console.py \
+  tests/unit/test_ops_agent_config.py \
+  tests/unit/test_api_request.py \
+  tests/unit/test_vlm_resilience.py \
+  tests/unit/test_batch_router_diagnose.py -q
+# 109 passed
+```
+
+### 部署提示
+
+- 构建并部署 UI16 后，需要刷新 `mineru-code-sync` 共享代码卷，并重建 `mineru-ops`、`mineru-api`、`mineru-router` 等实际使用代码卷的服务。
+- 现场修改配置后，应在服务页分别查看 HTTP 健康和配置应用状态；两者同时显示“健康”和“等待重启生效”是可能且有意义的。
+- 性能实验目录填写 `.` 或测试根目录下的相对目录，例如 `company-set-01`，不能填写宿主机路径。

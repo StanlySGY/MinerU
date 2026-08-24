@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MinerU 运维控制台</title>
-  <link rel="stylesheet" href="/assets/ops.css?v=ui15">
+  <link rel="stylesheet" href="/assets/ops.css?v=ui16">
 </head>
 <body>
   <div class="shell">
@@ -81,7 +81,7 @@
           <div class="section-heading">
             <div>
               <h2>运行时诊断</h2>
-              <p class="muted">只读取当前 ops 容器可见配置、模型路径和设备信息，不联网、不下载模型。</p>
+            <p class="muted">检查实际 mineru-api 容器加载的配置、模型路径和设备信息，不联网、不下载模型。</p>
             </div>
             <button id="runtime-diagnostics-refresh" type="button" class="secondary-button">刷新诊断</button>
           </div>
@@ -173,7 +173,7 @@
               <label><span>引擎标签</span><select name="engine"><option value="mineru">MinerU</option><option value="ragflow">RAGFlow</option><option value="other">其他</option></select></label>
               <label><span>后端</span><select name="backend"><option value="vlm-http-client">vlm-http-client</option><option value="hybrid-http-client">hybrid-http-client</option><option value="pipeline">pipeline</option></select></label>
               <label><span>语言</span><input name="lang" value="ch"></label>
-              <label class="lab-wide"><span>服务器测试目录</span><input name="input_path" value="."><small>相对于控制台允许的测试根目录；如需浏览器上传，请使用“批量测试”。</small></label>
+            <label class="lab-wide"><span>服务器测试目录（相对路径）</span><input name="input_path" value="."><small>相对于 Ops 容器的 MINERU_OPS_TEST_ROOT；填写 . 或 company-set-01。不能直接填写宿主机绝对路径。</small></label>
               <fieldset class="lab-wide lab-batch-options">
                 <legend>VLM micro-batch 页数</legend>
                 <div class="lab-option-row">
@@ -224,7 +224,7 @@
       <section id="view-config" class="view">
         <section class="feature-hero config-hero">
           <div>
-            <span class="feature-kicker">安全、可解释的现场配置 <b class="ui8-badge">UI15</b></span>
+            <span class="feature-kicker">安全、可解释的现场配置 <b class="ui8-badge">UI16</b></span>
             <h2>配置中心</h2>
             <p>从宿主机 Agent 读取当前 env 配置，先预览差异，再通过 Compose 校验安全应用；失败会自动回滚。</p>
           </div>
@@ -283,6 +283,7 @@
         <div class="toolbar log-toolbar">
           <select id="log-service"></select>
           <select id="log-tail"><option value="200">最近 200 行</option><option value="500">最近 500 行</option><option value="1000">最近 1000 行</option><option value="2000">最近 2000 行</option></select>
+          <input id="log-filter" type="search" placeholder="筛选关键词或字段，例如 ERROR、timeout、task_id" aria-label="日志关键词筛选">
           <label class="inline-check"><input id="log-live" type="checkbox" checked><span>动态刷新</span></label>
           <label class="inline-check"><input id="log-follow" type="checkbox" checked><span>跟随最新</span></label>
           <button id="load-logs" class="secondary-button">立即刷新</button>
@@ -376,6 +377,13 @@
     </div>
   </dialog>
 
-  <script src="/assets/ops.js?v=ui15"></script>
+  <dialog id="config-help-dialog" class="config-help-dialog">
+    <header class="dialog-header">
+      <div><h2 id="config-help-title">配置说明</h2><p id="config-help-key" class="mono muted"></p></div>
+      <button id="config-help-close" type="button" class="secondary-button">关闭</button>
+    </header>
+    <div id="config-help-body" class="config-help-body"></div>
+  </dialog>
+  <script src="/assets/ops.js?v=ui16"></script>
 </body>
 </html>
