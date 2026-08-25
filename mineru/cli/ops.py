@@ -34,7 +34,7 @@ import httpx
 import uvicorn
 import yaml
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 from pydantic import BaseModel, Field
@@ -4435,10 +4435,15 @@ def create_app() -> FastAPI:
     if static_dir.is_dir():
         app.mount("/assets", StaticFiles(directory=static_dir), name="ops-assets")
 
+        # 控制台前端版本号：单一来源。index.html 中的 {{OPS_VERSION}} 占位符
+        # （缓存号 ?v=… 与 .version-badge 文案）统一由这里注入。
+        OPS_VERSION = "2.0.0"
+
         @app.get("/")
         async def index():
-            return FileResponse(
-                static_dir / "index.html",
+            html = (static_dir / "index.html").read_text(encoding="utf-8")
+            return HTMLResponse(
+                html.replace("{{OPS_VERSION}}", OPS_VERSION),
                 headers={"Cache-Control": "no-store"},
             )
 

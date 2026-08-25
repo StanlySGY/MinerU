@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MinerU 运维控制台</title>
-  <link rel="stylesheet" href="/assets/ops.css?v=ui19">
+  <link rel="stylesheet" href="/assets/ops.css?v={{OPS_VERSION}}">
 </head>
 <body>
   <div class="shell">
@@ -232,7 +232,7 @@
       <section id="view-config" class="view">
         <section class="feature-hero config-hero">
           <div>
-            <span class="feature-kicker">安全、可解释的现场配置 <b class="ui8-badge">UI19</b></span>
+            <span class="feature-kicker">安全、可解释的现场配置 <b class="version-badge">{{OPS_VERSION}}</b></span>
             <h2>配置中心</h2>
             <p>从宿主机 Agent 读取当前 env 配置，先预览差异，再通过 Compose 校验安全应用；失败会自动回滚。</p>
           </div>
@@ -359,19 +359,22 @@
       <button id="close-task-preview" type="button" class="secondary-button">关闭</button>
     </header>
     <div class="dialog-actions document-toolbar">
-      <label class="inline-check"><input id="task-preview-sync" type="checkbox" checked><span>同步滚动</span></label>
+      <div class="inspector-actions">
+        <label class="inline-check"><input id="task-preview-sync" type="checkbox" checked><span>同步滚动</span></label>
+      </div>
       <div class="actions">
+        <button id="copy-task-markdown" type="button" class="secondary-button copy-button">复制 Markdown</button>
         <button id="download-task-original" type="button" class="secondary-button">下载原始 PDF</button>
-        <button id="download-task-result" type="button" class="secondary-button">下载结果 ZIP</button>
+        <button id="download-task-result" type="button" class="secondary-button" disabled>下载结果 ZIP</button>
       </div>
     </div>
     <div class="task-compare-grid">
-      <section class="task-compare-pane">
-        <div class="preview-heading"><h3>原始 PDF</h3><span id="task-pdf-page-count" class="muted"></span></div>
+      <section class="task-compare-pane inspector-pane">
+        <div class="preview-heading"><h3>原始 PDF · BBox 定位视窗</h3><span id="task-pdf-page-count" class="muted"></span></div>
         <div id="task-original-pages" class="task-synced-scroll task-pdf-pages"></div>
       </section>
-      <section class="task-compare-pane">
-        <div class="preview-heading"><h3>Markdown 提取结果</h3><span id="task-preview-status" class="muted"></span></div>
+      <section class="task-compare-pane inspector-pane">
+        <div class="preview-heading"><h3>Markdown · LaTeX · 结构化表格</h3><span id="task-preview-status" class="muted"></span></div>
         <article id="task-result-preview" class="markdown-preview task-synced-scroll"><div class="empty-state">正在读取...</div></article>
       </section>
     </div>
@@ -394,6 +397,6 @@
     </header>
     <div id="config-help-body" class="config-help-body"></div>
   </dialog>
-  <script src="/assets/ops.js?v=ui19"></script>
+  <script src="/assets/ops.js?v={{OPS_VERSION}}"></script>
 </body>
 </html>

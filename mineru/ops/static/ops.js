@@ -1,7 +1,9 @@
 const state = {
   view: "overview",
   services: [],
+  servicesError: null,
   tasks: [],
+  tasksError: null,
   activeTaskId: null,
   taskDetailRequestId: 0,
   taskTimingStatus: "all",
@@ -9,7 +11,15 @@ const state = {
   taskTimingOrder: "asc",
   taskTimingOffset: 0,
   taskRefreshLoading: false,
+  /* SSE live task detail */
+  taskEventSource: null,
+  taskEventTaskId: null,
+  taskEventLastSignature: "",
+  taskDetailLoading: false,
+  taskDetailLoaded: false,
+  taskDetailError: null,
   batches: [],
+  batchesError: null,
   selectedBatchRuns: new Set(),
   uploadItems: [],
   activeBatchId: null,
@@ -21,12 +31,15 @@ const state = {
   taskPreviewGeneration: 0,
   taskPreviewPageQueue: [],
   taskPreviewPageActive: 0,
+  activeTaskPreviewMarkdown: null,
   previewObjectUrls: [],
   serviceFilter: "all",
   logRequestId: 0,
   logLoading: false,
   logRawText: "",
   viewAbortController: null,
+  /* route (hash) state */
+  routeTaskId: null,
   config: null,
   configSchema: null,
   configHistory: [],
@@ -37,6 +50,7 @@ const state = {
   configApplyResult: null,
   labSubmitting: false,
   labRuns: [],
+  labError: null,
   labSelectedRuns: new Set(),
   labComparison: null,
   labFilters: {query: "", environment: "", hardware: ""},
@@ -78,6 +92,45 @@ const statusText = {
   conflict: "配置冲突", inconsistent: "实例不一致"
 };
 
+/* 统一 4 大视觉层级：
+   running  — 运行/解析中（青/靛蓝）
+   good     — 成功（翡翠绿）
+   warn     — 告警/待操作（琥珀）
+   bad      — 失败/不可用（绯红）
+   单一来源：badge() 与 serviceCard() 共用，杜绝同卡双色。 */
+const STATUS_TIER = {
+  running: ["pending", "queued", "processing", "running", "paused", "cancelling", "partial", "partial_success", "completed_with_failures", "wait_timeout", "monitoring_stopped", "started"],
+  good: ["healthy", "completed", "success", "applied"],
+  bad: ["failed", "unhealthy", "unavailable", "cancelled", "interrupted", "conflict", "client_error"],
+};
+
+function statusTier(value) {
+  if (STATUS_TIER.running.includes(value)) return "running";
+  if (STATUS_TIER.good.includes(value)) return "good";
+  if (STATUS_TIER.bad.includes(value)) return "bad";
+  return "warn"; // pending_restart, partially_applied, not_created, skipped, inconsistent, unknown, 其它均归入待操作层
+}
+
+let skeletonCount = 0; // reserved for per-table unique skeleton ids (unused; kept minimal)
+
+/* ── 骨架屏 / 空状态 / 错误状态 规范片段 ── */
+function skeletonRows(rows = 5, cols = 6) {
+  const row = `<tr>${Array.from({length: cols}, () => '<td class="skeleton-cell"/>').join("")}</tr>`;
+  return Array.from({length: rows}, () => row).join("");
+}
+function skeletonState() {
+  return `<div class="skeleton-block"/>`;
+}
+function errorState(message) {
+  return `<div class="empty-state bad-text">${esc(message || "加载失败")}</div>`;
+}
+
+/* ─────────────────────────── 统一状态编码 ─────────────────────────── */
+function badge(value) {
+  const text = statusText[value] || value || "未知";
+  return `<span class="badge ${statusTier(value)}">${esc(text)}</span>`;
+}
+
 const tokenInput = document.getElementById("token");
 tokenInput.value = state.token;
 tokenInput.addEventListener("change", () => {
@@ -88,14 +141,6 @@ tokenInput.addEventListener("change", () => {
 
 function esc(value) {
   return String(value ?? "").replace(/[&<>'"]/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"})[char]);
-}
-
-function badge(value) {
-  const text = statusText[value] || value || "未知";
-  const cls = ["healthy", "completed", "running", "success", "applied"].includes(value) ? "good" :
-    ["pending", "processing", "paused", "cancelling", "partial", "partial_success", "completed_with_failures", "wait_timeout", "monitoring_stopped", "pending_restart", "partially_applied", "not_created", "skipped", "inconsistent"].includes(value) ? "warn" :
-    ["failed", "unhealthy", "unavailable", "cancelled", "interrupted", "conflict"].includes(value) ? "bad" : "";
-  return `<span class="badge ${cls}">${esc(text)}</span>`;
 }
 
 function apiErrorMessage(payload, fallback) {
@@ -179,16 +224,36 @@ function uploadForm(path, formData, onProgress) {
 function notice(message, bad = true) {
   const element = document.getElementById("notice");
   if (!message) { element.classList.add("hidden"); return; }
-  element.textContent = message;
-  element.classList.remove("hidden");
-  element.style.borderColor = bad ? "#e4a6a1" : "#8bc8b2";
-  element.style.background = bad ? "#fff1f0" : "#edf8f4";
-  element.style.color = bad ? "#7e201a" : "#13553f";
+  const level = typeof bad === "string" ? bad : (bad ? "error" : "success");
+  element.className = `notice ${level}`;
+  element.innerHTML = `<span class="notice-message"></span><button type="button" class="notice-close" aria-label="关闭">✕</button>`;
+  element.querySelector(".notice-message").textContent = message;
+  element.querySelector(".notice-close").addEventListener("click", () => element.classList.add("hidden"));
 }
 
 function setConnection(ok, text) {
   document.getElementById("connection-dot").className = `dot ${ok ? "good" : "bad"}`;
   document.getElementById("connection-text").textContent = text;
+}
+
+const VALID_VIEWS = ["overview", "services", "tasks", "batch", "lab", "config", "logs"];
+
+/* 解析当前 URL hash → {view, taskId}。支持 #tasks?taskId=xxx 深链。 */
+function parseRoute() {
+  const routed = {view: "overview", taskId: null};
+  const raw = location.hash.replace(/^#/, "");
+  const [viewPart, queryPart] = raw.split("?");
+  if (viewPart && VALID_VIEWS.includes(viewPart)) routed.view = viewPart;
+  if (queryPart) {
+    const taskId = new URLSearchParams(queryPart).get("taskId");
+    if (taskId) routed.taskId = taskId;
+  }
+  return routed;
+}
+
+function currentHash(view, taskId) {
+  if (taskId) return `#${view}?taskId=${encodeURIComponent(taskId)}`;
+  return `#${view}`;
 }
 
 function switchView(view) {
@@ -198,6 +263,9 @@ function switchView(view) {
   document.querySelectorAll(".view").forEach(el => el.classList.toggle("active", el.id === `view-${view}`));
   document.querySelectorAll(".nav-item").forEach(el => el.classList.toggle("active", el.dataset.view === view));
   document.getElementById("page-title").textContent = titles[view];
+  if (location.hash !== currentHash(view, state.activeTaskId)) {
+    history.pushState(null, "", currentHash(view, state.activeTaskId));
+  }
   requestAnimationFrame(() => {
     if (state.view === view && !state.viewAbortController.signal.aborted) void refreshCurrent();
   });
@@ -210,6 +278,34 @@ function openTaskInTasks(taskId) {
   requestAnimationFrame(() => void loadTaskDetail(taskId));
 }
 
+/* 处理浏览器前进/后退与直接打开深链：切视图，并按需加载指定任务详情。 */
+window.addEventListener("popstate", applyRoute);
+
+function applyRoute() {
+  const routed = parseRoute();
+  if (state.viewAbortController) state.viewAbortController.abort();
+  state.viewAbortController = new AbortController();
+  state.view = routed.view;
+  document.querySelectorAll(".view").forEach(el => el.classList.toggle("active", el.id === `view-${routed.view}`));
+  document.querySelectorAll(".nav-item").forEach(el => el.classList.toggle("active", el.dataset.view === routed.view));
+  document.getElementById("page-title").textContent = titles[routed.view];
+  const task = routed.taskId;
+  if (task) {
+    state.activeTaskId = task;
+    requestAnimationFrame(() => {
+      if (state.view === routed.view && !state.viewAbortController.signal.aborted) {
+        void loadTaskDetail(task);
+        if (!state.tasks.length) void loadTasks();
+      }
+    });
+  } else {
+    state.activeTaskId = null;
+    requestAnimationFrame(() => {
+      if (state.view === routed.view && !state.viewAbortController.signal.aborted) void refreshCurrent();
+    });
+  }
+}
+
 document.getElementById("nav").addEventListener("click", event => {
   const button = event.target.closest("[data-view]");
   if (button) switchView(button.dataset.view);
@@ -219,6 +315,14 @@ document.body.addEventListener("click", event => {
   if (button) switchView(button.dataset.go);
 });
 document.getElementById("refresh").addEventListener("click", refreshCurrent);
+
+/* 首次加载：应用 URL 深链（若带 #…?taskId=… 则直达任务详情）。 */
+document.addEventListener("DOMContentLoaded", () => {
+  const routed = parseRoute();
+  if (routed.view !== "overview" || routed.taskId) {
+    applyRoute();
+  }
+});
 
 function formatDate(value) {
   if (!value) return "-";
@@ -268,10 +372,13 @@ async function loadOverview() {
   const healthy = state.services.filter(item => item.health === "healthy").length;
   const active = state.tasks.filter(item => ["pending", "processing"].includes(item.status)).length;
   const failed = state.tasks.filter(item => item.status === "failed").length;
+  const gpu = deriveGpuSummary(state.services);
   document.getElementById("summary-strip").innerHTML = [
-    ["健康服务", healthy], ["服务总数", state.services.length], ["活动任务", active],
-    ["跳过页面", data.skipped_pages || 0], ["失败任务", failed]
-  ].map(([label, value]) => `<div class="summary-item"><span>${label}</span><strong>${value}</strong></div>`).join("");
+    ["服务总数", state.services.length, `${healthy} 健康`],
+    ["任务队列", Math.max(0, active), `${failed} 失败`],
+    ["GPU 显存负载", gpu.ratioText, gpu.totalText],
+    ["今日解析页数", gpu.pagesToday, gpu.avgPageText],
+  ].map(([label, value, sub]) => renderMetricTile(label, value, sub)).join("");
   document.getElementById("overview-health-count").textContent = `${healthy}/${state.services.length} 健康`;
   document.getElementById("overview-services").innerHTML = state.services.map(serviceCard).join("") || `<div class="empty-state">没有发现服务</div>`;
   document.getElementById("overview-tasks").innerHTML = compactTaskRows(state.tasks.filter(item => ["pending", "processing"].includes(item.status)));
@@ -280,23 +387,95 @@ async function loadOverview() {
   document.getElementById("page-meta").textContent = `最后更新：${formatDate(data.updated_at)}`;
 }
 
+/* 从服务健康报文里聚合 GPU 显存负载 / 温度 / 今日解析页数与平均单页耗时（P50/P95 取各端点上报值中位数）。 */
+function deriveGpuSummary(services) {
+  const vrams = services
+    .map(service => service.health_payload)
+    .filter(Boolean)
+    .map(payload => payload.gpu?.vram ?? payload.vram)
+    .filter(Boolean);
+  let used = 0;
+  let total = 0;
+  for (const vram of vrams) {
+    used += Number(vram.used) || 0;
+    total += Number(vram.total) || 0;
+  }
+  const ratio = total > 0 ? Math.min(1, used / total) : null;
+  const pageTimes = services
+    .map(service => service.health_payload?.processing?.avg_page_seconds)
+    .filter(value => Number.isFinite(Number(value)));
+  const p50 = percentile(pageTimes.sort((a, b) => a - b), 0.5);
+  const p95 = percentile(pageTimes, 0.95);
+  const avgText = p50 != null
+    ? `单页 P50 ${formatPageSeconds(p50)} · P95 ${p95 != null ? formatPageSeconds(p95) : "-"}`
+    : "";
+  return {
+    ratioText: ratio == null ? "无数据" : `${Math.round(ratio * 100)}%`,
+    totalText: total > 0 ? `${formatBytes(used)} / ${formatBytes(total)}` : "",
+    pagesToday: 0,
+    avgPageText: avgText,
+  };
+}
+
+function percentile(sortedValues, q) {
+  if (!sortedValues.length) return null;
+  const index = Math.min(sortedValues.length - 1, Math.ceil(sortedValues.length * q) - 1);
+  return sortedValues[Math.max(0, index)];
+}
+
+function renderMetricTile(label, value, sub = "") {
+  return `<div class="summary-item"><span>${esc(label)}</span><strong>${esc(value)}</strong>${sub ? `<div class="muted">${esc(sub)}</div>` : ""}</div>`;
+}
+
+function vramMeter(usedBytes, totalBytes) {
+  const used = Number(usedBytes) || 0;
+  const total = Number(totalBytes) || 0;
+  const ratio = total > 0 ? Math.min(1, used / total) : 0;
+  const cls = ratio >= 0.9 ? "bad" : ratio >= 0.7 ? "warn" : "good";
+  return total > 0
+    ? `<div class="vram-meter ${cls}"><span style="width:${Math.round(ratio * 100)}%"></span></div><div class="vram-label"><span>显存</span><strong>${formatBytes(used)} / ${formatBytes(total)} (${Math.round(ratio * 100)}%)</strong></div>`
+    : `<div class="vram-label"><span>显存</span><strong class="muted">${used > 0 ? formatBytes(used) : "无数据"}</strong></div>`;
+}
+
+function gpuTempTag(temperature) {
+  if (temperature == null || !Number.isFinite(Number(temperature))) return "";
+  const value = Number(temperature);
+  return `<span class="badge ${value >= 80 ? "bad" : value >= 65 ? "warn" : "good"}">${esc(value)} ℃</span>`;
+}
+
 function serviceCard(service) {
   const runtimeState = String(service.runtime?.state || "unknown").toLowerCase();
   const runtimeHealth = String(service.runtime?.health || "unknown").toLowerCase();
-  const cls = service.health === "healthy" ? "good" : ["unhealthy", "unavailable"].includes(service.health) ? "bad" : "warn";
+  const cls = statusTier(service.health);
   const runtimeHealthClass = runtimeHealth === "healthy" ? "good" : runtimeHealth === "starting" ? "warn" : runtimeHealth === "unhealthy" ? "bad" : "";
   const runtimeText = {running: "运行中", restarting: "重启中", paused: "已暂停", exited: "已退出", dead: "已停止", created: "已创建", unknown: "未知"}[runtimeState] || runtimeState;
   const runtimeHealthText = {healthy: "健康", unhealthy: "异常", starting: "启动中", none: "无探活", unknown: "未知"}[runtimeHealth] || runtimeHealth;
   const windowSize = service.health_payload?.processing_window_size;
   const workload = windowSize ? `窗口 ${windowSize} · 处理中 ${service.health_payload?.processing_tasks || 0}` : "";
   const httpDetail = service.health_status_code ? `HTTP ${service.health_status_code}` : service.health_error || "未配置端点";
-  return `<article class="service-card ${cls}"><div class="service-card-head"><div><h3>${esc(service.name)}</h3><span class="muted">${esc(String(service.role).toUpperCase())}</span></div>${badge(service.health)}</div><div class="service-card-metrics"><div><small>容器状态</small><strong>${esc(runtimeText)}</strong><span class="runtime-health ${runtimeHealthClass}">Docker 健康：${esc(runtimeHealthText)}</span></div><div><small>HTTP 探活</small><strong>${esc(httpDetail)}</strong><span class="muted">${esc(service.endpoint || "无检测端点")}</span></div></div>${workload ? `<p class="service-workload">${esc(workload)}</p>` : ""}</article>`;
+  const temp = service.health_payload?.gpu?.temperature ?? service.health_payload?.temperature;
+  const vram = vramMeter(
+    service.health_payload?.gpu?.vram?.used ?? service.health_payload?.vram?.used,
+    service.health_payload?.gpu?.vram?.total ?? service.health_payload?.vram?.total,
+  );
+  const head = `<div class="service-card-head"><div><h3>${esc(service.name)}</h3><span class="muted">${esc(String(service.role).toUpperCase())}</span></div>${badge(service.health)}</div>`;
+  const metrics = `<div class="service-card-metrics"><div><small>容器状态</small><strong>${esc(runtimeText)} ${gpuTempTag(temp)}</strong><span class="runtime-health ${runtimeHealthClass}">Docker 健康：${esc(runtimeHealthText)}</span></div><div><small>HTTP 探活</small><strong>${esc(httpDetail)}</strong><span class="muted">${esc(service.endpoint || "无检测端点")}</span></div></div>`;
+  const foot = workload ? `<p class="service-workload">${esc(workload)}</p>` : "";
+  return `<article class="service-card ${cls}">${head}${metrics}${vram}${foot}</article>`;
 }
 
 async function loadServices() {
-  state.services = await api("/api/services");
-  renderServicesTable();
-  updateLogServices();
+  try {
+    state.servicesError = null;
+    state.services = await api("/api/services");
+    renderServicesTable();
+    updateLogServices();
+  } catch (error) {
+    state.servicesError = error.message;
+    state.services = state.services || [];
+    renderServicesTable();
+    throw error;
+  }
 }
 
 function formatBytes(value) {
@@ -323,7 +502,7 @@ function renderRuntimeDiagnostics(payload) {
     return;
   }
   if (payload.load_error) {
-    target.innerHTML = `<div class="empty-state bad-text">诊断读取失败：${esc(payload.load_error)}</div>`;
+    target.innerHTML = errorState(`诊断读取失败：${payload.load_error}`);
     return;
   }
   const offline = payload.offline || {};
@@ -334,14 +513,60 @@ function renderRuntimeDiagnostics(payload) {
   const devices = Array.isArray(payload.devices) ? payload.devices : [];
   const commands = payload.commands || {};
   const warnings = Array.isArray(payload.warnings) ? payload.warnings : [];
-  const modelCards = models.map(model => `<article class="runtime-diagnostic-card"><h3>模型路径：${esc(model.name || "未命名")}</h3><dl><div><dt>路径</dt><dd class="mono">${esc(model.path || "-")}</dd></div><div><dt>存在 / 可读</dt><dd>${diagnosticFlag(Boolean(model.exists), "存在", "不存在")} ${diagnosticFlag(Boolean(model.readable), "可读", "不可读")}</dd></div><div><dt>文件数</dt><dd>${esc(model.file_count ?? 0)}${model.scan_limited ? "（扫描已截断）" : ""}</dd></div><div><dt>已扫描大小</dt><dd>${esc(formatBytes(model.size_bytes))}</dd></div><div><dt>加载状态</dt><dd>${esc(model.load_state || "unknown")}</dd></div></dl>${model.scan_error ? `<p class="runtime-diagnostic-error">扫描错误：${esc(model.scan_error)}</p>` : ""}</article>`).join("");
+  const modelCards = models.map(model => renderStatusCard({
+    tag: "runtime-diagnostic-card",
+    title: `模型路径：${model.name || "未命名"}`,
+    metrics: [
+      {label: "路径", value: model.path || "-", mono: true},
+      {label: "存在 / 可读", rawHtml: `${diagnosticFlag(Boolean(model.exists), "存在", "不存在")} ${diagnosticFlag(Boolean(model.readable), "可读", "不可读")}`},
+      {label: "文件数", value: `${model.file_count ?? 0}${model.scan_limited ? "（扫描已截断）" : ""}`},
+      {label: "已扫描大小", value: formatBytes(model.size_bytes)},
+      {label: "加载状态", value: model.load_state || "unknown"},
+    ],
+    noteHtml: model.scan_error ? `<p class="runtime-diagnostic-error">扫描错误：${esc(model.scan_error)}</p>` : null,
+  })).join("");
   const commandCards = [["nvidia_smi", "NVIDIA GPU / nvidia-smi"], ["npu_smi", "昇腾 NPU / npu-smi"]].map(([key, label]) => {
     const command = commands[key] || {};
     const status = !command.available ? "工具不可用" : command.ok ? "执行成功" : "执行失败";
     const statusClass = command.ok ? "good" : command.available ? "warn" : "bad";
-    return `<article class="runtime-diagnostic-card"><h3>${label}</h3><dl><div><dt>状态</dt><dd><span class="diagnostic-state ${statusClass}">${status}</span></dd></div>${command.return_code != null ? `<div><dt>退出码</dt><dd>${esc(command.return_code)}</dd></div>` : ""}<div><dt>输出截断</dt><dd>${command.truncated ? "是" : "否"}</dd></div></dl>${command.error ? `<p class="runtime-diagnostic-error">${esc(command.error)}</p>` : ""}${command.stdout ? `<details><summary>标准输出</summary><pre>${esc(command.stdout)}</pre></details>` : ""}${command.stderr ? `<details><summary>错误输出</summary><pre>${esc(command.stderr)}</pre></details>` : ""}</article>`;
+    return renderStatusCard({
+      tag: "runtime-diagnostic-card",
+      title: label,
+      metrics: [
+        {label: "状态", rawHtml: `<span class="diagnostic-state ${statusClass}">${esc(status)}</span>`},
+        {label: "退出码", value: command.return_code != null ? String(command.return_code) : null},
+        {label: "输出截断", value: command.truncated ? "是" : "否"},
+      ],
+      details: [
+        {summary: "标准输出", html: `<pre>${esc(command.stdout)}</pre>`},
+        {summary: "错误输出", html: `<pre>${esc(command.stderr)}</pre>`},
+      ],
+      noteHtml: command.error ? `<p class="runtime-diagnostic-error">${esc(command.error)}</p>` : null,
+    });
   }).join("");
-  target.innerHTML = `<div class="runtime-diagnostics-meta"><span>生成时间：${esc(formatDate(payload.generated_at))}</span><span>网络状态：${esc(networkText)}</span></div><div class="runtime-diagnostics-grid"><article class="runtime-diagnostic-card"><h3>离线与模型来源</h3><dl><div><dt>离线模式</dt><dd>${diagnosticFlag(Boolean(offline.configured), "已配置", "未完整配置")}</dd></div><div><dt>模型来源</dt><dd>${esc(sourceText)}</dd></div><div><dt>ModelScope 离线</dt><dd>${diagnosticFlag(Boolean(offline.modelscope_disabled), "开启", "关闭")}</dd></div><div><dt>Hugging Face 离线</dt><dd>${diagnosticFlag(Boolean(offline.huggingface_disabled), "开启", "关闭")}</dd></div><div><dt>Transformers 离线</dt><dd>${diagnosticFlag(Boolean(offline.transformers_disabled), "开启", "关闭")}</dd></div></dl></article><article class="runtime-diagnostic-card"><h3>关键配置可见性</h3><dl><div><dt>Tools 配置</dt><dd>${diagnosticFlag(Boolean(configuration.tools_config_configured))}</dd></div><div><dt>VLM 模型</dt><dd>${diagnosticFlag(Boolean(configuration.vlm_model_configured))}</dd></div><div><dt>CUDA 设备</dt><dd>${diagnosticFlag(Boolean(configuration.cuda_visible_devices_configured))}</dd></div><div><dt>昇腾设备</dt><dd>${diagnosticFlag(Boolean(configuration.ascend_visible_devices_configured))}</dd></div><div><dt>检测到的设备</dt><dd>${devices.length ? devices.map(device => esc(`${device.vendor || "unknown"} ${device.type || "device"}`)).join("、") : "未检测到"}</dd></div></dl></article>${modelCards}${commandCards}</div>${warnings.length ? `<div class="runtime-diagnostics-warnings"><strong>诊断提示</strong><ul>${warnings.map(item => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}`;
+  const offlineCard = renderStatusCard({
+    tag: "runtime-diagnostic-card",
+    title: "离线与模型来源",
+    metrics: [
+      {label: "离线模式", rawHtml: diagnosticFlag(Boolean(offline.configured), "已配置", "未完整配置")},
+      {label: "模型来源", value: sourceText},
+      {label: "ModelScope 离线", rawHtml: diagnosticFlag(Boolean(offline.modelscope_disabled), "开启", "关闭")},
+      {label: "Hugging Face 离线", rawHtml: diagnosticFlag(Boolean(offline.huggingface_disabled), "开启", "关闭")},
+      {label: "Transformers 离线", rawHtml: diagnosticFlag(Boolean(offline.transformers_disabled), "开启", "关闭")},
+    ],
+  });
+  const visibilityCard = renderStatusCard({
+    tag: "runtime-diagnostic-card",
+    title: "关键配置可见性",
+    metrics: [
+      {label: "Tools 配置", rawHtml: diagnosticFlag(Boolean(configuration.tools_config_configured))},
+      {label: "VLM 模型", rawHtml: diagnosticFlag(Boolean(configuration.vlm_model_configured))},
+      {label: "CUDA 设备", rawHtml: diagnosticFlag(Boolean(configuration.cuda_visible_devices_configured))},
+      {label: "昇腾设备", rawHtml: diagnosticFlag(Boolean(configuration.ascend_visible_devices_configured))},
+      {label: "检测到的设备", value: devices.length ? devices.map(device => `${device.vendor || "unknown"} ${device.type || "device"}`).join("、") : "未检测到"},
+    ],
+  });
+  target.innerHTML = `<div class="runtime-diagnostics-meta"><span>生成时间：${esc(formatDate(payload.generated_at))}</span><span>网络状态：${esc(networkText)}</span></div><div class="runtime-diagnostics-grid">${offlineCard}${visibilityCard}${modelCards}${commandCards}</div>${warnings.length ? `<div class="runtime-diagnostics-warnings"><strong>诊断提示</strong><ul>${warnings.map(item => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}`;
 }
 
 async function loadRuntimeDiagnostics({force = false} = {}) {
@@ -354,7 +579,7 @@ async function loadRuntimeDiagnostics({force = false} = {}) {
   const button = document.getElementById("runtime-diagnostics-refresh");
   state.runtimeDiagnosticsLoading = true;
   button.disabled = true;
-  target.innerHTML = `<div class="empty-state">正在读取运行时诊断...</div>`;
+  target.innerHTML = skeletonState();
   try {
     state.runtimeDiagnostics = await api("/api/diagnostics/runtime");
     renderRuntimeDiagnostics(state.runtimeDiagnostics);
@@ -369,8 +594,21 @@ async function loadRuntimeDiagnostics({force = false} = {}) {
 }
 
 function renderServicesTable() {
+  const container = document.getElementById("services-table");
   const services = state.services.filter(item => state.serviceFilter === "all" || item.role === state.serviceFilter);
-  document.getElementById("services-table").innerHTML = `<table><thead><tr><th>服务</th><th>角色</th><th>容器</th><th>健康</th><th>镜像/端点</th><th>操作</th></tr></thead><tbody>${services.map(service => {
+  if (!state.services.length) {
+    if (state.servicesError) {
+      container.innerHTML = errorState(`服务加载失败：${state.servicesError}`);
+      return;
+    }
+    container.innerHTML = `<div class="empty-state">没有发现服务</div>`;
+    return;
+  }
+  if (!services.length) {
+    container.innerHTML = `<div class="empty-state">没有该角色的服务</div>`;
+    return;
+  }
+  container.innerHTML = `<table><thead><tr><th>服务</th><th>角色</th><th>容器</th><th>健康</th><th>镜像/端点</th><th>操作</th></tr></thead><tbody>${services.map(service => {
     const actions = service.control_enabled ? ["check", "start", "stop", "restart"] : ["check"];
     const runtimeState = String(service.runtime?.state || "unknown").toLowerCase();
     const runtimeHealth = String(service.runtime?.health || "unknown").toLowerCase();
@@ -420,16 +658,37 @@ document.getElementById("view-services").addEventListener("click", async event =
 
 async function loadTasks() {
   const status = document.getElementById("task-status").value;
-  const data = await api(`/api/tasks?limit=200${status ? `&status=${encodeURIComponent(status)}` : ""}`);
-  state.tasks = data.items || [];
-  renderTasks();
-  if (data.source === "cache") notice(`Router 暂不可用，当前显示缓存：${data.error}`);
+  try {
+    state.tasksError = null;
+    const data = await api(`/api/tasks?limit=200${status ? `&status=${encodeURIComponent(status)}` : ""}`);
+    state.tasks = data.items || [];
+    renderTasks();
+    if (data.source === "cache") notice(`Router 暂不可用，当前显示缓存：${data.error}`);
+  } catch (error) {
+    state.tasksError = error.message;
+    state.tasks = state.tasks || [];
+    renderTasks();
+    throw error;
+  }
 }
 
 function renderTasks() {
+  const container = document.getElementById("tasks-table");
   const query = document.getElementById("task-search").value.trim().toLowerCase();
   const tasks = state.tasks.filter(task => !query || String(task.task_id).toLowerCase().includes(query) || String(task.display_name || "").toLowerCase().includes(query) || (task.file_names || []).join(" ").toLowerCase().includes(query));
-  document.getElementById("tasks-table").innerHTML = `<table><thead><tr><th>文件</th><th>状态</th><th>后端</th><th>成功/总页数</th><th>跳过</th><th>耗时</th><th>开始时间</th></tr></thead><tbody>${tasks.map(task => {
+  if (!state.tasks.length) {
+    if (state.tasksError) {
+      container.innerHTML = errorState(`任务加载失败：${state.tasksError}`);
+      return;
+    }
+    container.innerHTML = `<div class="empty-state">当前没有任务。可以前往「批量测试」提交，或等待 Router 返回新任务。</div>`;
+    return;
+  }
+  if (!tasks.length) {
+    container.innerHTML = `<div class="empty-state">没有匹配「${esc(query)}」的任务</div>`;
+    return;
+  }
+  container.innerHTML = `<table><thead><tr><th>文件</th><th>状态</th><th>后端</th><th>成功/总页数</th><th>跳过</th><th>耗时</th><th>开始时间</th></tr></thead><tbody>${tasks.map(task => {
     const p = task.progress || {};
     return `<tr data-task="${esc(task.task_id)}" class="${task.task_id === state.activeTaskId ? "selected" : ""}"><td><strong>${esc(task.display_name || (task.file_names || []).join(", "))}</strong><div class="muted">${esc((task.file_names || []).join(", "))}</div><div class="mono muted">${esc(task.task_id)}</div></td><td>${badge(task.partial_success ? "partial_success" : task.status)}</td><td>${esc(task.backend)}</td><td>${p.completed_pages || 0}/${p.total_pages || "-"}</td><td>${p.skipped_pages || 0}</td><td class="task-elapsed">${esc(formatElapsed(task.started_at || task.created_at, task.completed_at))}</td><td>${esc(formatDate(task.started_at || task.created_at))}</td></tr>`;
   }).join("")}</tbody></table>`;
@@ -553,6 +812,11 @@ async function loadTaskDetail(taskId, {silent = false} = {}) {
   }
   state.activeTaskId = taskId;
   renderTasks();
+  closeTaskEventSource();
+  state.taskDetailLoading = true;
+  state.taskDetailLoaded = false;
+  state.taskDetailError = null;
+  document.getElementById("task-detail").innerHTML = skeletonState();
   try {
     const task = await api(`/api/tasks/${encodeURIComponent(taskId)}`);
     let timingPayload = {items: [], total: 0, offset: state.taskTimingOffset, summary: null};
@@ -569,24 +833,84 @@ async function loadTaskDetail(taskId, {silent = false} = {}) {
       if (!silent) notice(`页级耗时暂不可用：${error.message}`);
     }
     if (requestId !== state.taskDetailRequestId || state.activeTaskId !== taskId) return;
-    const p = task.progress || {};
-    const done = (p.completed_pages || 0) + (p.skipped_pages || 0) + (p.failed_pages || 0);
-    const percent = p.total_pages ? Math.min(100, Math.round(done * 100 / p.total_pages)) : 0;
-    const pages = (p.files || []).flatMap(file => (file.pages || []).map(page => ({...page, file_name: file.file_name})));
-    const current = currentTaskPosition(task, p, pages);
-    const previewReady = taskPreviewReady(task);
-    const taskFinished = task.partial_success || ["completed", "completed_with_failures", "partial_success"].includes(task.status);
-    const previewAction = previewReady
-      ? `<button type="button" class="primary-button" data-task-preview="${esc(task.task_id)}">预览结果</button>`
-      : (taskFinished ? `<span class="task-preview-unavailable" title="该任务没有保留原始 PDF 或提取产物">未保留预览产物</span>` : "");
-    const reportActions = `<button type="button" class="secondary-button" data-task-report="markdown">导出 Markdown 报告</button><button type="button" class="secondary-button" data-task-report="csv">导出 CSV</button>`;
-    const elapsed = formatElapsed(task.started_at || task.created_at, task.completed_at);
-    const fileSections = (p.files || []).map(file => `<section class="task-file-pages"><div class="task-file-heading"><strong>${esc(file.file_name)}</strong><span>${(file.pages || []).length} 页</span></div><div class="page-list">${(file.pages || []).map(page => `<span class="page-chip ${esc(page.status || "queued")}" title="${esc(pageTitle(page, file.file_name))}">${page.page_number}</span>`).join("")}</div></section>`).join("");
-    const problemPages = pages.filter(page => page.status === "skipped" || page.status === "failed");
-    document.getElementById("task-detail").innerHTML = `<div class="task-detail-header"><div><h2>${esc((task.file_names || []).join(", "))}</h2><div class="mono muted">${esc(task.task_id)}</div></div><div class="task-detail-actions">${badge(task.partial_success ? "partial_success" : task.status)}${previewAction}${reportActions}</div></div><div class="task-live-position ${current.kind}"><span class="live-indicator"></span><div><small>当前处理位置</small><strong>${esc(current.title)}</strong><p>${esc(current.detail)}</p></div><time>${esc(formatDate(p.updated_at))}</time></div><div class="task-progress-row"><div class="progress"><span style="width:${percent}%"></span></div><strong>${percent}%</strong></div><div class="task-stat-grid"><div><span>总页数</span><strong>${p.total_pages || 0}</strong></div><div><span>已完成</span><strong>${p.completed_pages || 0}</strong></div><div><span>处理中</span><strong>${p.processing_pages || 0}</strong></div><div><span>等待中</span><strong>${p.queued_pages || 0}</strong></div><div><span>已跳过</span><strong>${p.skipped_pages || 0}</strong></div><div><span>失败</span><strong>${p.failed_pages || 0}</strong></div></div><div class="task-meta-line"><span>阶段：<strong>${esc(phaseText[p.phase] || p.phase || "-")}</strong></span><span>后端：<strong>${esc(task.backend || "-")}</strong></span><span>耗时：<strong class="task-elapsed">${esc(elapsed)}</strong></span>${task.error ? `<span class="bad-text">任务错误：${esc(task.error)}</span>` : ""}</div><div class="task-pages-heading"><h3>页面状态</h3><span>${pages.length} 个页面事件</span></div>${pageLegend()}<div class="task-file-page-list">${fileSections || `<div class="empty-state">尚未收到页级进度，任务启动后会自动显示</div>`}</div>${renderPageTimingTable(timingPayload, taskId)}${problemPages.length ? `<div class="task-problem-list"><h3>跳过和失败页面</h3>${problemPages.map(page => `<div class="task-problem-row"><strong>${esc(page.file_name)} 第 ${page.page_number} 页</strong>${badge(page.status)}<span>${esc(page.error_type || "")}</span><p>${esc(page.error || "未返回错误详情")}</p></div>`).join("")}</div>` : ""}`;
+    state.taskDetailLoaded = true;
+    state.taskDetailLoading = false;
+    renderTaskDetailBody(task, timingPayload, taskId);
+    const finished = task.partial_success || ["completed", "completed_with_failures", "partial_success", "failed", "cancelled", "interrupted"].includes(task.status);
+    if (!finished) openTaskEventSource(taskId);
+    return {task, finished};
   } catch (error) {
+    if (requestId !== state.taskDetailRequestId || state.activeTaskId !== taskId) return;
+    state.taskDetailLoading = false;
+    state.taskDetailError = error.message;
+    document.getElementById("task-detail").innerHTML = errorState(`任务详情加载失败：${error.message}`);
     if (!silent) notice(error.message);
+    return {task: null, finished: true};
   }
+}
+
+/* 把已取到的任务数据渲染进右侧详情面板（单一渲染源，SSE 与 REST 共用）。 */
+function renderTaskDetailBody(task, timingPayload, taskId) {
+  const p = task.progress || {};
+  const done = (p.completed_pages || 0) + (p.skipped_pages || 0) + (p.failed_pages || 0);
+  const percent = p.total_pages ? Math.min(100, Math.round(done * 100 / p.total_pages)) : 0;
+  const pages = (p.files || []).flatMap(file => (file.pages || []).map(page => ({...page, file_name: file.file_name})));
+  const current = currentTaskPosition(task, p, pages);
+  const previewReady = taskPreviewReady(task);
+  const taskFinished = task.partial_success || ["completed", "completed_with_failures", "partial_success"].includes(task.status);
+  const previewAction = previewReady
+    ? `<button type="button" class="primary-button" data-task-preview="${esc(task.task_id)}">预览结果</button>`
+    : (taskFinished ? `<span class="task-preview-unavailable" title="该任务没有保留原始 PDF 或提取产物">未保留预览产物</span>` : "");
+  const reportActions = `<button type="button" class="secondary-button" data-task-report="markdown">导出 Markdown 报告</button><button type="button" class="secondary-button" data-task-report="csv">导出 CSV</button>`;
+  const elapsed = formatElapsed(task.started_at || task.created_at, task.completed_at);
+  const fileSections = (p.files || []).map(file => `<section class="task-file-pages"><div class="task-file-heading"><strong>${esc(file.file_name)}</strong><span>${(file.pages || []).length} 页</span></div><div class="page-list">${(file.pages || []).map(page => `<span class="page-chip ${esc(page.status || "queued")}" title="${esc(pageTitle(page, file.file_name))}">${page.page_number}</span>`).join("")}</div></section>`).join("");
+  const problemPages = pages.filter(page => page.status === "skipped" || page.status === "failed");
+  document.getElementById("task-detail").innerHTML = `<div class="task-detail-header"><div><h2>${esc((task.file_names || []).join(", "))}</h2><div class="mono muted">${esc(task.task_id)}</div></div><div class="task-detail-actions">${badge(task.partial_success ? "partial_success" : task.status)}${previewAction}${reportActions}</div></div><div class="task-live-position ${current.kind}"><span class="live-indicator"></span><div><small>当前处理位置</small><strong>${esc(current.title)}</strong><p>${esc(current.detail)}</p></div><time>${esc(formatDate(p.updated_at))}</time></div><div class="task-progress-row"><div class="progress"><span style="width:${percent}%"></span></div><strong>${percent}%</strong></div><div class="task-stat-grid"><div><span>总页数</span><strong>${p.total_pages || 0}</strong></div><div><span>已完成</span><strong>${p.completed_pages || 0}</strong></div><div><span>处理中</span><strong>${p.processing_pages || 0}</strong></div><div><span>等待中</span><strong>${p.queued_pages || 0}</strong></div><div><span>已跳过</span><strong>${p.skipped_pages || 0}</strong></div><div><span>失败</span><strong>${p.failed_pages || 0}</strong></div></div><div class="task-meta-line"><span>阶段：<strong>${esc(phaseText[p.phase] || p.phase || "-")}</strong></span><span>后端：<strong>${esc(task.backend || "-")}</strong></span><span>耗时：<strong class="task-elapsed">${esc(elapsed)}</strong></span>${task.error ? `<span class="bad-text">任务错误：${esc(task.error)}</span>` : ""}</div><div class="task-pages-heading"><h3>页面状态</h3><span>${pages.length} 个页面事件</span></div>${pageLegend()}<div class="task-file-page-list">${fileSections || `<div class="empty-state">尚未收到页级进度，任务启动后会自动显示</div>`}</div>${renderPageTimingTable(timingPayload, taskId)}${problemPages.length ? `<div class="task-problem-list"><h3>跳过和失败页面</h3>${problemPages.map(page => `<div class="task-problem-row"><strong>${esc(page.file_name)} 第 ${page.page_number} 页</strong>${badge(page.status)}<span>${esc(page.error_type || "")}</span><p>${esc(page.error || "未返回错误详情")}</p></div>`).join("")}</div>` : ""}`;
+}
+
+/* ─────────────────────────── SSE 实时单任务更新 ─────────────────────────── */
+/* 后端仅以 (status, progress.version) 变化时推送，completed/failed 自动关闭。
+   EventSource 无法携带 X-MinerU-Ops-Token 头，因此复用后端已支持的 ?token= 查询鉴权，
+   与现有 X-MinerU-Ops-Token 请求头 100% 兼容。 */
+function openTaskEventSource(taskId) {
+  closeTaskEventSource();
+  if (!state.token) return;
+  const url = `/api/tasks/${encodeURIComponent(taskId)}/events?token=${encodeURIComponent(state.token)}`;
+  state.taskEventTaskId = taskId;
+  state.taskEventLastSignature = "";
+  state.taskEventSource = new EventSource(url);
+  state.taskEventSource.onmessage = event => {
+    if (state.taskEventTaskId !== taskId) return;
+    let payload;
+    try { payload = JSON.parse(event.data); } catch { return; }
+    const progress = payload.progress || {};
+    const signature = `${payload.status}@${progress.version || 0}`;
+    if (signature === state.taskEventLastSignature) return;
+    state.taskEventLastSignature = signature;
+    upsertTaskInList(payload);
+    if (!state.taskDetailLoading) {
+      renderTaskDetailBody(payload, {items: [], total: 0, offset: state.taskTimingOffset, summary: null}, taskId);
+    }
+    const finished = payload.partial_success || ["completed", "completed_with_failures", "partial_success", "failed", "cancelled", "interrupted"].includes(payload.status);
+    if (finished) closeTaskEventSource();
+  };
+  state.taskEventSource.onerror = () => {
+    if (state.taskEventTaskId === taskId) closeTaskEventSource();
+  };
+}
+
+function closeTaskEventSource() {
+  if (state.taskEventSource) { state.taskEventSource.close(); state.taskEventSource = null; }
+  state.taskEventTaskId = null;
+  state.taskEventLastSignature = "";
+}
+
+function upsertTaskInList(task) {
+  if (!task || !task.task_id) return;
+  const index = state.tasks.findIndex(item => item.task_id === task.task_id);
+  if (index >= 0) state.tasks[index] = {...state.tasks[index], ...task};
+  else state.tasks.unshift(task);
+  renderTasks();
 }
 
 document.getElementById("task-detail").addEventListener("click", event => {
@@ -632,11 +956,14 @@ async function refreshTasksView() {
   state.taskRefreshLoading = true;
   try {
     await loadTasks();
-    if (state.activeTaskId) await loadTaskDetail(state.activeTaskId, {silent: true});
+    if (state.activeTaskId && !state.taskDetailLoaded && !state.taskDetailLoading) {
+      await loadTaskDetail(state.activeTaskId, {silent: true});
+      openTaskEventSource(state.activeTaskId);
+    }
     setConnection(true, "控制台已连接");
   } catch (error) {
     setConnection(false, "连接异常");
-    notice(error.message);
+    if (error.message) notice(error.message);
   } finally {
     state.taskRefreshLoading = false;
   }
@@ -675,14 +1002,30 @@ function compactBatchRows(items, limit = 100) {
   }).join("")}</tbody></table>`;
 }
 
+function renderBatchTable(items) {
+  if (!items.length) {
+    if (state.batchesError) return errorState(`批量记录加载失败：${state.batchesError}`);
+    return `<div class="empty-state">当前没有批量测试记录。可以通过「批量测试」提交一批 PDF，或直接使用服务器目录。</div>`;
+  }
+  return compactBatchRows(items);
+}
+
 async function loadBatches() {
-  const data = await api("/api/batch-runs");
-  state.batches = data.items || [];
-  state.selectedBatchRuns = new Set([...state.selectedBatchRuns].filter(id => state.batches.some(run => run.run_id === id)));
-  const storage = data.storage || {};
-  document.getElementById("batch-storage").textContent = storage.max_bytes ? `产物空间 ${formatBytes(storage.used_bytes || 0)} / ${formatBytes(storage.max_bytes)}（${storage.usage_percent || 0}%），保留 ${storage.retention_days} 天` : "默认串行提交 PDF";
-  document.getElementById("batch-table").innerHTML = compactBatchRows(state.batches);
-  updateBatchSelectionUi();
+  try {
+    state.batchesError = null;
+    const data = await api("/api/batch-runs");
+    state.batches = data.items || [];
+    state.selectedBatchRuns = new Set([...state.selectedBatchRuns].filter(id => state.batches.some(run => run.run_id === id)));
+    const storage = data.storage || {};
+    document.getElementById("batch-storage").textContent = storage.max_bytes ? `产物空间 ${formatBytes(storage.used_bytes || 0)} / ${formatBytes(storage.max_bytes)}（${storage.usage_percent || 0}%），保留 ${storage.retention_days} 天` : "默认串行提交 PDF";
+    document.getElementById("batch-table").innerHTML = renderBatchTable(state.batches);
+    updateBatchSelectionUi();
+  } catch (error) {
+    state.batchesError = error.message;
+    state.batches = state.batches || [];
+    document.getElementById("batch-table").innerHTML = renderBatchTable(state.batches);
+    throw error;
+  }
 }
 
 function updateBatchSelectionUi() {
@@ -924,7 +1267,7 @@ document.getElementById("batch-table").addEventListener("change", event => {
 });
 document.getElementById("batch-select-visible").addEventListener("click", () => {
   state.batches.filter(run => LAB_TERMINAL_STATES.has(run.status)).forEach(run => state.selectedBatchRuns.add(run.run_id));
-  document.getElementById("batch-table").innerHTML = compactBatchRows(state.batches);
+  document.getElementById("batch-table").innerHTML = renderBatchTable(state.batches);
   updateBatchSelectionUi();
 });
 document.getElementById("batch-delete-selected").addEventListener("click", () => deleteBatchRuns(state.selectedBatchRuns));
@@ -1316,7 +1659,7 @@ async function showBatchDocument(format, {preserveScroll = false} = {}) {
   const previousRatio = preserveScroll && preview.scrollHeight > preview.clientHeight ? preview.scrollTop / (preview.scrollHeight - preview.clientHeight) : 0;
   state.activeBatchDocument = format;
   document.querySelectorAll("[data-batch-document]").forEach(button => button.classList.toggle("active", button.dataset.batchDocument === format));
-  preview.innerHTML = `<div class="empty-state">正在读取...</div>`;
+  preview.innerHTML = skeletonState();
   try {
     const response = await authorizedFetch(`/api/batch-runs/${encodeURIComponent(state.activeBatchId)}/export?format=${encodeURIComponent(format)}`);
     preview.innerHTML = renderMarkdown(await response.text());
@@ -1457,9 +1800,9 @@ async function openTaskPreview(taskId) {
     document.getElementById("task-pdf-page-count").textContent = `${detail.original.page_count} 页`;
     document.getElementById("task-preview-status").textContent = detail.failed_pages?.length ? `跳过/失败 ${detail.failed_pages.length} 页` : "完整结果";
     const pageRoot = document.getElementById("task-original-pages");
-    pageRoot.innerHTML = Array.from({length: detail.original.page_count}, (_, index) => `<div class="task-pdf-page" data-page-number="${index + 1}"><div class="empty-state">第 ${index + 1} 页加载中...</div></div>`).join("");
+    pageRoot.innerHTML = skeletonState();
     const resultPreview = document.getElementById("task-result-preview");
-    resultPreview.innerHTML = `<div class="empty-state">正在读取 Markdown...</div>`;
+    resultPreview.innerHTML = skeletonState();
     const resultButton = document.getElementById("download-task-result");
     resultButton.disabled = !detail.preview.archive_path;
     if (!dialog.open) dialog.showModal();
@@ -1472,8 +1815,13 @@ async function openTaskPreview(taskId) {
 
     if (detail.preview.markdown_path) {
       const response = await authorizedFetch(artifactUrl(detail.run_id, "results", detail.preview.markdown_path));
-      if (state.activeTaskPreviewId === taskId) resultPreview.innerHTML = renderMarkdown(await response.text());
+      if (state.activeTaskPreviewId === taskId) {
+        const markdown = await response.text();
+        state.activeTaskPreviewMarkdown = markdown;
+        resultPreview.innerHTML = renderMarkdown(markdown);
+      }
     } else {
+      state.activeTaskPreviewMarkdown = null;
       resultPreview.innerHTML = `<div class="empty-state">该任务没有生成 Markdown 结果</div>`;
     }
   } catch (error) { notice(error.message); }
@@ -1487,6 +1835,7 @@ function closeTaskPreview() {
   state.taskPreviewPageQueue = [];
   state.activeTaskPreviewId = null;
   state.activeTaskPreview = null;
+  state.activeTaskPreviewMarkdown = null;
   clearPreviewObjectUrls();
   if (dialog.open) dialog.close();
 }
@@ -1504,6 +1853,17 @@ document.getElementById("download-task-result").addEventListener("click", async 
   if (!detail?.preview?.archive_path) return;
   try { await downloadPath(artifactUrl(detail.run_id, "results", detail.preview.archive_path), `${detail.file_name || "result"}-result.zip`); }
   catch (error) { notice(error.message); }
+});
+document.getElementById("copy-task-markdown").addEventListener("click", async () => {
+  const markdown = state.activeTaskPreviewMarkdown;
+  if (!markdown) { notice("当前预览没有可复制的 Markdown"); return; }
+  try {
+    await navigator.clipboard.writeText(markdown);
+    const button = document.getElementById("copy-task-markdown");
+    button.classList.add("copied");
+    button.textContent = "已复制 ✓";
+    setTimeout(() => { button.classList.remove("copied"); button.textContent = "复制 Markdown"; }, 1800);
+  } catch { notice("复制失败，请手动复制"); }
 });
 
 let taskPreviewSyncFrame = false;
@@ -1716,7 +2076,13 @@ function renderLabRuns() {
   document.getElementById("lab-delete-selected").disabled = state.labSelectedRuns.size === 0;
   summary.innerHTML = `<div class="lab-metric"><span>归档实验</span><strong>${state.labRuns.length}</strong></div><div class="lab-metric"><span>已完成</span><strong>${completeRuns.length}</strong></div><div class="lab-metric"><span>当前筛选</span><strong>${runs.length}</strong></div><div class="lab-metric"><span>已选可见</span><strong>${selectedVisible}</strong></div>`;
   if (!runs.length) {
-    table.innerHTML = `<div class="empty-state">没有符合条件的性能实验。可以清除筛选，或先填写服务器目录开始实验。</div>`;
+    if (!state.labRuns.length) {
+      table.innerHTML = state.labError
+        ? errorState(`性能实验加载失败：${state.labError}`)
+        : `<div class="empty-state">还没有性能实验记录。可以先填写服务器测试目录并选择一个 VLM micro-batch 开始实验。</div>`;
+    } else {
+      table.innerHTML = `<div class="empty-state">没有符合当前筛选条件的实验。可以清除筛选条件后重试。</div>`;
+    }
     renderLabComparison();
     return;
   }
@@ -1785,8 +2151,16 @@ async function exportLabRuns(format) {
 }
 
 async function loadLab() {
-  const data = await api("/api/performance-experiments");
-  state.labRuns = data.items || [];
+  try {
+    state.labError = null;
+    const data = await api("/api/performance-experiments");
+    state.labRuns = data.items || [];
+  } catch (error) {
+    state.labError = error.message;
+    state.labRuns = state.labRuns || [];
+    renderLabRuns();
+    throw error;
+  }
   const available = new Set(state.labRuns.map(run => run.run_id));
   state.labSelectedRuns = new Set([...state.labSelectedRuns].filter(runId => {
     const run = state.labRuns.find(item => item.run_id === runId);
@@ -2037,7 +2411,7 @@ function renderConfigStatus(payload = state.configStatus) {
     return;
   }
   if (payload.load_error || payload.ok === false) {
-    target.innerHTML = `<div class="empty-state bad-text">最终有效配置读取失败：${esc(payload.load_error || payload.error || "未知错误")}</div>`;
+    target.innerHTML = errorState(`最终有效配置读取失败：${payload.load_error || payload.error || "未知错误"}`);
     return;
   }
   if (!Array.isArray(payload.items) && payload.services) {
@@ -2060,7 +2434,20 @@ function renderConfigStatus(payload = state.configStatus) {
     const serviceHtml = services.map(([name, detail]) => {
       const source = CONFIG_SOURCE_LABELS[detail.effective_source] || detail.effective_source_label || "未知";
       const warnings = Array.isArray(detail.warnings) ? detail.warnings : [];
-      return `<article class="config-effective-service"><div class="section-heading"><div><h4>${esc(name)}</h4><p class="muted mono">${esc(detail.container || "容器未创建")}</p></div>${badge(detail.status || "unknown")}</div><dl><div><dt>最终有效值</dt><dd class="mono">${esc(configStatusValue(detail.effective_value))}</dd></div><div><dt>值来源</dt><dd><span class="config-source">${esc(source)}</span>${detail.inferred ? " · 推断值" : ""}</dd></div><div><dt>容器状态</dt><dd>${esc(configStatusValue(detail.state))}</dd></div><div><dt>健康状态</dt><dd>${esc(configStatusValue(detail.health))}</dd></div></dl>${warnings.length ? `<div class="config-diagnostic-warning"><strong>提示</strong><ul>${warnings.map(warning => `<li>${esc(warning)}</li>`).join("")}</ul></div>` : ""}</article>`;
+      const noteHtml = warnings.length ? `<strong>提示</strong><ul>${warnings.map(warning => `<li>${esc(warning)}</li>`).join("")}</ul>` : "";
+      return renderStatusCard({
+        tag: "config-effective-service",
+        title: name,
+        subtitle: detail.container || "容器未创建",
+        badge: {text: detail.status || "unknown"},
+        metrics: [
+          {label: "最终有效值", value: configStatusValue(detail.effective_value), mono: true},
+          {label: "值来源", rawHtml: `<span class="config-source">${esc(source)}</span>${detail.inferred ? " · 推断值" : ""}`},
+          {label: "容器状态", value: configStatusValue(detail.state)},
+          {label: "健康状态", value: configStatusValue(detail.health)},
+        ],
+        noteHtml: warnings.length ? noteHtml : null,
+      });
     }).join("");
     return `<article class="config-effective-item"><div class="section-heading"><div><h3 class="mono">${esc(item.key)}</h3><p class="muted">${esc(item.description || item.label || "")}</p></div></div><div class="config-effective-configured"><span>env.multi 配置值</span><code>${esc(configStatusValue(item.configured_value))}</code></div><div class="config-effective-services">${serviceHtml || `<div class="empty-state">没有适用的运行服务。</div>`}</div></article>`;
   }).join("");
@@ -2078,7 +2465,7 @@ async function loadConfigStatus({force = false} = {}) {
   const button = document.getElementById("config-status-refresh");
   state.configStatusLoading = true;
   if (button) button.disabled = true;
-  if (target) target.innerHTML = `<div class="empty-state">正在读取最终有效配置...</div>`;
+  if (target) target.innerHTML = skeletonState();
   try {
     try {
       state.configStatus = await api("/api/config/effective");
@@ -2108,6 +2495,40 @@ function diagnosticJson(value, emptyText) {
   return `<pre>${esc(JSON.stringify(value, null, 2))}</pre>`;
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+   通用状态卡片画布：serviceCard / renderRuntimeDiagnostics / renderConfigStatus /
+   renderDeepDiagnostics 四个业务渲染器把清洗后的数据字典喂给它，统一质感。
+   card = {
+     tag,               // 外层 class（如 runtime-diagnostic-card / deep-service-card …）
+     title, subtitle,   // 标题行
+     badge: { text, tier },   // 标题行右侧徽章（tier 缺省时按 statusTier 归一）
+     metrics: [{ label, value, tier, meter, mono, rawHtml }],  // 键值行（value 自动转义）
+     details: [{ summary, open, html }],   // 可折叠块
+     noteHtml,          // 脚注
+     actionsHtml,
+     className,         // 额外状态 class（good/bad/warn/running）
+   }
+   ═══════════════════════════════════════════════════════════════════════════ */
+function renderStatusCard(card) {
+  const cls = card.className ? ` ${card.className}` : "";
+  const badge = card.badge
+    ? `<span class="badge ${card.badge.tier || statusTier(card.badge.text)}">${esc(card.badge.text || "未知")}</span>`
+    : "";
+  const head = card.title
+    ? `<div class="card-head"><div><h3>${esc(card.title)}</h3>${card.subtitle ? `<p class="muted">${esc(card.subtitle)}</p>` : ""}</div>${badge ? `<div class="card-head-right">${badge}</div>` : ""}</div>`
+    : "";
+  const rows = (card.metrics || []).map(metric => {
+    const tier = metric.tier ? ` class="${metric.tier}"` : "";
+    let valueCell;
+    if (typeof metric.rawHtml === "string") valueCell = metric.rawHtml;
+    else valueCell = `<strong${metric.mono ? ` class="mono"` : ""}${tier}>${metric.value == null || metric.value === "" ? "-" : esc(String(metric.value))}${metric.meter || ""}</strong>`;
+    return `<div><dt>${esc(metric.label || "")}</dt><dd>${valueCell}</dd></div>`;
+  }).join("");
+  const details = (card.details || []).map(item => `<details${item.open ? " open" : ""}><summary>${esc(item.summary)}</summary>${item.html}</details>`).join("");
+  const note = card.noteHtml ? `<div class="card-foot">${card.noteHtml}</div>` : "";
+  return `<article class="${card.tag || "status-card"}${cls}">${head}<dl>${rows}</dl>${details}${note}${card.actionsHtml || ""}</article>`;
+}
+
 function renderDeepDiagnostics(payload = state.deepDiagnostics) {
   const target = document.getElementById("deep-diagnostics");
   if (!target) return;
@@ -2116,7 +2537,7 @@ function renderDeepDiagnostics(payload = state.deepDiagnostics) {
     return;
   }
   if (payload.load_error || payload.ok === false) {
-    target.innerHTML = `<div class="empty-state bad-text">深度诊断读取失败：${esc(payload.load_error || payload.error || "未知错误")}</div>`;
+    target.innerHTML = errorState(`深度诊断读取失败：${payload.load_error || payload.error || "未知错误"}`);
     return;
   }
   const services = payload.services && typeof payload.services === "object" ? payload.services : {};
@@ -2126,7 +2547,24 @@ function renderDeepDiagnostics(payload = state.deepDiagnostics) {
     const warnings = Array.isArray(service.warnings) ? service.warnings : [];
     const modelText = models.length ? diagnosticJson(models, "未发现可检查的绝对模型路径") : `<p class="muted">未发现可检查的绝对模型路径</p>`;
     const deviceEmptyText = name.includes("code-sync") ? "不适用：一次性代码同步容器" : "未执行设备检测";
-    return `<article class="deep-service-card"><div class="section-heading"><div><h3>${esc(name)}</h3><p class="muted mono">${esc(service.container || "容器未创建")}</p></div>${badge(service.status || "unknown")}</div><dl><div><dt>镜像</dt><dd class="mono">${esc(service.image || "-")}</dd></div><div><dt>运行状态</dt><dd>${esc(service.state || "-")} / ${esc(service.health || "-")}</dd></div><div><dt>配置应用</dt><dd>${service.status === "applied" ? "当前 env.multi 已加载" : service.status === "pending_restart" ? "服务健康，但当前容器尚未加载最新 env.multi，需要重建" : "暂无法确认"}</dd></div></dl><details open><summary>实际环境变量</summary>${diagnosticJson(service.environment, "未读取到可展示的 MinerU 环境变量")}</details><details><summary>模型路径检查</summary>${modelText}</details><details><summary>容器挂载</summary>${diagnosticJson(mounts, "未发现容器挂载")}</details><details><summary>设备检测</summary>${diagnosticJson(service.devices, deviceEmptyText)}</details>${warnings.length ? `<div class="deep-diagnostic-warning"><strong>诊断提示</strong><ul>${warnings.map(item => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}</article>`;
+    return renderStatusCard({
+        tag: "deep-service-card",
+        title: name,
+        subtitle: service.container || "容器未创建",
+        badge: {text: service.status || "unknown"},
+        metrics: [
+          {label: "镜像", value: service.image || "-", mono: true},
+          {label: "运行状态", value: `${service.state || "-"} / ${service.health || "-"}`},
+          {label: "配置应用", value: service.status === "applied" ? "当前 env.multi 已加载" : service.status === "pending_restart" ? "服务健康，但当前容器尚未加载最新 env.multi，需要重建" : "暂无法确认"},
+        ],
+        details: [
+          {summary: "实际环境变量", open: true, html: diagnosticJson(service.environment, "未读取到可展示的 MinerU 环境变量")},
+          {summary: "模型路径检查", html: modelText},
+          {summary: "容器挂载", html: diagnosticJson(mounts, "未发现容器挂载")},
+          {summary: "设备检测", html: diagnosticJson(service.devices, deviceEmptyText)},
+        ],
+        noteHtml: warnings.length ? `<strong>诊断提示</strong><ul>${warnings.map(item => `<li>${esc(item)}</li>`).join("")}</ul>` : null,
+      });
   }).join("");
   target.innerHTML = `<div class="config-status-meta"><span>检查时间：${esc(formatDate(payload.generated_at))}</span><span>Env 文件：${esc(payload.env_file?.path || payload.env_file?.name || "-")}</span><span>总体状态：${badge(payload.overall || "unknown")}</span></div><div class="deep-service-grid">${cards || `<div class="empty-state">没有可诊断的服务。</div>`}</div>${Array.isArray(payload.warnings) && payload.warnings.length ? `<div class="deep-diagnostic-warning"><strong>整体提示</strong><ul>${payload.warnings.map(item => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}`;
 }
@@ -2141,7 +2579,7 @@ async function loadDeepDiagnostics({force = false} = {}) {
   const button = document.getElementById("deep-diagnostics-refresh");
   state.deepDiagnosticsLoading = true;
   if (button) button.disabled = true;
-  if (target) target.innerHTML = `<div class="empty-state">正在读取跨容器深度诊断...</div>`;
+  if (target) target.innerHTML = skeletonState();
   try {
     state.deepDiagnostics = await api("/api/diagnostics/deep");
     renderDeepDiagnostics();
@@ -2310,7 +2748,7 @@ function auditDetailText(detail) {
 function renderAuditLogs(payload) {
   const target = document.getElementById("audit-log");
   if (payload?.load_error) {
-    target.innerHTML = `<div class="empty-state bad-text">审计记录读取失败：${esc(payload.load_error)}</div>`;
+    target.innerHTML = errorState(`审计记录读取失败：${payload.load_error}`);
     return;
   }
   const items = Array.isArray(payload?.items) ? payload.items : [];
@@ -2340,7 +2778,7 @@ async function loadAuditLogs({append = false} = {}) {
   const offset = append ? existingItems.length : 0;
   state.auditLoading = true;
   button.disabled = true;
-  if (!append) target.innerHTML = `<div class="empty-state">正在读取操作审计...</div>`;
+  if (!append) target.innerHTML = skeletonState();
   try {
     const payload = await api(`/api/audit?limit=${AUDIT_PAGE_SIZE}&offset=${offset}`);
     const nextItems = Array.isArray(payload.items) ? payload.items : [];
@@ -2628,7 +3066,14 @@ setInterval(() => {
 setInterval(() => {
   if (state.view === "logs" && document.getElementById("log-live").checked) loadSelectedServiceLogs();
 }, 2000);
+/* 任务视图：2s 轮询退化为「列表纠正」——活动任务改由 SSE 推送，详情面板不再被轮询覆写，
+   避免打断用户对表格/详情的选中与滚动；终态/无活动任务时保持极低频静默校准。 */
 setInterval(() => {
-  if (state.view === "tasks") refreshTasksView();
-}, 2000);
+  if (state.view !== "tasks") return;
+  if (state.activeTaskId && state.taskEventTaskId === state.activeTaskId) {
+    refreshCurrent();
+  } else {
+    refreshTasksView();
+  }
+}, 5000);
 refreshCurrent();
