@@ -1,5 +1,92 @@
 # Session handoff — 2026-08-23
 
+## 2026-08-25：运维控制台 UI/UX 重构（UI20）
+
+### 本轮状态
+
+- 用户已完成并推送运维控制台改进，当前 `dev` 分支提交为：
+  - `bb9f1bd2 refactor(ops): console UI/UX overhaul — design tokens, SSE, routing, cards`
+- 本轮正式修改文件：
+
+```text
+mineru/cli/ops.py
+mineru/ops/static/index.html
+mineru/ops/static/ops.js
+mineru/ops/static/ops.css
+```
+
+### 本轮改动摘要
+
+- 建立统一的前端设计 token、颜色、字号、圆角、动效和状态层级，整理服务卡片、配置卡片、弹窗、通知、空状态、错误状态和骨架屏。
+- 增加深色主题适配、键盘焦点样式和 `prefers-reduced-motion` 支持；压平过度装饰性的渐变和嵌套视觉层级。
+- 任务详情改为 SSE 增量更新：通过 `GET /api/tasks/{task_id}/events` 实时更新任务行和详情面板，终态后自动关闭连接，替代原先每 2 秒整体刷新表格。
+- 增加 URL hash 路由和浏览器前进/后退支持，任务详情支持 `#tasks?taskId=<任务ID>` 深链接，批量测试或外部链接进入后可以直接定位任务。
+- 统一任务、服务和配置状态的视觉语义为 running/good/warn/bad 四级，补齐加载中、空数据和请求失败状态。
+- 重构首页概览 KPI、服务卡片和任务检查器；增加 VRAM/温度信息、原始 PDF 与 Markdown/LaTeX/结构化表格双栏预览、复制 Markdown、通知关闭按钮等交互。
+- `mineru/cli/ops.py` 现在从单一 `OPS_VERSION = "2.0.0"` 注入首页、CSS 和 JS 的缓存版本及页面版本徽标；本次代码镜像发布标签按既有规则递增为 `ops-ui20`。
+
+### 本次构建和导出命令
+
+服务器项目目录固定为：`/data/maas/sgy_arm/gd-dev/MinerU`
+
+```bash
+cd /data/maas/sgy_arm/gd-dev/MinerU
+git fetch origin dev
+git checkout dev
+git pull --ff-only origin dev
+
+docker build -t mineru-code:v3.4.2-ops-ui20 -f docker/base/Dockerfile.code .
+
+docker save mineru-code:v3.4.2-ops-ui20 | gzip > /data/maas/sgy_arm/gd-dev/MinerU/docker/base/export/mineru-code-v3.4.2-ops-ui20.tar.gz
+```
+
+构建标签和导出文件名必须保持一致：
+
+```text
+镜像：mineru-code:v3.4.2-ops-ui20
+归档：/data/maas/sgy_arm/gd-dev/MinerU/docker/base/export/mineru-code-v3.4.2-ops-ui20.tar.gz
+```
+
+### 服务器更新步骤
+
+服务器直接构建镜像时，在 `docker/multi/env.multi` 中把代码镜像改为本次标签：
+
+```bash
+cd /data/maas/sgy_arm/gd-dev/MinerU/docker/multi
+sed -i 's|^MINERU_CODE_IMAGE=.*|MINERU_CODE_IMAGE=mineru-code:v3.4.2-ops-ui20|' env.multi
+grep '^MINERU_CODE_IMAGE=' env.multi
+```
+
+然后执行检查、停止并重新启动，使 `mineru-code-sync` 把新镜像内容写入共享 `mineru-code` 卷，并让 Router、API 和 Ops 重新使用新代码：
+
+```bash
+./start-multi.sh check
+./start-multi.sh stop
+./start-multi.sh start
+./start-multi.sh status
+```
+
+如果是把归档带到另一台离线服务器，先导入镜像，再将 `env.multi` 设置为同一标签：
+
+```bash
+docker load < /data/maas/sgy_arm/gd-dev/MinerU/docker/base/export/mineru-code-v3.4.2-ops-ui20.tar.gz
+```
+
+### 升级后核验
+
+- `./start-multi.sh status` 确认 `mineru-code-sync-multi`、`mineru-api-1`、`mineru-router`、`mineru-ops` 状态正常；`mineru-code-sync-multi` 正常退出（`Exited (0)`）即可。
+- 访问 `http://服务器IP:19000`，浏览器执行 `Ctrl+F5` 清除旧静态资源缓存。
+- 检查首页 HTML 中 CSS/JS 资源带有 `?v=2.0.0`，配置中心版本徽标显示 `2.0.0`。
+- 打开任务详情，确认任务状态通过 SSE 增量变化；刷新或复制带 `#tasks?taskId=...` 的链接，确认能直接定位任务。
+- 检查服务卡片、配置中心、日志页和任务预览的加载中、空数据、失败及深色主题状态。
+
+### 部署注意
+
+- 本轮只改了 Ops Web/后端控制台代码，没有修改 `docker/multi/mineru-ops-agent.py`；宿主机 Agent 无需因本提交单独替换，但若现场 Agent 文件不是当前 `dev` 版本，仍应按现场流程同步。
+- 使用共享 `/app` 或 `mineru-code` code volume 时，只替换环境镜像或只重启浏览器不会更新源码；必须让 `mineru-code-sync` 运行并重建/启动 `mineru-api-1`、Router 和 `mineru-ops`。
+- `mineru-ops-data` 是独立数据卷，重建容器不会删除控制台任务历史、实验归档和审计日志。
+- 如果现场使用 `docker/multi/update-code.sh`，可执行 `./update-code.sh v3.4.2-ops-ui20`；该脚本会构建代码镜像、更新 `MINERU_CODE_IMAGE` 并重启业务服务。离线导入归档时使用上面的 `docker load` 加手动更新 `env.multi` 流程。
+
 ## 2026-08-25：补充 MinerU 与 RAGFlow 提取效果结论
 
 - 更新 `docs/analysis-error/双环境PDF解析性能综合对比报告-修改版.md`。
