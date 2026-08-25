@@ -118,6 +118,12 @@
 
       <section id="view-batch" class="view">
         <section class="form-band">
+          <div class="preset-strip" data-preset-form="batch-form">
+            <span class="preset-label">快速预设</span>
+            <button type="button" class="preset-chip" data-preset="stable">⚡ 快速保稳</button>
+            <button type="button" class="preset-chip" data-preset="gpu">🚀 GPU 吞吐极限</button>
+            <button type="button" class="preset-chip" data-preset="academic">📄 学术论文双栏</button>
+          </div>
           <form id="batch-form">
             <div id="upload-drop-zone" class="upload-drop-zone" tabindex="0">
               <strong>拖拽 PDF 文件或文件夹到这里</strong>
@@ -171,6 +177,12 @@
         <div class="lab-layout">
           <section class="panel lab-form-panel">
             <div class="section-heading"><h2>新建实验</h2><span class="muted">服务器目录</span></div>
+            <div class="preset-strip" data-preset-form="lab-form">
+              <span class="preset-label">快速预设</span>
+              <button type="button" class="preset-chip" data-preset="stable">⚡ 快速保稳</button>
+              <button type="button" class="preset-chip" data-preset="gpu">🚀 GPU 吞吐极限</button>
+              <button type="button" class="preset-chip" data-preset="academic">📄 学术论文双栏</button>
+            </div>
             <form id="lab-form" class="lab-form">
               <label class="lab-wide"><span>实验名称</span><input name="experiment_name" placeholder="例如：现场昇腾 batch-8 基准" maxlength="120"><small>用于归档和报告展示，不影响实际处理。</small></label>
               <label><span>环境名称</span><input name="environment_name" placeholder="例如：现场 NPU / 公司 T4" maxlength="120"></label>
@@ -268,6 +280,9 @@
           <span id="config-validation-status" class="muted">修改输入框后先预览变更；不会立即写入 env 文件。</span>
         </div>
         <section id="config-plan-panel" class="config-plan hidden"></section>
+        <div class="config-groups-toolbar">
+          <input id="config-groups-search" type="search" placeholder="搜索配置键名或说明">
+        </div>
         <div class="config-layout">
           <div id="config-groups" class="config-groups"><div class="empty-state">正在读取配置...</div></div>
           <aside class="panel config-history-panel">
@@ -296,6 +311,7 @@
           <label class="inline-check"><input id="log-hide-health" type="checkbox" checked><span>隐藏健康探活</span></label>
           <label class="inline-check"><input id="log-live" type="checkbox" checked><span>动态刷新</span></label>
           <label class="inline-check"><input id="log-follow" type="checkbox" checked><span>跟随最新</span></label>
+          <label class="inline-check"><input id="log-wrap" type="checkbox"><span>自动换行</span></label>
           <button id="load-logs" class="secondary-button">立即刷新</button>
           <span id="log-status" class="log-status muted">请选择服务</span>
         </div>

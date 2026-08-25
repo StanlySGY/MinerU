@@ -232,7 +232,9 @@ function notice(message, bad = true) {
 }
 
 function setConnection(ok, text) {
-  document.getElementById("connection-dot").className = `dot ${ok ? "good" : "bad"}`;
+  const dot = document.getElementById("connection-dot");
+  dot.className = `dot ${ok ? "good" : "bad"}`;
+  dot.title = text;
   document.getElementById("connection-text").textContent = text;
 }
 
@@ -354,8 +356,8 @@ function taskPreviewReady(task) {
   );
 }
 
-function compactTaskRows(tasks, limit = 6) {
-  if (!tasks.length) return `<div class="empty-state">暂无任务</div>`;
+function compactTaskRows(tasks, limit = 6, emptyText = "暂无任务") {
+  if (!tasks.length) return `<div class="empty-state compact-empty-state">${esc(emptyText)}</div>`;
   return `<table><thead><tr><th>文件</th><th>状态</th><th>页进度</th><th>更新时间</th></tr></thead><tbody>${tasks.slice(0, limit).map(task => {
     const progress = task.progress || {};
     const finished = (progress.completed_pages || 0) + (progress.skipped_pages || 0) + (progress.failed_pages || 0);
@@ -381,7 +383,15 @@ async function loadOverview() {
   ].map(([label, value, sub]) => renderMetricTile(label, value, sub)).join("");
   document.getElementById("overview-health-count").textContent = `${healthy}/${state.services.length} 健康`;
   document.getElementById("overview-services").innerHTML = state.services.map(serviceCard).join("") || `<div class="empty-state">没有发现服务</div>`;
-  document.getElementById("overview-tasks").innerHTML = compactTaskRows(state.tasks.filter(item => ["pending", "processing"].includes(item.status)));
+  const activeTasks = state.tasks.filter(item => ["pending", "processing"].includes(item.status));
+  if (activeTasks.length) {
+    document.getElementById("overview-tasks").innerHTML = compactTaskRows(activeTasks);
+  } else {
+    const recentDone = state.tasks
+      .filter(item => ["completed", "completed_with_failures", "partial_success", "failed"].includes(item.status))
+      .sort((a, b) => new Date(b.completed_at || b.created_at || 0) - new Date(a.completed_at || a.created_at || 0));
+    document.getElementById("overview-tasks").innerHTML = `<div class="empty-state compact-empty-state">当前没有进行中的任务</div>${recentDone.length ? `<div class="overview-recent-heading muted">最近完成</div>${compactTaskRows(recentDone, 4)}` : ""}`;
+  }
   document.getElementById("overview-batches").innerHTML = compactBatchRows(state.batches, 6);
   updateLogServices();
   document.getElementById("page-meta").textContent = `最后更新：${formatDate(data.updated_at)}`;
@@ -527,21 +537,22 @@ function renderRuntimeDiagnostics(payload) {
   })).join("");
   const commandCards = [["nvidia_smi", "NVIDIA GPU / nvidia-smi"], ["npu_smi", "昇腾 NPU / npu-smi"]].map(([key, label]) => {
     const command = commands[key] || {};
-    const status = !command.available ? "工具不可用" : command.ok ? "执行成功" : "执行失败";
-    const statusClass = command.ok ? "good" : command.available ? "warn" : "bad";
+    const status = !command.available ? "未检测到 GPU（当前为 CPU 模式）" : command.ok ? "执行成功" : "执行失败";
+    const statusClass = !command.available ? "muted" : command.ok ? "good" : "bad";
     return renderStatusCard({
       tag: "runtime-diagnostic-card",
+      className: !command.available ? "diagnostic-card-muted" : "",
       title: label,
       metrics: [
         {label: "状态", rawHtml: `<span class="diagnostic-state ${statusClass}">${esc(status)}</span>`},
         {label: "退出码", value: command.return_code != null ? String(command.return_code) : null},
         {label: "输出截断", value: command.truncated ? "是" : "否"},
       ],
-      details: [
+      details: command.available ? [
         {summary: "标准输出", html: `<pre>${esc(command.stdout)}</pre>`},
         {summary: "错误输出", html: `<pre>${esc(command.stderr)}</pre>`},
-      ],
-      noteHtml: command.error ? `<p class="runtime-diagnostic-error">${esc(command.error)}</p>` : null,
+      ] : [],
+      noteHtml: command.error && command.available ? `<p class="runtime-diagnostic-error">${esc(command.error)}</p>` : null,
     });
   }).join("");
   const offlineCard = renderStatusCard({
@@ -865,7 +876,7 @@ function renderTaskDetailBody(task, timingPayload, taskId) {
   const elapsed = formatElapsed(task.started_at || task.created_at, task.completed_at);
   const fileSections = (p.files || []).map(file => `<section class="task-file-pages"><div class="task-file-heading"><strong>${esc(file.file_name)}</strong><span>${(file.pages || []).length} 页</span></div><div class="page-list">${(file.pages || []).map(page => `<span class="page-chip ${esc(page.status || "queued")}" title="${esc(pageTitle(page, file.file_name))}">${page.page_number}</span>`).join("")}</div></section>`).join("");
   const problemPages = pages.filter(page => page.status === "skipped" || page.status === "failed");
-  document.getElementById("task-detail").innerHTML = `<div class="task-detail-header"><div><h2>${esc((task.file_names || []).join(", "))}</h2><div class="mono muted">${esc(task.task_id)}</div></div><div class="task-detail-actions">${badge(task.partial_success ? "partial_success" : task.status)}${previewAction}${reportActions}</div></div><div class="task-live-position ${current.kind}"><span class="live-indicator"></span><div><small>当前处理位置</small><strong>${esc(current.title)}</strong><p>${esc(current.detail)}</p></div><time>${esc(formatDate(p.updated_at))}</time></div><div class="task-progress-row"><div class="progress"><span style="width:${percent}%"></span></div><strong>${percent}%</strong></div><div class="task-stat-grid"><div><span>总页数</span><strong>${p.total_pages || 0}</strong></div><div><span>已完成</span><strong>${p.completed_pages || 0}</strong></div><div><span>处理中</span><strong>${p.processing_pages || 0}</strong></div><div><span>等待中</span><strong>${p.queued_pages || 0}</strong></div><div><span>已跳过</span><strong>${p.skipped_pages || 0}</strong></div><div><span>失败</span><strong>${p.failed_pages || 0}</strong></div></div><div class="task-meta-line"><span>阶段：<strong>${esc(phaseText[p.phase] || p.phase || "-")}</strong></span><span>后端：<strong>${esc(task.backend || "-")}</strong></span><span>耗时：<strong class="task-elapsed">${esc(elapsed)}</strong></span>${task.error ? `<span class="bad-text">任务错误：${esc(task.error)}</span>` : ""}</div><div class="task-pages-heading"><h3>页面状态</h3><span>${pages.length} 个页面事件</span></div>${pageLegend()}<div class="task-file-page-list">${fileSections || `<div class="empty-state">尚未收到页级进度，任务启动后会自动显示</div>`}</div>${renderPageTimingTable(timingPayload, taskId)}${problemPages.length ? `<div class="task-problem-list"><h3>跳过和失败页面</h3>${problemPages.map(page => `<div class="task-problem-row"><strong>${esc(page.file_name)} 第 ${page.page_number} 页</strong>${badge(page.status)}<span>${esc(page.error_type || "")}</span><p>${esc(page.error || "未返回错误详情")}</p></div>`).join("")}</div>` : ""}`;
+  document.getElementById("task-detail").innerHTML = `<div class="task-detail-header"><div><h2>${esc((task.file_names || []).join(", "))}</h2><div class="mono muted">${esc(task.task_id)}</div></div><div class="task-detail-actions">${badge(task.partial_success ? "partial_success" : task.status)}${previewAction}${reportActions}</div></div><div class="task-live-position ${current.kind}"><span class="live-indicator"></span><div><small>当前处理位置</small><strong>${esc(current.title)}</strong><p>${esc(current.detail)}</p></div><time>${esc(formatDate(p.updated_at))}</time></div><div class="task-progress-row"><div class="progress"><span style="width:${percent}%"></span></div><strong>${percent}%</strong></div><div class="task-stat-grid"><div><span>总页数</span><strong>${p.total_pages || 0}</strong></div><div><span>已完成</span><strong>${p.completed_pages || 0}</strong></div><div><span>处理中</span><strong>${p.processing_pages || 0}</strong></div><div><span>等待中</span><strong>${p.queued_pages || 0}</strong></div><div><span>已跳过</span><strong>${p.skipped_pages || 0}</strong></div><div><span>失败</span><strong>${p.failed_pages || 0}</strong></div></div><div class="task-meta-line"><span>阶段：<strong>${esc(phaseText[p.phase] || p.phase || "-")}</strong></span><span>后端：<strong>${esc(task.backend || "-")}</strong></span><span>耗时：<strong class="task-elapsed">${esc(elapsed)}</strong></span>${task.error ? `<span class="bad-text">任务错误：${esc(task.error)}</span>` : ""}</div><div class="task-pages-heading"><h3>页面状态</h3><span>${pages.length} 个页面事件</span></div>${pageLegend()}<div id="task-page-grid" class="task-file-page-list">${fileSections || `<div class="empty-state">尚未收到页级进度，任务启动后会自动显示</div>`}</div>${renderPageTimingTable(timingPayload, taskId)}${problemPages.length ? `<div class="task-problem-list"><h3>跳过和失败页面</h3>${problemPages.map(page => `<div class="task-problem-row"><strong>${esc(page.file_name)} 第 ${page.page_number} 页</strong>${badge(page.status)}<span>${esc(page.error_type || "")}</span><p>${esc(page.error || "未返回错误详情")}</p></div>`).join("")}</div>` : ""}`;
 }
 
 /* ─────────────────────────── SSE 实时单任务更新 ─────────────────────────── */
@@ -962,7 +973,7 @@ async function refreshTasksView() {
     }
     setConnection(true, "控制台已连接");
   } catch (error) {
-    setConnection(false, "连接异常");
+    setConnection(false, `任务视图连接异常：${error.message || "SSE/接口无响应"}`);
     if (error.message) notice(error.message);
   } finally {
     state.taskRefreshLoading = false;
@@ -1055,9 +1066,11 @@ const uploadDropZone = document.getElementById("upload-drop-zone");
 const uploadFileList = document.getElementById("upload-file-list");
 
 function formatBytes(bytes) {
-  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
-  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value < 0) return "--";
+  if (value < 1024 * 1024) return `${Math.max(1, Math.round(value / 1024))} KB`;
+  if (value >= 1024 * 1024 * 1024) return `${(value / 1024 / 1024 / 1024).toFixed(2)} GB`;
+  return `${(value / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function updateUploadSummary() {
@@ -1164,6 +1177,50 @@ uploadDropZone.addEventListener("drop", async event => {
 });
 uploadDropZone.addEventListener("keydown", event => {
   if (event.key === "Enter" || event.key === " ") { event.preventDefault(); batchFilesInput.click(); }
+});
+
+/* ── 快速预设：批量测试 / 性能实验室表单共用的一键填充标签 ──
+   vlm_batch_size 对应批量测试单选数字输入；vlm_batch_sizes 对应性能实验室的多选 micro-batch 复选框组。 */
+const FORM_PRESETS = {
+  stable: {
+    label: "⚡ 快速保稳",
+    values: {vlm_batch_size: 1, vlm_batch_sizes: [1], page_timeout_seconds: 600, task_timeout: 3600, page_connect_max_retries: 1},
+  },
+  gpu: {
+    label: "🚀 GPU 吞吐极限",
+    values: {vlm_batch_size: 16, vlm_batch_sizes: [8, 16, 32], page_timeout_seconds: 300, task_timeout: 7200, page_connect_max_retries: 0},
+  },
+  academic: {
+    label: "📄 学术论文双栏",
+    values: {vlm_batch_size: 2, vlm_batch_sizes: [2, 4], page_timeout_seconds: 900, task_timeout: 7200, page_connect_max_retries: 0},
+  },
+};
+
+function applyFormPreset(formId, presetKey) {
+  const preset = FORM_PRESETS[presetKey];
+  const form = document.getElementById(formId);
+  if (!preset || !form) return;
+  for (const [name, value] of Object.entries(preset.values)) {
+    if (Array.isArray(value)) {
+      const nodes = form.querySelectorAll(`[name="${name}"]`);
+      if (!nodes.length) continue;
+      nodes.forEach(node => { node.checked = value.includes(Number(node.value)); });
+    } else {
+      const field = form.elements[name];
+      if (!field) continue;
+      if (field.type === "checkbox") field.checked = Boolean(value);
+      else field.value = String(value);
+    }
+  }
+  notice(`已应用预设：${preset.label}`, false);
+}
+
+document.querySelectorAll("[data-preset-form]").forEach(strip => {
+  strip.addEventListener("click", event => {
+    const button = event.target.closest("[data-preset]");
+    if (!button) return;
+    applyFormPreset(strip.dataset.presetForm, button.dataset.preset);
+  });
 });
 
 document.getElementById("batch-form").addEventListener("submit", async event => {
@@ -1965,6 +2022,9 @@ document.getElementById("log-follow").addEventListener("change", event => {
 document.getElementById("log-filter").addEventListener("input", renderFilteredLogs);
 document.getElementById("log-exclude").addEventListener("input", renderFilteredLogs);
 document.getElementById("log-hide-health").addEventListener("change", renderFilteredLogs);
+document.getElementById("log-wrap").addEventListener("change", event => {
+  document.getElementById("log-output").classList.toggle("wrap-enabled", event.currentTarget.checked);
+});
 
 function labRunSettings(run) {
   return run.settings || run.config || {};
@@ -2343,7 +2403,27 @@ function renderConfig() {
   if (overallElement) overallElement.innerHTML = badge(state.configStatus?.overall || "unknown");
   const groups = new Map();
   for (const item of items) groups.set(item.category || "其他配置", [...(groups.get(item.category || "其他配置") || []), item]);
-  document.getElementById("config-groups").innerHTML = [...groups.entries()].map(([category, group]) => `<section class="panel config-group"><div class="section-heading"><h2>${esc(category)}</h2><span>${group.length} 项</span></div>${group.map(item => configControl(item)).join("")}</section>`).join("") || `<div class="empty-state">没有可显示的配置。</div>`;
+  document.getElementById("config-groups").innerHTML = [...groups.entries()].map(([category, group]) => {
+    const compact = category === "其他配置";
+    return `<section class="panel config-group${compact ? " config-group-compact" : ""}" data-config-category="${esc(category)}"><div class="section-heading"><h2>${esc(category)}</h2><span>${group.length} 项</span></div><div class="config-group-body${compact ? " config-group-grid" : ""}">${group.map(item => configControl(item)).join("")}</div></section>`;
+  }).join("") || `<div class="empty-state">没有可显示的配置。</div>`;
+  applyConfigGroupsFilter();
+}
+
+/* 「其他配置」紧凑双列网格的即时搜索：按键名/说明过滤，命中为 0 的分组直接隐藏。 */
+function applyConfigGroupsFilter() {
+  const input = document.getElementById("config-groups-search");
+  const query = (input?.value || "").trim().toLowerCase();
+  document.querySelectorAll("#config-groups .config-group").forEach(section => {
+    let visibleCount = 0;
+    section.querySelectorAll(".config-item").forEach(item => {
+      const haystack = item.textContent.toLowerCase();
+      const match = !query || haystack.includes(query);
+      item.classList.toggle("hidden", !match);
+      if (match) visibleCount += 1;
+    });
+    section.classList.toggle("hidden", Boolean(query) && visibleCount === 0);
+  });
 }
 
 const configHelpDialog = document.getElementById("config-help-dialog");
@@ -2972,6 +3052,7 @@ function markConfigDraft(input) {
 }
 
 document.getElementById("config-reload").addEventListener("click", loadConfig);
+document.getElementById("config-groups-search").addEventListener("input", applyConfigGroupsFilter);
 document.getElementById("config-validate").addEventListener("click", validateConfig);
 document.getElementById("config-plan").addEventListener("click", planConfig);
 document.getElementById("config-apply").addEventListener("click", openConfigApplyDialog);
@@ -3054,7 +3135,7 @@ async function refreshCurrent() {
     setConnection(true, "控制台已连接");
   } catch (error) {
     if (error.name === "AbortError") return;
-    setConnection(false, "连接异常");
+    setConnection(false, `${titles[state.view] || "控制台"}连接异常：${error.message || "未知错误"}`);
     notice(error.message);
   }
 }

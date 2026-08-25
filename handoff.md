@@ -1,5 +1,58 @@
 # Session handoff — 2026-08-23
 
+## 2026-08-25：运维控制台 UI/UX 细节打磨（UI20 补充）
+
+本轮在 UI20 重构基础上做最后一轮个人日常使用体验和视觉降噪打磨，未新增页面或接口，未改动任何 API 请求路径和参数。
+
+### 本轮完成
+
+1. **批量测试 / 性能实验室快速预设**：表单顶部新增 3 个预设按钮（⚡快速保稳 / 🚀GPU 吞吐极限 / 📄学术论文双栏），点击自动填充 `vlm_batch_size`(`s`)、`page_timeout_seconds`、`task_timeout`、`page_connect_max_retries`，兼容单值输入框和 `vlm_batch_sizes` 复选框组。
+2. **任务详情页码列表限高**：`#task-page-grid` 增加 `max-height: 280px; overflow-y: auto`，避免超长页码撑爆布局，页码 `title` 悬浮提示不受影响。
+3. **诊断 NaN 修复**：上传文件大小 `formatBytes()` 增加 `Number.isFinite` 校验，非法/负值统一显示为 `--`。
+4. **GPU 不可用低干扰展示**：nvidia-smi/npu-smi 不可用时改为静音态卡片（灰色文案、`opacity:.82`），文案统一为「未检测到 GPU（当前为 CPU 模式）」，隐藏无意义的 stdout/stderr 详情。
+5. **总览空状态优化**：「进行中的任务」为空时不再留白，改为紧凑空状态提示 + 下方「最近完成」任务列表。
+6. **连接状态明细化**：左下角连接异常提示明确标注具体是哪个视图/SSE 连接失败及错误详情，并带 `title` 悬浮提示；恢复后自动变绿。
+7. **日志自动换行**：日志工具栏新增「自动换行」勾选框，勾选后对日志容器应用 `white-space:pre-wrap; word-break:break-all`。
+8. **配置中心「其他配置」紧凑网格**：23 项只读配置改为响应式两列网格（≤1080px 自动降级单列），新增即时搜索过滤输入框。
+9. **修复遗留测试断言**：`tests/unit/test_ops_console.py::test_ops_app_serves_dashboard_and_health` 仍在断言旧版本号机制的字面量 `UI19`/`ops.js?v=ui19`，与 UI20 已改为运行时占位符 `{{OPS_VERSION}}` 注入不一致（该测试在 UI20 合并时遗漏更新，非本轮引入的回归）。已同步断言为 `{{OPS_VERSION}}` / `ops.js?v={{OPS_VERSION}}` / `ops.css?v={{OPS_VERSION}}`。
+
+### 本轮修改文件
+
+```text
+mineru/ops/static/index.html
+mineru/ops/static/ops.js
+mineru/ops/static/ops.css
+tests/unit/test_ops_console.py
+handoff.md
+```
+
+### 验证结果
+
+```bash
+node --check mineru/ops/static/ops.js
+# 通过
+
+python -m pytest -o addopts='' tests/unit/ -q
+# 119 passed, 1 skipped
+
+python -m pytest -o addopts='' \
+  tests/unit/test_ops_console.py \
+  tests/unit/test_ops_agent_config.py \
+  tests/unit/test_api_request.py \
+  tests/unit/test_vlm_resilience.py \
+  tests/unit/test_batch_router_diagnose.py -q
+# 114 passed
+
+git diff --check
+# 通过
+```
+
+对 `ops.js` 全量 diff 做了 `api(` 调用行扫描，结果为 0 处改动，确认所有现有 API 请求路径与参数保持 100% 不变。
+
+### 部署说明
+
+本轮仍属于 UI20 静态资源范围，不需要单独的镜像标签；沿用下方 UI20 的构建、发布和升级流程即可（版本号统一由 `mineru/cli/ops.py` 的 `OPS_VERSION` 注入，无需在页面里硬编码版本字符串）。
+
 ## 2026-08-25：运维控制台 UI/UX 重构（UI20）
 
 ### 本轮状态
