@@ -63,8 +63,11 @@ grep '^MINERU_CODE_IMAGE=' env.multi
 ./start-multi.sh check
 ./start-multi.sh stop
 ./start-multi.sh start
+docker restart mineru-ops
 ./start-multi.sh status
 ```
+
+`start-multi.sh stop` 默认保留 Ops 容器，因此这里必须在代码卷同步完成后显式重启 `mineru-ops`，让 Ops Python 进程重新加载本轮新增的 SSE 接口和页面路由逻辑。
 
 如果是把归档带到另一台离线服务器，先导入镜像，再将 `env.multi` 设置为同一标签：
 
