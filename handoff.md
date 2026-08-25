@@ -1,5 +1,12 @@
 # Session handoff — 2026-08-23
 
+## 2026-08-25：补充 MinerU 与 RAGFlow 提取效果结论
+
+- 更新 `docs/analysis-error/双环境PDF解析性能综合对比报告-修改版.md`。
+- 新增明确判断：在本次技术 PDF 交付场景下，MinerU 的提取效果整体优于 RAGFlow，更适合公式/矩阵、表格行列结构、标题与段落阅读顺序、图片/图注关系，以及 Markdown、Middle JSON、Content List 等结构化结果。
+- 明确 RAGFlow 更适合后续知识库切分、检索和问答，不作为本次高保真 PDF 提取效果的替代基准。
+- 同时保留边界说明：当前没有统一版本、模型、解析器和参数下的逐页盲测，因此不虚构具体准确率提升百分比。
+
 ## 2026-08-25：重写双环境 MinerU 性能报告，弱化 RAGFlow 速度结论
 
 - 重写 `docs/analysis-error/双环境PDF解析性能综合对比报告.md`，报告主线改为 MinerU 两套环境的同条件性能、超时、慢页和输出能力。
