@@ -1,5 +1,18 @@
 # Session handoff — 2026-08-23
 
+## 2026-08-25：重写双环境 MinerU 性能报告，弱化 RAGFlow 速度结论
+
+- 重写 `docs/analysis-error/双环境PDF解析性能综合对比报告.md`，报告主线改为 MinerU 两套环境的同条件性能、超时、慢页和输出能力。
+- RAGFlow 两侧速度表、合计数字和方向性比较不再作为正文核心结论；仅说明现有资料缺少版本、解析器、模型、完成页数和质量记录，无法增强硬件或 MinerU 结论。
+- 新增 MinerU 输出能力背景：公式/LaTeX、表格结构、Markdown、Middle JSON、Content List、图文版面和标题层级，强调本次技术 PDF 的交付目标不是单纯 OCR 或任务耗时。
+- 新增官方 Issue 外部佐证并保留证据边界：
+  - #5361：昇腾 910B3 长时间高负载解析成功率下降、ACL `507035` / `ACL_ERROR_RT_VECTOR_CORE_EXCEPTION`；
+  - #5322：NPU + vLLM 解析速度偏低，扩展节点后吞吐反而下降，对照 NVIDIA 3090 更快；
+  - #5293：Windows managed parse-server 渲染超时，说明超时还需区分服务运行上下文，不能简单归咎于 PDF 内容。
+- Issue 内容只作为外部工程背景，不与本报告现场数据混算，也不宣称完全复现。
+
+本轮报告修改尚未单独构建镜像；提交后按既有流程推送 GitHub `dev` 分支。
+
 ## 2026-08-24：UI19 日志排除过滤、批量删除与配置界面整理
 
 ### 本轮完成
