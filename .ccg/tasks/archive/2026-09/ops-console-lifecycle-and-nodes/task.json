@@ -1,0 +1,12 @@
+{
+  "id": "ops-console-lifecycle-and-nodes",
+  "title": "完善运维控制台任务清理、配置更新和多节点部署",
+  "status": "completed",
+  "complexity": "L+",
+  "risk": "medium",
+  "domain": "backend",
+  "currentPhase": "completed",
+  "nextAction": "归档任务记录",
+  "createdAt": "2026-09-18T00:00:00Z",
+  "branch": "dev"
+}
