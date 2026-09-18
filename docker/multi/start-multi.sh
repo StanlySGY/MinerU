@@ -510,6 +510,7 @@ case "${1:-help}" in
         ;;
 
     start)
+        load_env
         echo "启动服务（角色：$MINERU_DEPLOY_ROLE；API 节点：$MINERU_API_NODE_IDS）..."
         check
         prepare_ops
@@ -605,7 +606,7 @@ case "${1:-help}" in
         compose ps
         ;;
 
-    logs)
+    logs|log)
         load_env
         compose logs -f
         ;;

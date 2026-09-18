@@ -185,6 +185,10 @@ class OpsStore:
                     updated_at TEXT NOT NULL,
                     payload_json TEXT NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS idx_task_snapshots_updated
+                    ON task_snapshots(updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_task_snapshots_status_updated
+                    ON task_snapshots(status, updated_at DESC);
                 CREATE TABLE IF NOT EXISTS task_page_timings (
                     task_id TEXT NOT NULL,
                     file_name TEXT NOT NULL,
@@ -761,13 +765,33 @@ class OpsStore:
             "with_retry_wall_seconds": with_retry_wall_seconds,
         }
 
-    def cached_tasks(self, limit: int = 100) -> list[dict[str, Any]]:
+    def cached_tasks(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
         with self.connect() as connection:
+            where = " WHERE status = ?" if status else ""
+            params: list[Any] = [status] if status else []
+            params.extend([max(0, int(limit)), max(0, int(offset))])
             rows = connection.execute(
-                "SELECT payload_json FROM task_snapshots ORDER BY updated_at DESC LIMIT ?",
-                (limit,),
+                "SELECT payload_json FROM task_snapshots"
+                f"{where} ORDER BY updated_at DESC, task_id DESC LIMIT ? OFFSET ?",
+                params,
             ).fetchall()
         return [json_loads_object(row["payload_json"]) for row in rows]
+
+    def count_tasks(self, status: str | None = None) -> int:
+        with self.connect() as connection:
+            if status:
+                row = connection.execute(
+                    "SELECT COUNT(*) FROM task_snapshots WHERE status = ?",
+                    (status,),
+                ).fetchone()
+            else:
+                row = connection.execute("SELECT COUNT(*) FROM task_snapshots").fetchone()
+        return int(row[0] if row else 0)
 
     def cached_task(self, task_id: str) -> dict[str, Any] | None:
         with self.connect() as connection:
@@ -2844,7 +2868,7 @@ class OpsRuntime:
             try:
                 response = await self.http_client.get(
                     f"{self.router_url}/tasks",
-                    params={"limit": 500, "offset": 0},
+                    params={"limit": 100, "offset": 0},
                 )
                 response.raise_for_status()
                 payload = response.json()
@@ -2886,7 +2910,6 @@ class OpsRuntime:
                         if not page_items:
                             break
                         self.store.upsert_tasks(page_items)
-                        items.extend(page_items)
                         offset += len(page_items)
                     if offset >= total:
                         self.last_full_task_sync_monotonic = now
@@ -2905,7 +2928,7 @@ class OpsRuntime:
                     } | self.retained_preview_task_ids,
                     updated_before=cutoff.isoformat(),
                 )
-            self.last_task_sync_items = list(items)
+            self.last_task_sync_items = list(items[:100])
             self.last_task_sync_monotonic = now
             return items
 
@@ -4176,7 +4199,11 @@ def create_app() -> FastAPI:
 
         merged = {
             str(item.get("task_id")): item
-            for item in runtime.store.cached_tasks(limit=10000)
+            for item in runtime.store.cached_tasks(
+                limit=normalized_limit,
+                offset=normalized_offset,
+                status=status,
+            )
             if item.get("task_id")
         }
         for item in live_items:
@@ -4205,10 +4232,11 @@ def create_app() -> FastAPI:
             ),
             reverse=True,
         )
-        selected = items[normalized_offset : normalized_offset + normalized_limit]
+        selected = items[:normalized_limit]
+        total = runtime.store.count_tasks(status=status)
         result = {
             "items": selected,
-            "total": len(items),
+            "total": total,
             "limit": normalized_limit,
             "offset": normalized_offset,
             "source": "cache" if live_error is not None else "live",

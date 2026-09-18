@@ -684,10 +684,13 @@ async function loadTasks() {
   const status = document.getElementById("task-status").value;
   try {
     state.tasksError = null;
-    const data = await api(`/api/tasks?limit=200${status ? `&status=${encodeURIComponent(status)}` : ""}`);
+    const data = await api(`/api/tasks?limit=100${status ? `&status=${encodeURIComponent(status)}` : ""}`);
     state.tasks = data.items || [];
     const retention = document.getElementById("tasks-retention");
-    if (retention) retention.textContent = `缓存保留 ${data.retention_days || 7} 天`;
+    if (retention) {
+      const total = Number(data.total) || state.tasks.length;
+      retention.textContent = `显示最近 ${state.tasks.length} 条，共 ${total} 条 · 缓存保留 ${data.retention_days || 7} 天`;
+    }
     renderTasks();
     if (data.source === "cache") notice(`Router 暂不可用，当前显示缓存：${data.error}`);
   } catch (error) {
@@ -3194,7 +3197,10 @@ async function refreshCurrent() {
     else if (state.view === "tasks") await refreshTasksView();
     else if (state.view === "batch") await loadBatches();
     else if (state.view === "lab") await loadLab();
-    else if (state.view === "config") await loadConfig();
+    else if (state.view === "config") {
+      if (!state.config) await loadConfig();
+      else await loadConfigStatus({force: true});
+    }
     else if (state.view === "logs") {
       if (!state.services.length) await loadServices();
       else updateLogServices();
@@ -3210,8 +3216,9 @@ async function refreshCurrent() {
 
 setInterval(() => {
   if (["overview", "services", "batch", "lab"].includes(state.view)) refreshCurrent();
+  else if (state.view === "config" && state.config) loadConfigStatus({force: true});
   if (state.activeBatchId) refreshActiveBatchDocument();
-}, 5000);
+}, 10000);
 setInterval(() => {
   if (state.view === "logs" && document.getElementById("log-live").checked) loadSelectedServiceLogs();
 }, 2000);
@@ -3224,5 +3231,5 @@ setInterval(() => {
   } else {
     refreshTasksView();
   }
-}, 5000);
+}, 10000);
 refreshCurrent();
