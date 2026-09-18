@@ -1456,29 +1456,55 @@ class OpsRuntime:
         services = self.compose_config().get("services")
         if not isinstance(services, dict):
             return []
+        deployment_role = os.getenv("MINERU_DEPLOY_ROLE", "all").strip().lower() or "all"
+        selected_api_ids = self._selected_api_node_ids()
         discovered = []
         vlm_urls: set[str] = set()
         for name, spec_value in services.items():
             spec = spec_value if isinstance(spec_value, dict) else {}
             labels = spec.get("labels") if isinstance(spec.get("labels"), dict) else {}
             role = labels.get("com.mineru.role") or self._infer_role(name)
+            api_id = self._api_node_id(name) if role == "api" else None
             environment = spec.get("environment") if isinstance(spec.get("environment"), dict) else {}
-            endpoint = self._service_endpoint(name, role)
-            discovered.append(
-                {
-                    "name": name,
-                    "role": role,
-                    "image": spec.get("image"),
-                    "endpoint": endpoint,
-                    "control_enabled": role not in {"ops", "code-sync"},
-                }
-            )
             if role == "api":
                 raw_url = environment.get("MINERU_VL_SERVER") or environment.get("MINERU_VLM_SERVER_URL")
                 if isinstance(raw_url, str) and raw_url.startswith("http"):
                     host_part = raw_url.split("//", 1)[-1].split("/", 1)[0]
                     if not host_part.startswith(":") and not host_part.startswith("127.0.0.1"):
-                        vlm_urls.add(raw_url.rstrip("/"))
+                        if deployment_role != "api" or not selected_api_ids or api_id in selected_api_ids:
+                            vlm_urls.add(raw_url.rstrip("/"))
+            if deployment_role == "router" and role == "api":
+                continue
+            if deployment_role == "api" and role in {"router", "ops"}:
+                continue
+            if role == "api" and selected_api_ids and api_id not in selected_api_ids:
+                continue
+            endpoint = self._service_endpoint(name, role)
+            discovered.append(
+                {
+                    "name": name,
+                    "role": role,
+                    "node_id": api_id,
+                    "image": spec.get("image"),
+                    "endpoint": endpoint,
+                    "remote": False,
+                    "control_enabled": role not in {"ops", "code-sync"},
+                }
+            )
+        if deployment_role == "router":
+            for index, upstream in enumerate(self._configured_router_upstreams(), start=1):
+                discovered.append(
+                    {
+                        "name": f"mineru-api-{index}",
+                        "role": "api",
+                        "node_id": str(index),
+                        "image": None,
+                        "endpoint": f"{upstream.rstrip('/')}/health",
+                        "address": upstream,
+                        "remote": True,
+                        "control_enabled": False,
+                    }
+                )
         for index, url in enumerate(sorted(vlm_urls), start=1):
             models_url = url if url.endswith("/models") else f"{url}/models"
             discovered.append(
@@ -1487,10 +1513,48 @@ class OpsRuntime:
                     "role": "vlm",
                     "image": None,
                     "endpoint": models_url,
+                    "remote": True,
                     "control_enabled": False,
                 }
             )
         return discovered
+
+    @staticmethod
+    def _api_node_id(name: str) -> str | None:
+        if name == "mineru-api":
+            return "1"
+        if name.startswith("mineru-api-"):
+            suffix = name.removeprefix("mineru-api-")
+            return suffix if suffix.isdigit() else None
+        return None
+
+    @staticmethod
+    def _selected_api_node_ids() -> set[str]:
+        raw = os.getenv("MINERU_API_NODE_IDS", "").strip()
+        if not raw:
+            return set()
+        return {
+            item.strip()
+            for item in raw.split(",")
+            if item.strip().isdigit()
+        }
+
+    @staticmethod
+    def _configured_router_upstreams() -> list[str]:
+        raw = os.getenv("MINERU_ROUTER_UPSTREAM_URLS_JSON", "").strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {"'", '"'}:
+            raw = raw[1:-1]
+        try:
+            values = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return []
+        if not isinstance(values, list):
+            return []
+        return list(dict.fromkeys(
+            value.strip().rstrip("/")
+            for value in values
+            if isinstance(value, str) and value.strip().startswith(("http://", "https://"))
+        ))
 
     @staticmethod
     def _infer_role(name: str) -> str:
@@ -3996,6 +4060,12 @@ def create_app() -> FastAPI:
         runtime_states = agent_result.get("services", {}) if agent_result.get("ok") else {}
         for service in health_results:
             state = runtime_states.get(service["name"], {}) if isinstance(runtime_states, dict) else {}
+            if service.get("remote") and not state:
+                state = {
+                    "state": "remote",
+                    "status": "远程 API，只提供健康检查",
+                    "health": "none",
+                }
             apply_service_runtime_health(service, state)
             if not agent_result.get("ok"):
                 service["agent_error"] = agent_result.get("error")

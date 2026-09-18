@@ -795,6 +795,8 @@ dialog { max-width: 1200px; max-height: 90vh; }
 .config-layout { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 16px; align-items: start; }
 .config-groups { display: grid; gap: 14px; }
 .config-group { padding: 0 16px 10px; overflow: hidden; }
+.config-group .section-heading > div { min-width: 0; }
+.config-group-apply { flex: none; }
 .config-group.hidden { display: none; }
 .config-item { display: grid; grid-template-columns: minmax(230px, .8fr) minmax(260px, 1fr); gap: 7px 16px; padding: 13px 0; border-top: 1px solid var(--border-default); }
 .config-item.hidden { display: none; }

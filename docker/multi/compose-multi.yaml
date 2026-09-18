@@ -1,8 +1,8 @@
 # 当前现场部署：一个或多个外部 VLM + 一个或多个 mineru-api-* + 一个 Router。
 # VLM 不由本文件创建，必须先在 VLM 主机上启动，并保证 API 容器可以访问它。
 #
-# 多节点扩容：复制 mineru-api-2 的模板改成 mineru-api-N，环境变量用 VLM_N_IP/VLM_N_PORT/API_N_PORT，
-# 并在 mineru-router 的 depends_on 和 command 中为每个新 API 增加对应依赖和 --upstream-url。
+# 多节点扩容：复制对应 API 模板改成 mineru-api-N，环境变量用 VLM_N_IP/VLM_N_PORT/API_N_PORT，
+# Router/Ops 主机通过 MINERU_ROUTER_UPSTREAM_URLS_JSON 接入已部署的远程 API。
 # start-multi.sh 按 MINERU_DEPLOY_ROLE 和 MINERU_API_NODE_IDS 选择启动节点，并按 env.multi 检查 VLM。
 #
 # 本文件只包含与硬件无关的定义，可直接在 x86 / ARM 的纯 CPU 主机上启动。
@@ -13,7 +13,7 @@
 services:
   mineru-code-sync:
     # 一次性把代码镜像复制到共享卷；Exited (0) 是正常结果。
-    image: ${MINERU_CODE_IMAGE:-mineru-code:v3.4.2}
+    image: ${MINERU_CODE_IMAGE:-mineru-code:v3.4.2-ops-ui20}
     container_name: mineru-code-sync-multi
     restart: "no"
     labels:
@@ -22,7 +22,7 @@ services:
       - mineru-code:/target
 
   mineru-api-1:
-    image: ${MINERU_ENV_IMAGE:-mineru-env:npu-v1.0}
+    image: ${MINERU_ENV_IMAGE:-mineru-env:v1.0}
     container_name: mineru-api-1
     restart: always
     labels:
@@ -32,7 +32,7 @@ services:
       mineru-code-sync:
         condition: service_completed_successfully
     ports:
-      - "${API_1_PORT:-18000}:8000"
+      - "${API_1_PORT:-6002}:8000"
     environment: &api-environment
       PYTHONPATH: /app
       # 这里填写 API 容器能访问的外部 VLM，不要填写 API 容器自己的 127.0.0.1。
@@ -86,7 +86,7 @@ services:
   # 4 个节点都定义在同一份文件中；start-multi.sh 通过 MINERU_API_NODE_IDS
   # 决定本机实际启动哪些节点，因此两台 API 主机可以复用该文件。
   mineru-api-2:
-    image: ${MINERU_ENV_IMAGE:-mineru-env:npu-v1.0}
+    image: ${MINERU_ENV_IMAGE:-mineru-env:v1.0}
     container_name: mineru-api-2
     restart: always
     labels:
@@ -107,7 +107,7 @@ services:
     healthcheck: *api-healthcheck
 
   mineru-api-3:
-    image: ${MINERU_ENV_IMAGE:-mineru-env:npu-v1.0}
+    image: ${MINERU_ENV_IMAGE:-mineru-env:v1.0}
     container_name: mineru-api-3
     restart: always
     labels:
@@ -128,7 +128,7 @@ services:
     healthcheck: *api-healthcheck
 
   mineru-api-4:
-    image: ${MINERU_ENV_IMAGE:-mineru-env:npu-v1.0}
+    image: ${MINERU_ENV_IMAGE:-mineru-env:v1.0}
     container_name: mineru-api-4
     restart: always
     labels:
@@ -149,7 +149,7 @@ services:
     healthcheck: *api-healthcheck
 
   mineru-router:
-    image: ${MINERU_ENV_IMAGE:-mineru-env:npu-v1.0}
+    image: ${MINERU_ENV_IMAGE:-mineru-env:v1.0}
     container_name: mineru-router
     restart: always
     labels:
@@ -185,7 +185,7 @@ services:
       retries: 3
 
   mineru-ops:
-    image: ${MINERU_ENV_IMAGE:-mineru-env:npu-v1.0}
+    image: ${MINERU_ENV_IMAGE:-mineru-env:v1.0}
     container_name: mineru-ops
     restart: always
     labels:
@@ -214,6 +214,10 @@ services:
       MINERU_OPS_BATCH_ORPHAN_GRACE_SECONDS: ${MINERU_OPS_BATCH_ORPHAN_GRACE_SECONDS:-120}
       MINERU_OPS_BATCH_MAX_RUNTIME_SECONDS: ${MINERU_OPS_BATCH_MAX_RUNTIME_SECONDS:-86400}
       MINERU_OPS_TASK_RETENTION_DAYS: ${MINERU_OPS_TASK_RETENTION_DAYS:-7}
+      # 控制台只展示本机实际角色和 Router upstream 中的远程 API 节点。
+      MINERU_DEPLOY_ROLE: ${MINERU_DEPLOY_ROLE:-all}
+      MINERU_API_NODE_IDS: ${MINERU_API_NODE_IDS:-1}
+      MINERU_ROUTER_UPSTREAM_URLS_JSON: '${MINERU_ROUTER_UPSTREAM_URLS_JSON:-["http://mineru-api-1:8000"]}'
       TMPDIR: /var/lib/mineru-ops/tmp
     volumes:
       - mineru-code:/app:ro

@@ -69,6 +69,7 @@
             <button data-filter="api">API</button>
             <button data-filter="vlm">VLM</button>
           </div>
+          <span id="service-inventory" class="muted"></span>
           <div class="actions stack-actions">
             <button class="secondary-button" data-system-action="test">全链路测试</button>
             <button class="secondary-button" data-system-action="start">启动业务服务</button>
@@ -252,7 +253,7 @@
           </div>
           <div class="feature-tags"><span>安全应用模式</span><span>Compose 校验</span><span>失败自动回滚</span><span>需要管理令牌</span></div>
         </section>
-        <div class="config-safe-banner"><strong>安全应用模式</strong><span>修改会先生成预览并校验，保存后只重建受影响的业务服务；mineru-ops 自身不会自动重建。</span></div>
+        <div class="config-safe-banner"><strong>安全应用模式</strong><span>每个分组都可以独立预览、保存并应用；系统只重建受影响的业务服务，失败会自动回滚。</span></div>
         <div class="config-summary">
           <div><span>工作模式</span><strong id="config-mode">安全应用</strong></div>
           <div><span>Agent 通道</span><strong id="config-agent-status">读取中</strong></div>

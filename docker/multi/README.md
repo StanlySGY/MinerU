@@ -51,8 +51,8 @@ docker/multi/
 │   ├── mineru-pipeline-models-3.4.2.tar.gz
 │   └── mineru-pipeline-models-3.4.2.tar.gz.sha256
 ├── images/
-│   ├── mineru-env-npu-v1.0.tar.gz
-│   └── mineru-code-v3.4.2.tar.gz
+│   ├── mineru-env-v1.0.tar.gz
+│   └── mineru-code-v3.4.2-ops-ui20.tar.gz
 ├── compose-multi.yaml
 ├── compose-multi.npu.yaml
 ├── compose-multi.nvidia.yaml
@@ -69,6 +69,10 @@ docker/multi/
 ```
 
 `mineru-env` 必须是适配现场 ARM64、麒麟、CANN/torch_npu 的环境镜像；不能使用 WSL 的 x86_64 镜像代替。
+
+当前现场默认代码标签是 `mineru-code:v3.4.2-ops-ui20`。公司 ARM 服务器完成
+UI21 构建和验证后，可将归档名与 `MINERU_CODE_IMAGE` 一并替换为
+`mineru-code-v3.4.2-ops-ui21.tar.gz` 和 `mineru-code:v3.4.2-ops-ui21`。
 
 ## 现场执行顺序
 

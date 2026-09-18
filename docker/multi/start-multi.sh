@@ -83,8 +83,8 @@ load_env_defaults() {
         . "./$ENV_FILE"
         set +a
     fi
-    MINERU_ENV_IMAGE="${MINERU_ENV_IMAGE:-mineru-env:npu-v1.0}"
-    MINERU_CODE_IMAGE="${MINERU_CODE_IMAGE:-mineru-code:v3.4.2}"
+    MINERU_ENV_IMAGE="${MINERU_ENV_IMAGE:-mineru-env:v1.0}"
+    MINERU_CODE_IMAGE="${MINERU_CODE_IMAGE:-mineru-code:v3.4.2-ops-ui20}"
     MINERU_API_OUTPUT_ROOT="${MINERU_API_OUTPUT_ROOT:-/var/lib/mineru/output}"
     PIPELINE_MODEL_HOST_PATH="${PIPELINE_MODEL_HOST_PATH:-./models/PDF-Extract-Kit-1.0}"
     PIPELINE_CONFIG_HOST_PATH="${PIPELINE_CONFIG_HOST_PATH:-./mineru.pipeline.json}"

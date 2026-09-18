@@ -46,6 +46,8 @@ const state = {
   configDraft: {},
   configValidationErrors: {},
   configPlan: null,
+  configApplyValues: null,
+  configApplyScope: null,
   configApplying: false,
   configApplyResult: null,
   labSubmitting: false,
@@ -458,7 +460,7 @@ function serviceCard(service) {
   const runtimeHealth = String(service.runtime?.health || "unknown").toLowerCase();
   const cls = statusTier(service.health);
   const runtimeHealthClass = runtimeHealth === "healthy" ? "good" : runtimeHealth === "starting" ? "warn" : runtimeHealth === "unhealthy" ? "bad" : "";
-  const runtimeText = {running: "运行中", restarting: "重启中", paused: "已暂停", exited: "已退出", dead: "已停止", created: "已创建", unknown: "未知"}[runtimeState] || runtimeState;
+  const runtimeText = {running: "运行中", restarting: "重启中", paused: "已暂停", exited: "已退出", dead: "已停止", created: "已创建", remote: "远程节点", unknown: "未知"}[runtimeState] || runtimeState;
   const runtimeHealthText = {healthy: "健康", unhealthy: "异常", starting: "启动中", none: "无探活", unknown: "未知"}[runtimeHealth] || runtimeHealth;
   const windowSize = service.health_payload?.processing_window_size;
   const workload = windowSize ? `窗口 ${windowSize} · 处理中 ${service.health_payload?.processing_tasks || 0}` : "";
@@ -468,7 +470,8 @@ function serviceCard(service) {
     service.health_payload?.gpu?.vram?.used ?? service.health_payload?.vram?.used,
     service.health_payload?.gpu?.vram?.total ?? service.health_payload?.vram?.total,
   );
-  const head = `<div class="service-card-head"><div><h3>${esc(service.name)}</h3><span class="muted">${esc(String(service.role).toUpperCase())}</span></div>${badge(service.health)}</div>`;
+  const subtitle = service.address || (service.remote ? "远程节点" : String(service.role).toUpperCase());
+  const head = `<div class="service-card-head"><div><h3>${esc(service.name)}</h3><span class="muted">${esc(subtitle)}</span></div>${badge(service.health)}</div>`;
   const metrics = `<div class="service-card-metrics"><div><small>容器状态</small><strong>${esc(runtimeText)} ${gpuTempTag(temp)}</strong><span class="runtime-health ${runtimeHealthClass}">Docker 健康：${esc(runtimeHealthText)}</span></div><div><small>HTTP 探活</small><strong>${esc(httpDetail)}</strong><span class="muted">${esc(service.endpoint || "无检测端点")}</span></div></div>`;
   const foot = workload ? `<p class="service-workload">${esc(workload)}</p>` : "";
   return `<article class="service-card ${cls}">${head}${metrics}${vram}${foot}</article>`;
@@ -607,6 +610,14 @@ async function loadRuntimeDiagnostics({force = false} = {}) {
 function renderServicesTable() {
   const container = document.getElementById("services-table");
   const services = state.services.filter(item => state.serviceFilter === "all" || item.role === state.serviceFilter);
+  const inventory = document.getElementById("service-inventory");
+  if (inventory) {
+    const counts = state.services.reduce((result, item) => {
+      result[item.role] = (result[item.role] || 0) + 1;
+      return result;
+    }, {});
+    inventory.textContent = `实际节点：API ${counts.api || 0} · Router ${counts.router || 0} · VLM ${counts.vlm || 0}`;
+  }
   if (!state.services.length) {
     if (state.servicesError) {
       container.innerHTML = errorState(`服务加载失败：${state.servicesError}`);
@@ -623,10 +634,12 @@ function renderServicesTable() {
     const actions = service.control_enabled ? ["check", "start", "stop", "restart"] : ["check"];
     const runtimeState = String(service.runtime?.state || "unknown").toLowerCase();
     const runtimeHealth = String(service.runtime?.health || "unknown").toLowerCase();
-    const runtimeLabel = {running: "运行中", restarting: "重启中", paused: "已暂停", exited: "已退出", dead: "已停止", created: "已创建", unknown: "未知"}[runtimeState] || runtimeState;
+    const runtimeLabel = {running: "运行中", restarting: "重启中", paused: "已暂停", exited: "已退出", dead: "已停止", created: "已创建", remote: "远程节点", unknown: "未知"}[runtimeState] || runtimeState;
     const runtimeHealthLabel = {healthy: "健康", unhealthy: "异常", starting: "启动中", none: "无探活", unknown: "未知"}[runtimeHealth] || runtimeHealth;
     const endpointDetail = service.health_status_code ? `HTTP ${service.health_status_code}` : service.health_error || "-";
-    return `<tr><td><strong>${esc(service.name)}</strong></td><td>${esc(service.role)}</td><td><strong>${esc(runtimeLabel)}</strong><div class="muted">Docker 健康：${esc(runtimeHealthLabel)}</div></td><td>${badge(service.health)}<div class="muted">${esc(endpointDetail)}</div>${service.health_message ? `<div class="muted">${esc(service.health_message)}</div>` : ""}</td><td><div class="mono service-endpoint">${esc(service.image || service.endpoint || "-")}</div></td><td><div class="actions">${actions.map(action => `<button class="action-button ${action === "stop" ? "danger" : ""}" data-service="${esc(service.name)}" data-action="${action}">${{check:"检查",start:"启动",stop:"停止",restart:"重启"}[action]}</button>`).join("")}</div></td></tr>`;
+    const endpointLabel = service.address || service.endpoint || service.image || "-";
+    const remoteLabel = service.remote ? "远程只读" : "本机服务";
+    return `<tr><td><strong>${esc(service.name)}</strong><div class="muted">${remoteLabel}</div></td><td>${esc(service.role)}</td><td><strong>${esc(runtimeLabel)}</strong><div class="muted">Docker 健康：${esc(runtimeHealthLabel)}</div></td><td>${badge(service.health)}<div class="muted">${esc(endpointDetail)}</div>${service.health_message ? `<div class="muted">${esc(service.health_message)}</div>` : ""}</td><td><div class="mono service-endpoint">${esc(endpointLabel)}</div></td><td><div class="actions">${actions.map(action => `<button class="action-button ${action === "stop" ? "danger" : ""}" data-service="${esc(service.name)}" data-action="${action}">${{check:"检查",start:"启动",stop:"停止",restart:"重启"}[action]}</button>`).join("")}</div></td></tr>`;
   }).join("")}</tbody></table>`;
 }
 
@@ -2432,7 +2445,8 @@ function renderConfig() {
   for (const item of items) groups.set(item.category || "其他配置", [...(groups.get(item.category || "其他配置") || []), item]);
   document.getElementById("config-groups").innerHTML = [...groups.entries()].map(([category, group]) => {
     const compact = category === "其他配置";
-    return `<section class="panel config-group${compact ? " config-group-compact" : ""}" data-config-category="${esc(category)}"><div class="section-heading"><h2>${esc(category)}</h2><span>${group.length} 项</span></div><div class="config-group-body${compact ? " config-group-grid" : ""}">${group.map(item => configControl(item)).join("")}</div></section>`;
+    const editable = group.some(item => item.editable !== false);
+    return `<section class="panel config-group${compact ? " config-group-compact" : ""}" data-config-category="${esc(category)}"><div class="section-heading"><div><h2>${esc(category)}</h2><span>${group.length} 项</span></div>${editable ? `<button type="button" class="secondary-button config-group-apply" data-config-group-apply="${esc(category)}">保存并应用</button>` : ""}</div><div class="config-group-body${compact ? " config-group-grid" : ""}">${group.map(item => configControl(item)).join("")}</div></section>`;
   }).join("") || `<div class="empty-state">没有可显示的配置。</div>`;
   applyConfigGroupsFilter();
 }
@@ -2810,6 +2824,7 @@ function setConfigBusy(busy, label = "") {
     const button = document.getElementById(id);
     if (button) button.disabled = busy;
   }
+  document.querySelectorAll("[data-config-group-apply]").forEach(button => { button.disabled = busy; });
   document.getElementById("config-groups").classList.toggle("loading", busy);
   if (label) document.getElementById("config-validation-status").textContent = label;
 }
@@ -2818,6 +2833,8 @@ async function loadConfig() {
   state.configDraft = {};
   state.configValidationErrors = {};
   state.configPlan = null;
+  state.configApplyValues = null;
+  state.configApplyScope = null;
   state.configApplying = false;
   const [schema, config, history] = await Promise.all([
     api("/api/config/schema"),
@@ -2934,15 +2951,31 @@ async function validateConfig() {
 }
 
 async function planConfig() {
-  if (!Object.keys(state.configDraft).length) {
+  return planConfigValues(state.configDraft, null);
+}
+
+function configDraftValues(category = null) {
+  const items = state.config?.items || [];
+  const allowed = new Set(
+    items
+      .filter(item => item.editable !== false && (category === null || (item.category || "其他配置") === category))
+      .map(item => item.key),
+  );
+  return Object.fromEntries(Object.entries(state.configDraft).filter(([key]) => allowed.has(key)));
+}
+
+async function planConfigValues(values, scope = null) {
+  if (!Object.keys(values).length) {
     notice("请先修改至少一个候选值");
     return null;
   }
   const status = document.getElementById("config-validation-status");
   setConfigBusy(true, "正在生成变更预览并校验 Compose...");
   try {
-    const result = await api("/api/config/plan", {method: "POST", body: JSON.stringify({values: state.configDraft})});
+    const result = await api("/api/config/plan", {method: "POST", body: JSON.stringify({values})});
     state.configPlan = result;
+    state.configApplyValues = values;
+    state.configApplyScope = scope;
     state.configValidationErrors = result.errors || {};
     renderConfig();
     renderConfigPlan();
@@ -2969,10 +3002,13 @@ function configConfirmationHtml(plan) {
     ${plan.requires_ops_restart ? `<p class="config-plan-warning">应用完成后还需现场手工重启 mineru-ops，避免当前请求把自己中断。</p>` : ""}`;
 }
 
-async function openConfigApplyDialog() {
+async function openConfigApplyDialog(scope = null) {
   if (state.configApplying) return;
-  let plan = state.configPlan;
-  if (!plan) plan = await planConfig();
+  const values = configDraftValues(scope);
+  let plan = scope === null && state.configApplyScope === null ? state.configPlan : null;
+  if (!plan || JSON.stringify(state.configApplyValues) !== JSON.stringify(values)) {
+    plan = await planConfigValues(values, scope);
+  }
   if (!plan || !plan.ok || plan.valid === false || plan.compose_valid === false) {
     notice(plan?.error || plan?.message || "请先修正配置并通过预览");
     return;
@@ -2988,9 +3024,10 @@ async function openConfigApplyDialog() {
 async function applyConfig() {
   if (state.configApplying) return;
   const dialog = document.getElementById("config-apply-dialog");
+  const values = state.configApplyValues || state.configDraft;
   setConfigBusy(true, "正在写入配置并重建受影响服务，请勿关闭页面...");
   try {
-    const result = await api("/api/config/apply", {method: "POST", body: JSON.stringify({values: state.configDraft})});
+    const result = await api("/api/config/apply", {method: "POST", body: JSON.stringify({values})});
     state.configApplyResult = result;
     renderConfigApplyResult(result);
     if (!result.ok) {
@@ -3084,6 +3121,10 @@ document.getElementById("config-validate").addEventListener("click", validateCon
 document.getElementById("config-plan").addEventListener("click", planConfig);
 document.getElementById("config-apply").addEventListener("click", openConfigApplyDialog);
 document.getElementById("config-confirm-apply").addEventListener("click", applyConfig);
+document.getElementById("config-groups").addEventListener("click", event => {
+  const button = event.target.closest("[data-config-group-apply]");
+  if (button) openConfigApplyDialog(button.dataset.configGroupApply);
+});
 document.getElementById("config-cancel-apply").addEventListener("click", () => document.getElementById("config-apply-dialog").close());
 document.getElementById("config-groups").addEventListener("input", event => {
   const input = event.target.closest("[data-config-key]");
