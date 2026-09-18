@@ -1460,6 +1460,7 @@ class OpsRuntime:
         selected_api_ids = self._selected_api_node_ids()
         discovered = []
         vlm_urls: set[str] = set()
+        local_api_ids: set[str] = set()
         for name, spec_value in services.items():
             spec = spec_value if isinstance(spec_value, dict) else {}
             labels = spec.get("labels") if isinstance(spec.get("labels"), dict) else {}
@@ -1491,8 +1492,12 @@ class OpsRuntime:
                     "control_enabled": role not in {"ops", "code-sync"},
                 }
             )
-        if deployment_role == "router":
+            if role == "api" and api_id is not None:
+                local_api_ids.add(api_id)
+        if deployment_role in {"router", "all"}:
             for index, upstream in enumerate(self._configured_router_upstreams(), start=1):
+                if str(index) in local_api_ids:
+                    continue
                 discovered.append(
                     {
                         "name": f"mineru-api-{index}",

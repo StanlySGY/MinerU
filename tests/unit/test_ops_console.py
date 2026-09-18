@@ -1323,6 +1323,53 @@ def test_ops_runtime_filters_api_nodes_for_api_role(tmp_path: Path, monkeypatch)
     asyncio.run(runtime.close())
 
 
+def test_ops_runtime_combines_local_and_remote_api_nodes_for_all_role(tmp_path: Path, monkeypatch):
+    compose_path = tmp_path / "compose-config.yaml"
+    compose_path.write_text(
+        yaml.safe_dump(
+            {
+                "services": {
+                    "mineru-api-1": {"labels": {"com.mineru.role": "api"}},
+                    "mineru-api-2": {"labels": {"com.mineru.role": "api"}},
+                    "mineru-api-3": {"labels": {"com.mineru.role": "api"}},
+                    "mineru-api-4": {"labels": {"com.mineru.role": "api"}},
+                    "mineru-router": {"labels": {"com.mineru.role": "router"}},
+                    "mineru-ops": {"labels": {"com.mineru.role": "ops"}},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
+    monkeypatch.setenv("MINERU_OPS_COMPOSE_CONFIG", str(compose_path))
+    monkeypatch.setenv("MINERU_DEPLOY_ROLE", "all")
+    monkeypatch.setenv("MINERU_API_NODE_IDS", "1,2")
+    monkeypatch.setenv(
+        "MINERU_ROUTER_UPSTREAM_URLS_JSON",
+        '["http://32.15.75.232:6002", "http://32.15.75.232:6003", "http://32.15.84.31:8001", "http://32.15.84.31:8002"]',
+    )
+    runtime = OpsRuntime()
+
+    services = runtime.discover_services()
+
+    api_services = [service for service in services if service["role"] == "api"]
+    assert [service["name"] for service in api_services] == [
+        "mineru-api-1",
+        "mineru-api-2",
+        "mineru-api-3",
+        "mineru-api-4",
+    ]
+    assert [service["address"] for service in api_services if service["remote"]] == [
+        "http://32.15.84.31:8001",
+        "http://32.15.84.31:8002",
+    ]
+    assert all(not service["remote"] for service in api_services[:2])
+    assert all(service["remote"] for service in api_services[2:])
+
+    asyncio.run(runtime.close())
+
+
 def test_batch_run_request_supports_performance_lab_and_batch_32() -> None:
     assert BatchRunRequest().experiment_type == "batch_test"
     payload = BatchRunRequest(experiment_type="performance_lab", vlm_batch_size=32)
