@@ -6,12 +6,18 @@
 - `bash -n docker/multi/start-multi.sh` 通过。
 - CPU 和 NPU Compose 配置展开通过。
 - `node --check mineru/ops/static/ops.js` 通过。
-- `PYTHONPATH=. pytest -q -o addopts='' tests/unit`：124 passed, 1 skipped。
+- `PYTHONPATH=. pytest -q -o addopts='' tests/unit`：126 passed, 1 skipped。
 - `git diff --check` 通过。
+
+## 收尾修复
+
+- 将 Router 专属配置集合收窄为 `MINERU_ROUTER_UPSTREAM_URLS_JSON`。
+- `MINERU_VLM_PAGE_TIMEOUT_SECONDS` 和 `MINERU_VLM_CONNECT_MAX_RETRIES` 同时注入 API/Router，因此修改时会同时重建两类服务。
+- 新增 `test_shared_vlm_timeout_config_recreates_api_and_router` 回归测试。
 
 ## 外部模型审查
 
-已按 CCG 要求并行启动 antigravity 和 claude reviewer，但当前沙箱禁止模型进程监听本地端口，且其日志目录只读；两者均在输出报告前退出。因此本记录以本地代码审阅和测试结果为准。
+已按 CCG 要求并行启动 antigravity 和 claude reviewer，但当前沙箱禁止模型进程监听本地端口，且其日志目录只读；两次尝试均在输出报告前退出。因此本记录以本地代码审阅和测试结果为准。
 
 ## 已知边界
 
