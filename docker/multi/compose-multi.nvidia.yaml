@@ -6,3 +6,9 @@ services:
   mineru-api-1:
     # 等价于 docker run --gpus all；只想暴露部分卡时改成 "device=0" 这类取值。
     gpus: ${NVIDIA_GPUS:-all}
+  mineru-api-2:
+    gpus: ${NVIDIA_GPUS:-all}
+  mineru-api-3:
+    gpus: ${NVIDIA_GPUS:-all}
+  mineru-api-4:
+    gpus: ${NVIDIA_GPUS:-all}

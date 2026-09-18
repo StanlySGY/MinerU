@@ -1696,8 +1696,11 @@ def main(
     worker_host: str,
     enable_vlm_preload: bool,
 ):
+    global app
+    configured_upstreams = RouterSettings.from_env().upstream_urls
+    resolved_upstreams = tuple(dict.fromkeys((*configured_upstreams, *upstream_urls)))
     settings = RouterSettings(
-        upstream_urls=tuple(upstream_urls),
+        upstream_urls=resolved_upstreams,
         local_gpus=local_gpus,
         worker_host=worker_host,
         enable_vlm_preload=enable_vlm_preload,
@@ -1726,12 +1729,14 @@ def main(
         "1" if allow_public_http_client else "0"
     )
     warn_if_public_http_client_policy(host, allow_public_http_client)
-
     access_log = not env_flag_enabled("MINERU_API_DISABLE_ACCESS_LOG")
     print(f"Start MinerU Router Service: http://{host}:{port}")
     print(f"API documentation: http://{host}:{port}/docs")
 
     if reload:
+        # Click options are parsed after the module-level app is created.
+        # Replace it so reload mode also honors CLI upstreams.
+        app = create_app(settings)
         uvicorn.run(
             "mineru.cli.router:app",
             host=host,

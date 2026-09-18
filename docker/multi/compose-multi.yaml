@@ -1,5 +1,9 @@
-# 当前现场部署：一个外部 VLM + 一个 API + 一个 Router。
+# 当前现场部署：一个或多个外部 VLM + 一个或多个 mineru-api-* + 一个 Router。
 # VLM 不由本文件创建，必须先在 VLM 主机上启动，并保证 API 容器可以访问它。
+#
+# 多节点扩容：复制 mineru-api-2 的模板改成 mineru-api-N，环境变量用 VLM_N_IP/VLM_N_PORT/API_N_PORT，
+# 并在 mineru-router 的 depends_on 和 command 中为每个新 API 增加对应依赖和 --upstream-url。
+# start-multi.sh 按 MINERU_DEPLOY_ROLE 和 MINERU_API_NODE_IDS 选择启动节点，并按 env.multi 检查 VLM。
 #
 # 本文件只包含与硬件无关的定义，可直接在 x86 / ARM 的纯 CPU 主机上启动。
 # 需要加速卡时，由 start-multi.sh 按 env.multi 的 MINERU_DEVICE_MODE 追加叠加文件：
@@ -79,43 +83,70 @@ services:
       timeout: 10s
       retries: 3
 
-  # 扩容到第二个 VLM 时，复制并取消下面的注释，同时在 Router 中增加对应 upstream。
-  # mineru-api-2:
-  #   image: ${MINERU_ENV_IMAGE:-mineru-env:npu-v1.0}
-  #   container_name: mineru-api-2
-  #   restart: always
-  #   depends_on:
-  #     mineru-code-sync:
-  #       condition: service_completed_successfully
-  #   ports:
-  #     - "${API_2_PORT:-18001}:8000"
-  #   environment:
-  #     <<: *api-environment
-  #     MINERU_VL_SERVER: http://${VLM_2_IP}:${VLM_2_PORT}/v1
-  #     MINERU_VLM_SERVER_URL: http://${VLM_2_IP}:${VLM_2_PORT}/v1
-  #   volumes: *api-volumes
-  #   entrypoint: ["python", "-m"]
-  #   command: *api-command
-  #   healthcheck: *api-healthcheck
+  # 4 个节点都定义在同一份文件中；start-multi.sh 通过 MINERU_API_NODE_IDS
+  # 决定本机实际启动哪些节点，因此两台 API 主机可以复用该文件。
+  mineru-api-2:
+    image: ${MINERU_ENV_IMAGE:-mineru-env:npu-v1.0}
+    container_name: mineru-api-2
+    restart: always
+    labels:
+      com.mineru.role: api
+      com.mineru.api.index: "2"
+    depends_on:
+      mineru-code-sync:
+        condition: service_completed_successfully
+    ports:
+      - "${API_2_PORT:-6003}:8000"
+    environment:
+      <<: *api-environment
+      MINERU_VL_SERVER: "http://${VLM_2_IP:-127.0.0.1}:${VLM_2_PORT:-30000}/v1"
+      MINERU_VLM_SERVER_URL: "http://${VLM_2_IP:-127.0.0.1}:${VLM_2_PORT:-30000}/v1"
+    volumes: *api-volumes
+    entrypoint: ["python", "-m"]
+    command: *api-command
+    healthcheck: *api-healthcheck
 
-  # 当前只有一个 VLM，第三个 API 暂不启动。
-  # mineru-api-3:
-  #   image: ${MINERU_ENV_IMAGE:-mineru-env:npu-v1.0}
-  #   container_name: mineru-api-3
-  #   restart: always
-  #   depends_on:
-  #     mineru-code-sync:
-  #       condition: service_completed_successfully
-  #   ports:
-  #     - "${API_3_PORT:-18002}:8000"
-  #   environment:
-  #     <<: *api-environment
-  #     MINERU_VL_SERVER: http://${VLM_3_IP}:${VLM_3_PORT}/v1
-  #     MINERU_VLM_SERVER_URL: http://${VLM_3_IP}:${VLM_3_PORT}/v1
-  #   volumes: *api-volumes
-  #   entrypoint: ["python", "-m"]
-  #   command: *api-command
-  #   healthcheck: *api-healthcheck
+  mineru-api-3:
+    image: ${MINERU_ENV_IMAGE:-mineru-env:npu-v1.0}
+    container_name: mineru-api-3
+    restart: always
+    labels:
+      com.mineru.role: api
+      com.mineru.api.index: "3"
+    depends_on:
+      mineru-code-sync:
+        condition: service_completed_successfully
+    ports:
+      - "${API_3_PORT:-8001}:8000"
+    environment:
+      <<: *api-environment
+      MINERU_VL_SERVER: "http://${VLM_3_IP:-127.0.0.1}:${VLM_3_PORT:-30000}/v1"
+      MINERU_VLM_SERVER_URL: "http://${VLM_3_IP:-127.0.0.1}:${VLM_3_PORT:-30000}/v1"
+    volumes: *api-volumes
+    entrypoint: ["python", "-m"]
+    command: *api-command
+    healthcheck: *api-healthcheck
+
+  mineru-api-4:
+    image: ${MINERU_ENV_IMAGE:-mineru-env:npu-v1.0}
+    container_name: mineru-api-4
+    restart: always
+    labels:
+      com.mineru.role: api
+      com.mineru.api.index: "4"
+    depends_on:
+      mineru-code-sync:
+        condition: service_completed_successfully
+    ports:
+      - "${API_4_PORT:-8002}:8000"
+    environment:
+      <<: *api-environment
+      MINERU_VL_SERVER: "http://${VLM_4_IP:-127.0.0.1}:${VLM_4_PORT:-30000}/v1"
+      MINERU_VLM_SERVER_URL: "http://${VLM_4_IP:-127.0.0.1}:${VLM_4_PORT:-30000}/v1"
+    volumes: *api-volumes
+    entrypoint: ["python", "-m"]
+    command: *api-command
+    healthcheck: *api-healthcheck
 
   mineru-router:
     image: ${MINERU_ENV_IMAGE:-mineru-env:npu-v1.0}
@@ -124,13 +155,8 @@ services:
     labels:
       com.mineru.role: router
     depends_on:
-      mineru-api-1:
-        condition: service_healthy
-      # 增加 API 实例时，再取消对应依赖的注释。
-      # mineru-api-2:
-      #   condition: service_healthy
-      # mineru-api-3:
-      #   condition: service_healthy
+      mineru-code-sync:
+        condition: service_completed_successfully
     ports:
       - "${ROUTER_PORT:-8002}:8002"
     environment:
@@ -139,6 +165,7 @@ services:
       MINERU_VLM_PAGE_TIMEOUT_SECONDS: ${MINERU_VLM_PAGE_TIMEOUT_SECONDS:-600}
       # 外部调用未显式传连接重试次数时，由 Router 使用配置中心的值并转发给 API。
       MINERU_VLM_CONNECT_MAX_RETRIES: ${MINERU_VLM_CONNECT_MAX_RETRIES:-1}
+      MINERU_ROUTER_UPSTREAM_URLS_JSON: '${MINERU_ROUTER_UPSTREAM_URLS_JSON:-["http://mineru-api-1:8000"]}'
     volumes:
       - mineru-code:/app:ro
     entrypoint: ["python", "-m"]
@@ -151,13 +178,6 @@ services:
       - --local-gpus
       - none
       - --allow-public-http-client
-      - --upstream-url
-      - http://mineru-api-1:8000
-      # 增加 API 实例时，再取消对应 upstream 的注释。
-      # - --upstream-url
-      # - http://mineru-api-2:8000
-      # - --upstream-url
-      # - http://mineru-api-3:8000
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8002/health || exit 1"]
       interval: 30s
@@ -190,6 +210,10 @@ services:
       MINERU_OPS_ARTIFACT_RETENTION_DAYS: ${MINERU_OPS_ARTIFACT_RETENTION_DAYS:-7}
       MINERU_OPS_ARTIFACT_MAX_GB: ${MINERU_OPS_ARTIFACT_MAX_GB:-50}
       MINERU_OPS_SAVE_RESULT_IMAGES: ${MINERU_OPS_SAVE_RESULT_IMAGES:-true}
+      MINERU_OPS_BATCH_REAPER_INTERVAL_SECONDS: ${MINERU_OPS_BATCH_REAPER_INTERVAL_SECONDS:-30}
+      MINERU_OPS_BATCH_ORPHAN_GRACE_SECONDS: ${MINERU_OPS_BATCH_ORPHAN_GRACE_SECONDS:-120}
+      MINERU_OPS_BATCH_MAX_RUNTIME_SECONDS: ${MINERU_OPS_BATCH_MAX_RUNTIME_SECONDS:-86400}
+      MINERU_OPS_TASK_RETENTION_DAYS: ${MINERU_OPS_TASK_RETENTION_DAYS:-7}
       TMPDIR: /var/lib/mineru-ops/tmp
     volumes:
       - mineru-code:/app:ro

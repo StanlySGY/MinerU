@@ -53,6 +53,10 @@ TERMINAL_BATCH_STATES = {
 }
 ACTIVE_BATCH_STATES = {"pending", "running", "paused", "cancelling"}
 BATCH_PROCESS_TERMINATE_TIMEOUT_SECONDS = 5.0
+DEFAULT_BATCH_REAPER_INTERVAL_SECONDS = 30.0
+DEFAULT_BATCH_ORPHAN_GRACE_SECONDS = 120.0
+DEFAULT_BATCH_MAX_RUNTIME_SECONDS = 86400.0
+DEFAULT_TASK_RETENTION_DAYS = 7
 ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
 
@@ -507,6 +511,19 @@ class OpsStore:
                 for item in serialized
                 if existing.get(item[1]) != item[3]
             ]
+            preserved: list[tuple[dict[str, Any], str, str, str]] = []
+            for task, task_id, status, payload_json in changed:
+                previous = json_loads_object(existing.get(task_id)) if existing.get(task_id) else {}
+                if previous.get("source_batch_run_id") and not task.get("source_batch_run_id"):
+                    task = {
+                        **task,
+                        "source_batch_run_id": previous["source_batch_run_id"],
+                        "source": previous.get("source", "batch_history"),
+                        "preview_available": previous.get("preview_available", True),
+                    }
+                    payload_json = json.dumps(task, ensure_ascii=False)
+                preserved.append((task, task_id, status, payload_json))
+            changed = preserved
             if not changed:
                 return
             connection.executemany(
@@ -760,6 +777,56 @@ class OpsStore:
             ).fetchone()
         return json_loads_object(row["payload_json"]) if row else None
 
+    def delete_task_snapshots(self, task_ids: list[str] | set[str]) -> int:
+        normalized = list(dict.fromkeys(str(task_id).strip() for task_id in task_ids if str(task_id).strip()))
+        if not normalized:
+            return 0
+        with self.connect() as connection:
+            placeholders = ", ".join("?" for _ in normalized)
+            connection.execute(
+                f"DELETE FROM task_page_attempts WHERE task_id IN ({placeholders})",
+                normalized,
+            )
+            connection.execute(
+                f"DELETE FROM task_page_timings WHERE task_id IN ({placeholders})",
+                normalized,
+            )
+            cursor = connection.execute(
+                f"DELETE FROM task_snapshots WHERE task_id IN ({placeholders})",
+                normalized,
+            )
+        return cursor.rowcount
+
+    def delete_task_snapshots_for_batch(self, run_id: str) -> int:
+        task_ids = [
+            str(item.get("task_id"))
+            for item in self.cached_tasks(limit=10000)
+            if item.get("task_id") and str(item.get("source_batch_run_id")) == run_id
+        ]
+        return self.delete_task_snapshots(task_ids)
+
+    def cleanup_stale_task_snapshots(
+        self,
+        *,
+        keep_task_ids: set[str],
+        updated_before: str,
+    ) -> int:
+        with self.connect() as connection:
+            if keep_task_ids:
+                placeholders = ", ".join("?" for _ in keep_task_ids)
+                cursor = connection.execute(
+                    f"SELECT task_id FROM task_snapshots WHERE updated_at < ? "
+                    f"AND task_id NOT IN ({placeholders})",
+                    [updated_before, *sorted(keep_task_ids)],
+                )
+            else:
+                cursor = connection.execute(
+                    "SELECT task_id FROM task_snapshots WHERE updated_at < ?",
+                    (updated_before,),
+                )
+            task_ids = [str(row["task_id"]) for row in cursor.fetchall()]
+        return self.delete_task_snapshots(task_ids)
+
     def create_batch_run(
         self,
         run_id: str,
@@ -958,6 +1025,7 @@ class OpsRuntime:
         self.batch_task_sync_lock = asyncio.Lock()
         self.task_sync_lock = asyncio.Lock()
         self.task_sync_task: asyncio.Task[Any] | None = None
+        self.batch_reaper_task: asyncio.Task[Any] | None = None
         self.task_sync_interval_seconds = max(
             1.0,
             float(os.getenv("MINERU_OPS_TASK_SYNC_INTERVAL_SECONDS", "5")),
@@ -965,6 +1033,22 @@ class OpsRuntime:
         self.task_full_sync_interval_seconds = max(
             30.0,
             float(os.getenv("MINERU_OPS_TASK_FULL_SYNC_INTERVAL_SECONDS", "60")),
+        )
+        self.batch_reaper_interval_seconds = max(
+            5.0,
+            float(os.getenv("MINERU_OPS_BATCH_REAPER_INTERVAL_SECONDS", str(DEFAULT_BATCH_REAPER_INTERVAL_SECONDS))),
+        )
+        self.batch_orphan_grace_seconds = max(
+            self.batch_reaper_interval_seconds,
+            float(os.getenv("MINERU_OPS_BATCH_ORPHAN_GRACE_SECONDS", str(DEFAULT_BATCH_ORPHAN_GRACE_SECONDS))),
+        )
+        self.batch_max_runtime_seconds = max(
+            60.0,
+            float(os.getenv("MINERU_OPS_BATCH_MAX_RUNTIME_SECONDS", str(DEFAULT_BATCH_MAX_RUNTIME_SECONDS))),
+        )
+        self.task_retention_days = max(
+            1,
+            int(os.getenv("MINERU_OPS_TASK_RETENTION_DAYS", str(DEFAULT_TASK_RETENTION_DAYS))),
         )
         self.last_task_sync_monotonic = 0.0
         self.last_full_task_sync_monotonic = 0.0
@@ -1131,6 +1215,76 @@ class OpsRuntime:
                 self._task_sync_loop(),
                 name="mineru-ops-task-sync",
             )
+        if self.batch_reaper_task is None or self.batch_reaper_task.done():
+            self.batch_reaper_task = asyncio.create_task(
+                self._batch_reaper_loop(),
+                name="mineru-ops-batch-reaper",
+            )
+
+    async def _batch_reaper_loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self.batch_reaper_interval_seconds)
+                try:
+                    await self.reap_batch_runs()
+                    self.cleanup_expired_artifacts()
+                except Exception as exc:
+                    logger.warning("Ops batch reaper failed: {}", exc)
+        except asyncio.CancelledError:
+            raise
+
+    @staticmethod
+    def _record_age_seconds(record: dict[str, Any]) -> float:
+        value = record.get("started_at") or record.get("created_at")
+        if not value:
+            return 0.0
+        try:
+            timestamp = datetime.fromisoformat(str(value))
+        except ValueError:
+            return 0.0
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - timestamp).total_seconds())
+
+    async def reap_batch_runs(self) -> list[str]:
+        repaired: list[str] = []
+        for record in self.store.list_batch_runs(limit=10000):
+            run_id = str(record.get("run_id") or "")
+            if not run_id or str(record.get("status") or "") not in ACTIVE_BATCH_STATES:
+                continue
+            process = self.batch_processes.get(run_id)
+            task = self.batch_tasks.get(run_id)
+            age_seconds = self._record_age_seconds(record)
+            runner_active = (
+                (process is not None and process.returncode is None)
+                or (task is not None and not task.done())
+            )
+            if not runner_active:
+                if age_seconds < self.batch_orphan_grace_seconds:
+                    continue
+                self.store.update_batch_run(
+                    run_id,
+                    status="interrupted",
+                    completed_at=utc_now_iso(),
+                    error="批次记录处于活动状态，但控制台没有对应的运行进程",
+                )
+                repaired.append(run_id)
+                continue
+            if age_seconds < self.batch_max_runtime_seconds:
+                continue
+            self.batch_cancel_requested.add(run_id)
+            if process is not None and process.returncode is None:
+                await self._terminate_batch_process(run_id, process, resume_first=str(record.get("status")) == "paused")
+            if task is not None and task is not asyncio.current_task() and not task.done():
+                await self._wait_for_batch_task(run_id, task)
+            self.store.update_batch_run(
+                run_id,
+                status="interrupted",
+                completed_at=utc_now_iso(),
+                error=f"批次运行超过 {int(self.batch_max_runtime_seconds)} 秒，已由看门狗终止",
+            )
+            repaired.append(run_id)
+        return repaired
 
     async def _task_sync_loop(self) -> None:
         try:
@@ -1233,6 +1387,11 @@ class OpsRuntime:
             with suppress(asyncio.CancelledError):
                 await self.task_sync_task
             self.task_sync_task = None
+        if self.batch_reaper_task is not None:
+            self.batch_reaper_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self.batch_reaper_task
+            self.batch_reaper_task = None
         process_entries: list[tuple[str, asyncio.subprocess.Process, bool]] = []
         run_ids = set(self.batch_tasks) | set(self.batch_processes)
         for run_id in run_ids:
@@ -2637,6 +2796,7 @@ class OpsRuntime:
                 and now - self.last_full_task_sync_monotonic
                 >= self.task_full_sync_interval_seconds
             )
+            sync_complete = total <= len(items)
             if full_sync_due:
                 offset = len(items)
                 try:
@@ -2661,13 +2821,53 @@ class OpsRuntime:
                         offset += len(page_items)
                     if offset >= total:
                         self.last_full_task_sync_monotonic = now
+                        sync_complete = True
                 except Exception as exc:
                     logger.warning("Ops full task synchronization failed: {}", exc)
             elif total <= len(items):
                 self.last_full_task_sync_monotonic = now
+            if sync_complete:
+                cutoff = datetime.now(timezone.utc) - timedelta(days=self.task_retention_days)
+                self.store.cleanup_stale_task_snapshots(
+                    keep_task_ids={
+                        str(item.get("task_id"))
+                        for item in items
+                        if item.get("task_id")
+                    } | self.retained_preview_task_ids,
+                    updated_before=cutoff.isoformat(),
+                )
             self.last_task_sync_items = list(items)
             self.last_task_sync_monotonic = now
             return items
+
+    def cleanup_task_snapshots(self) -> int:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=self.task_retention_days)
+        batch_run_ids = {
+            str(record.get("run_id"))
+            for record in self.store.list_batch_runs(limit=10000)
+            if record.get("run_id")
+        }
+        retained_batch_task_ids = {
+            str(item.get("task_id"))
+            for item in self.store.cached_tasks(limit=10000)
+            if item.get("task_id") and str(item.get("source_batch_run_id")) in batch_run_ids
+        }
+        return self.store.cleanup_stale_task_snapshots(
+            keep_task_ids=self.retained_preview_task_ids | retained_batch_task_ids,
+            updated_before=cutoff.isoformat(),
+        )
+
+    def delete_task_snapshot(self, task_id: str) -> None:
+        task = self.store.cached_task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="task snapshot not found")
+        if task.get("source_batch_run_id"):
+            raise HTTPException(
+                status_code=409,
+                detail="该任务由批次记录保留，请删除对应批次记录后再清理",
+            )
+        if self.store.delete_task_snapshots([task_id]) == 0:
+            raise HTTPException(status_code=404, detail="task snapshot not found")
 
     def performance_experiment_record(
         self,
@@ -3905,7 +4105,15 @@ def create_app() -> FastAPI:
             if item.get("task_id")
         }
         for item in live_items:
-            merged[str(item["task_id"])] = item
+            task_id = str(item["task_id"])
+            cached = merged.get(task_id)
+            if cached and cached.get("source_batch_run_id") and not item.get("source_batch_run_id"):
+                item = {
+                    **item,
+                    "source_batch_run_id": cached["source_batch_run_id"],
+                    "source": cached.get("source", "batch_history"),
+                }
+            merged[task_id] = item
         items = list(merged.values())
         for item in items:
             item["preview_available"] = (
@@ -3929,6 +4137,7 @@ def create_app() -> FastAPI:
             "limit": normalized_limit,
             "offset": normalized_offset,
             "source": "cache" if live_error is not None else "live",
+            "retention_days": runtime.task_retention_days,
         }
         if live_error is not None:
             result["error"] = str(live_error)
@@ -3943,6 +4152,13 @@ def create_app() -> FastAPI:
             payload = response.json()
             if not isinstance(payload, dict):
                 raise ValueError("router task payload is not an object")
+            cached = runtime.store.cached_task(task_id)
+            if cached and cached.get("source_batch_run_id") and not payload.get("source_batch_run_id"):
+                payload = {
+                    **payload,
+                    "source_batch_run_id": cached["source_batch_run_id"],
+                    "source": cached.get("source", "batch_history"),
+                }
             runtime.store.upsert_tasks([payload])
             payload["source"] = "live"
             payload["preview_available"] = task_id in runtime.retained_preview_task_ids
@@ -3961,6 +4177,24 @@ def create_app() -> FastAPI:
             cached["cache_error"] = str(exc)
             cached["preview_available"] = task_id in runtime.retained_preview_task_ids
             return cached
+
+    @app.post("/api/tasks/cleanup")
+    async def cleanup_tasks(request: Request):
+        authorize(request, write=True)
+        deleted = runtime.cleanup_task_snapshots()
+        runtime.store.audit("task_cleanup", "expired-snapshots", True, str(deleted))
+        return {
+            "ok": True,
+            "deleted": deleted,
+            "retention_days": runtime.task_retention_days,
+        }
+
+    @app.delete("/api/tasks/{task_id}")
+    async def delete_task(task_id: str, request: Request):
+        authorize(request, write=True)
+        runtime.delete_task_snapshot(task_id)
+        runtime.store.audit("task_delete", task_id, True)
+        return {"ok": True, "task_id": task_id}
 
     @app.get("/api/tasks/{task_id}/page-timings")
     async def task_page_timings(
@@ -4139,6 +4373,7 @@ def create_app() -> FastAPI:
             try:
                 shutil.rmtree(runtime.run_dir_for_record(record), ignore_errors=False)
                 runtime.store.delete_batch_run(run_id)
+                runtime.store.delete_task_snapshots_for_batch(run_id)
                 runtime.store.audit("batch_delete", run_id, True)
                 deleted.append(run_id)
             except Exception as exc:
@@ -4387,6 +4622,7 @@ def create_app() -> FastAPI:
             run_dir = runtime.run_dir_for_record(record)
             shutil.rmtree(run_dir)
             runtime.store.delete_batch_run(run_id)
+            runtime.store.delete_task_snapshots_for_batch(run_id)
             runtime.store.audit("batch_delete", run_id, True)
             return {"ok": True, "run_id": run_id}
         else:

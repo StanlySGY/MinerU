@@ -115,6 +115,36 @@ def test_config_validate_normalizes_valid_values_and_rejects_invalid_candidates(
     }
 
 
+def test_router_upstream_config_is_validated_and_only_recreates_router(tmp_path: Path, monkeypatch) -> None:
+    agent = make_agent(tmp_path)
+    valid = agent.config_validate({
+        "MINERU_ROUTER_UPSTREAM_URLS_JSON": '["http://32.15.75.232:6002", "http://32.15.84.31:8001"]',
+    })
+    invalid = agent.config_validate({"MINERU_ROUTER_UPSTREAM_URLS_JSON": "not-json"})
+    monkeypatch.setattr(agent, "configured_services", lambda: {"mineru-api-1", "mineru-router"})
+
+    assert valid["valid"] is True
+    assert valid["values"]["MINERU_ROUTER_UPSTREAM_URLS_JSON"] == '["http://32.15.75.232:6002","http://32.15.84.31:8001"]'
+    assert invalid["valid"] is False
+    assert agent._affected_services(["MINERU_ROUTER_UPSTREAM_URLS_JSON"]) == (["mineru-router"], False)
+
+
+def test_shared_vlm_timeout_config_recreates_api_and_router(tmp_path: Path, monkeypatch) -> None:
+    agent = make_agent(tmp_path)
+    monkeypatch.setattr(
+        agent,
+        "configured_services",
+        lambda: {"mineru-api-1", "mineru-api-2", "mineru-router", "mineru-ops"},
+    )
+
+    services, requires_ops_restart = agent._affected_services(
+        ["MINERU_VLM_PAGE_TIMEOUT_SECONDS", "MINERU_VLM_CONNECT_MAX_RETRIES"]
+    )
+
+    assert services == ["mineru-api-1", "mineru-api-2", "mineru-router"]
+    assert requires_ops_restart is False
+
+
 def test_config_path_must_remain_inside_project_directory(tmp_path: Path) -> None:
     project_dir = tmp_path / "multi"
     project_dir.mkdir()

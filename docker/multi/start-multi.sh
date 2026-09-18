@@ -2,7 +2,8 @@
 # =============================================================================
 # MinerU 多实例部署脚本
 # =============================================================================
-# 当前架构：Router + 1 个 API；VLM 是已经独立启动的外部服务。
+# 当前架构：Router + 1 或多个 mineru-api-*；VLM 是已经独立启动的外部服务。
+# MINERU_DEPLOY_ROLE=router/api/all 可让两台主机复用同一份 Compose 文件。
 #
 # 使用方式：
 #   ./start-multi.sh import-images # 导入 images/ 下的离线镜像
@@ -97,6 +98,8 @@ load_env_defaults() {
     MINERU_OPS_PORT="${MINERU_OPS_PORT:-19000}"
     MINERU_OPS_TEST_HOST_PATH="${MINERU_OPS_TEST_HOST_PATH:-./test-pdfs}"
     MINERU_OPS_AUTH_TOKEN="${MINERU_OPS_AUTH_TOKEN:-}"
+    MINERU_DEPLOY_ROLE="${MINERU_DEPLOY_ROLE:-all}"
+    MINERU_API_NODE_IDS="${MINERU_API_NODE_IDS:-1}"
     resolve_compose_files
 }
 
@@ -197,12 +200,79 @@ stop_ops_agent() {
 }
 
 business_services() {
+    deployment_services | while IFS= read -r service; do
+        [ "$service" = "mineru-ops" ] || printf '%s\n' "$service"
+    done
+}
+
+# 返回 compose 中定义的 API 服务名（mineru-api、mineru-api-1 ... mineru-api-N）。
+# 用于 start/check 动态打印多节点地址，不再写死 API-1。
+api_services() {
     compose config --services | while IFS= read -r service; do
         case "$service" in
-            mineru-ops|mineru-code-sync|'') ;;
-            *) printf '%s\n' "$service" ;;
+            mineru-api|mineru-api-*) printf '%s\n' "$service" ;;
         esac
     done
+}
+
+selected_api_services() {
+    IFS=',' read -r -a node_ids <<< "$MINERU_API_NODE_IDS"
+    for node_id in "${node_ids[@]}"; do
+        node_id="${node_id//[[:space:]]/}"
+        [ -n "$node_id" ] || continue
+        service="mineru-api-${node_id}"
+        if api_services | grep -Fxq "$service"; then
+            printf '%s\n' "$service"
+        else
+            echo "错误：MINERU_API_NODE_IDS 包含未定义服务 $service。" >&2
+            return 1
+        fi
+    done
+}
+
+deployment_services() {
+    case "$MINERU_DEPLOY_ROLE" in
+        router)
+            printf '%s\n' mineru-code-sync mineru-router mineru-ops
+            ;;
+        api)
+            printf '%s\n' mineru-code-sync
+            selected_api_services
+            ;;
+        all)
+            printf '%s\n' mineru-code-sync
+            selected_api_services
+            printf '%s\n' mineru-router mineru-ops
+            ;;
+        *)
+            echo "错误：MINERU_DEPLOY_ROLE 只支持 router、api 或 all，当前为 $MINERU_DEPLOY_ROLE。" >&2
+            return 1
+            ;;
+    esac
+}
+
+# 解析 env.multi 中所有 VLM_<N>_IP 配置，输出 "N IP PORT" 列表。
+# 用于 check/start 对每个 VLM 分别做连通性检查和地址打印。
+enumerate_vlms() {
+    awk -F= '
+        /^[[:space:]]*VLM_[0-9]+_IP=/ {
+            k=$1; sub(/^VLM_/, "", k); sub(/_IP$/, "", k);
+            ip=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", ip); gsub(/^"|"$/, "", ip);
+            ips[k]=ip
+        }
+        /^[[:space:]]*VLM_[0-9]+_PORT=/ {
+            k=$1; sub(/^VLM_/, "", k); sub(/_PORT$/, "", k);
+            port=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", port); gsub(/^"|"$/, "", port);
+            ports[k]=port
+        }
+        END {
+            for (n in ips) {
+                if (ips[n] == "") continue
+                p = (n in ports) ? ports[n] : 30000
+                printf "%s %s %s\n", n, ips[n], p
+            }
+        }
+    ' "$ENV_FILE" | sort -n -k1,1
 }
 
 prepare_ops() {
@@ -264,17 +334,26 @@ check_npu_host_paths() {
         return
     fi
 
-    for path in \
-        "/dev/davinci${PIPELINE_NPU_ID}" \
-        /dev/davinci_manager \
-        /dev/devmm_svm \
-        /dev/hisi_hdc \
-        /usr/local/Ascend/driver \
-        /usr/local/Ascend/add-ons
-    do
+    npu_ids=()
+    while IFS= read -r service; do
+        case "$service" in
+            mineru-api-1) npu_ids+=("${PIPELINE_NPU_ID:-6}") ;;
+            mineru-api-2) npu_ids+=("${PIPELINE_2_NPU_ID:-7}") ;;
+            mineru-api-3) npu_ids+=("${PIPELINE_3_NPU_ID:-6}") ;;
+            mineru-api-4) npu_ids+=("${PIPELINE_4_NPU_ID:-7}") ;;
+        esac
+    done < <(selected_api_services)
+    for npu_id in "${npu_ids[@]}"; do
+        path="/dev/davinci${npu_id}"
         if [ ! -e "$path" ]; then
             echo "错误：NPU 手工映射所需路径不存在：$path" >&2
             echo "如果这台主机没有 Ascend NPU，请在 env.multi 中改为 MINERU_DEVICE_MODE=cpu。" >&2
+            exit 1
+        fi
+    done
+    for path in /dev/davinci_manager /dev/devmm_svm /dev/hisi_hdc /usr/local/Ascend/driver /usr/local/Ascend/add-ons; do
+        if [ ! -e "$path" ]; then
+            echo "错误：NPU 手工映射所需路径不存在：$path" >&2
             exit 1
         fi
     done
@@ -320,21 +399,25 @@ check_cpu_image() {
 check() {
     load_env
     echo "设备模式：$MINERU_DEVICE_MODE；Compose 文件：${COMPOSE_FILES[*]}"
-    check_pipeline_files
-    check_npu_host_paths
+    if [ "$MINERU_DEPLOY_ROLE" != "router" ]; then
+        check_pipeline_files
+        check_npu_host_paths
+    fi
     case "$MINERU_API_OUTPUT_ROOT" in
         /app|/app/*)
             echo "错误：MINERU_API_OUTPUT_ROOT 不能位于只读的 /app 目录，请使用 /var/lib/mineru/output。" >&2
             exit 1
             ;;
     esac
-    case "$VLM_1_IP" in
-        127.0.0.1|localhost)
-            echo "错误：VLM_1_IP 不能填写 $VLM_1_IP；容器中的该地址指向 API 容器自身。" >&2
-            echo "请让 VLM 监听 0.0.0.0，并填写 VLM 主机的实际 IP。" >&2
-            exit 1
-            ;;
-    esac
+    while read -r vlm_num vlm_ip vlm_port; do
+        case "$vlm_ip" in
+            127.0.0.1|localhost)
+                echo "错误：VLM_${vlm_num}_IP 不能填写 $vlm_ip；容器中的该地址指向 API 容器自身。" >&2
+                echo "请让 VLM 监听 0.0.0.0，并填写 VLM 主机的实际 IP。" >&2
+                exit 1
+                ;;
+        esac
+    done < <(enumerate_vlms)
     echo "检查 Compose 配置..."
     compose config >/dev/null
     if [ ! -f ./mineru-ops-agent.py ] || [ ! -f ./batch-router-diagnose.py ]; then
@@ -354,24 +437,31 @@ check() {
         echo "错误：本地没有 $MINERU_CODE_IMAGE，请先导入 mineru-code-*.tar.gz，或修改 env.multi 标签。" >&2
         exit 1
     }
-    check_cpu_image
-    check_npu_image
-    pipeline_model_abs=$(absolute_existing_path "$PIPELINE_MODEL_HOST_PATH")
-    pipeline_config_abs=$(absolute_existing_path "$PIPELINE_CONFIG_HOST_PATH")
-    echo "从临时容器检查 Pipeline 配置和模型挂载..."
-    docker run --rm --entrypoint python \
-        -v "$pipeline_model_abs:/models/pipeline:ro" \
-        -v "$pipeline_config_abs:/etc/mineru/mineru.json:ro" \
-        "$MINERU_ENV_IMAGE" -c \
-        'import json, os; p="/etc/mineru/mineru.json"; c=json.load(open(p, encoding="utf-8")); assert c.get("models-dir", {}).get("pipeline") == "/models/pipeline", "models-dir.pipeline 必须是 /models/pipeline"; required=["models/Layout/PP-DocLayoutV2", "models/MFR/unimernet_hf_small_2503", "models/MFR/pp_formulanet_plus_m", "models/OCR/paddleocr_torch", "models/TabRec/SlanetPlus/slanet-plus.onnx", "models/TabRec/UnetStructure/unet.onnx", "models/TabCls/paddle_table_cls/PP-LCNet_x1_0_table_cls.onnx"]; missing=[x for x in required if not os.path.exists(os.path.join("/models/pipeline", x))]; assert not missing, "容器内缺少模型（可能是外部符号链接）：" + ", ".join(missing)'
-    if [ -z "$VLM_1_IP" ]; then
-        echo "提示：env.multi 中没有填写 VLM_1_IP，跳过外部 VLM 检查。"
-        echo "      此时只能使用 backend=pipeline；hybrid/vlm 系列后端不可用。"
+    if [ "$MINERU_DEPLOY_ROLE" != "router" ]; then
+        check_cpu_image
+        check_npu_image
+        pipeline_model_abs=$(absolute_existing_path "$PIPELINE_MODEL_HOST_PATH")
+        pipeline_config_abs=$(absolute_existing_path "$PIPELINE_CONFIG_HOST_PATH")
+        echo "从临时容器检查 Pipeline 配置和模型挂载..."
+        docker run --rm --entrypoint python \
+            -v "$pipeline_model_abs:/models/pipeline:ro" \
+            -v "$pipeline_config_abs:/etc/mineru/mineru.json:ro" \
+            "$MINERU_ENV_IMAGE" -c \
+            'import json, os; p="/etc/mineru/mineru.json"; c=json.load(open(p, encoding="utf-8")); assert c.get("models-dir", {}).get("pipeline") == "/models/pipeline", "models-dir.pipeline 必须是 /models/pipeline"; required=["models/Layout/PP-DocLayoutV2", "models/MFR/unimernet_hf_small_2503", "models/MFR/pp_formulanet_plus_m", "models/OCR/paddleocr_torch", "models/TabRec/SlanetPlus/slanet-plus.onnx", "models/TabRec/UnetStructure/unet.onnx", "models/TabCls/paddle_table_cls/PP-LCNet_x1_0_table_cls.onnx"]; missing=[x for x in required if not os.path.exists(os.path.join("/models/pipeline", x))]; assert not missing, "容器内缺少模型（可能是外部符号链接）：" + ", ".join(missing)'
+        vlm_count=0
+        while read -r vlm_num vlm_ip vlm_port; do
+            vlm_count=$((vlm_count + 1))
+            echo "从临时容器检查 VLM-$vlm_num：http://${vlm_ip}:${vlm_port}/v1/models"
+            docker run --rm --entrypoint curl "$MINERU_ENV_IMAGE" \
+                --fail --silent --show-error --connect-timeout 5 --max-time 15 \
+                "http://${vlm_ip}:${vlm_port}/v1/models" >/dev/null
+        done < <(enumerate_vlms)
+        if [ "$vlm_count" -eq 0 ]; then
+            echo "提示：env.multi 中没有填写任何 VLM_<N>_IP，跳过外部 VLM 检查。"
+            echo "      此时只能使用 backend=pipeline；hybrid/vlm 系列后端不可用。"
+        fi
     else
-        echo "从临时容器检查 VLM：http://${VLM_1_IP}:${VLM_1_PORT}/v1/models"
-        docker run --rm --entrypoint curl "$MINERU_ENV_IMAGE" \
-            --fail --silent --show-error --connect-timeout 5 --max-time 15 \
-            "http://${VLM_1_IP}:${VLM_1_PORT}/v1/models" >/dev/null
+        echo "Router 角色：跳过本地 Pipeline/NPU/VLM 检查。"
     fi
     echo "检查通过。"
 }
@@ -420,10 +510,11 @@ case "${1:-help}" in
         ;;
 
     start)
-        echo "启动服务（Router + API-1 + Ops；VLM 为外部服务）..."
+        echo "启动服务（角色：$MINERU_DEPLOY_ROLE；API 节点：$MINERU_API_NODE_IDS）..."
         check
         prepare_ops
-        compose up -d
+        mapfile -t services_to_start < <(deployment_services)
+        compose up -d "${services_to_start[@]}"
         echo ""
         echo "等待服务就绪..."
         sleep 10
@@ -439,10 +530,29 @@ case "${1:-help}" in
         echo "运维控制台:   http://${HOST_IP}:${MINERU_OPS_PORT}"
         echo ""
         echo "API 服务地址："
-        echo "  API-1: http://${HOST_IP}:${API_1_PORT}/docs"
-        if [ -n "$VLM_1_IP" ]; then
-            echo "VLM 地址：${VLM_1_IP}:${VLM_1_PORT}（由你单独部署）"
-        else
+        api_listed=0
+        while IFS= read -r service; do
+            case "$service" in
+                mineru-api|mineru-api-*)
+                    api_num="${service#mineru-api}"
+                    api_num="${api_num#-}"
+                    api_port_var="API_${api_num}_PORT"
+                    [ "$api_num" = "" ] && api_port_var="API_1_PORT"
+                    api_port="${!api_port_var:-18000}"
+                    echo "  $service: http://${HOST_IP}:${api_port}/docs"
+                    api_listed=1
+                    ;;
+            esac
+        done < <(api_services)
+        if [ "$api_listed" -eq 0 ]; then
+            echo "  （compose 中未定义 mineru-api 服务）"
+        fi
+        vlm_count=0
+        while read -r vlm_num vlm_ip vlm_port; do
+            echo "VLM-$vlm_num 地址：${vlm_ip}:${vlm_port}（由你单独部署）"
+            vlm_count=$((vlm_count + 1))
+        done < <(enumerate_vlms)
+        if [ "$vlm_count" -eq 0 ]; then
             echo "VLM 地址：未配置（只能使用 backend=pipeline）"
         fi
         ;;
@@ -530,16 +640,16 @@ case "${1:-help}" in
         ;;
 
     help|-h|--help)
-        echo "MinerU 单 VLM + 单 API + Router 部署脚本"
+        echo "MinerU 多 API + Router + Ops 部署脚本"
         echo ""
         echo "使用：$0 {import-images|check|start|stop|stop-all|restart|ops|status|logs|test}"
         echo ""
         echo "  check  - 检查配置、镜像和 VLM 连通性"
         echo "  import-images - 从 images/ 导入两个离线镜像归档"
-        echo "  start  - 启动 Router + API-1 + Ops"
-        echo "  stop   - 停止 Router + API-1，保留 Ops"
+        echo "  start  - 按 MINERU_DEPLOY_ROLE 启动 Router/API/Ops"
+        echo "  stop   - 停止当前角色的业务服务，保留 Ops"
         echo "  stop-all - 停止包括 Ops 在内的全部服务"
-        echo "  restart - 重启 Router + API-1，保留 Ops"
+        echo "  restart - 重启当前角色的业务服务，保留 Ops"
         echo "  ops    - 单独启动或更新 Ops"
         echo "  status - 查看服务状态"
         echo "  logs   - 查看服务日志"
@@ -558,8 +668,8 @@ case "${1:-help}" in
         echo "  cuda - NVIDIA GPU 主机，叠加 compose-multi.nvidia.yaml"
         echo ""
         echo "架构："
-        echo "  Pipeline: Router (:8002) → API-1 (:18000) → 本地 Pipeline 模型"
-        echo "  Hybrid:   Router (:8002) → API-1 (:18000) → 本地模型 + 外部 VLM (:30000)"
+        echo "  Router 角色：Router (:8002) → env.multi 中的远程 API 节点"
+        echo "  API 角色：按 MINERU_API_NODE_IDS 启动对应 API_N_PORT"
         ;;
 
     *)

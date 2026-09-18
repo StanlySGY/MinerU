@@ -673,6 +673,8 @@ async function loadTasks() {
     state.tasksError = null;
     const data = await api(`/api/tasks?limit=200${status ? `&status=${encodeURIComponent(status)}` : ""}`);
     state.tasks = data.items || [];
+    const retention = document.getElementById("tasks-retention");
+    if (retention) retention.textContent = `缓存保留 ${data.retention_days || 7} 天`;
     renderTasks();
     if (data.source === "cache") notice(`Router 暂不可用，当前显示缓存：${data.error}`);
   } catch (error) {
@@ -873,10 +875,13 @@ function renderTaskDetailBody(task, timingPayload, taskId) {
     ? `<button type="button" class="primary-button" data-task-preview="${esc(task.task_id)}">预览结果</button>`
     : (taskFinished ? `<span class="task-preview-unavailable" title="该任务没有保留原始 PDF 或提取产物">未保留预览产物</span>` : "");
   const reportActions = `<button type="button" class="secondary-button" data-task-report="markdown">导出 Markdown 报告</button><button type="button" class="secondary-button" data-task-report="csv">导出 CSV</button>`;
+  const cacheAction = task.source_batch_run_id
+    ? ""
+    : `<button type="button" class="danger-button" data-task-delete="${esc(task.task_id)}" title="只删除控制台缓存，不影响远程任务">删除缓存</button>`;
   const elapsed = formatElapsed(task.started_at || task.created_at, task.completed_at);
   const fileSections = (p.files || []).map(file => `<section class="task-file-pages"><div class="task-file-heading"><strong>${esc(file.file_name)}</strong><span>${(file.pages || []).length} 页</span></div><div class="page-list">${(file.pages || []).map(page => `<span class="page-chip ${esc(page.status || "queued")}" title="${esc(pageTitle(page, file.file_name))}">${page.page_number}</span>`).join("")}</div></section>`).join("");
   const problemPages = pages.filter(page => page.status === "skipped" || page.status === "failed");
-  document.getElementById("task-detail").innerHTML = `<div class="task-detail-header"><div><h2>${esc((task.file_names || []).join(", "))}</h2><div class="mono muted">${esc(task.task_id)}</div></div><div class="task-detail-actions">${badge(task.partial_success ? "partial_success" : task.status)}${previewAction}${reportActions}</div></div><div class="task-live-position ${current.kind}"><span class="live-indicator"></span><div><small>当前处理位置</small><strong>${esc(current.title)}</strong><p>${esc(current.detail)}</p></div><time>${esc(formatDate(p.updated_at))}</time></div><div class="task-progress-row"><div class="progress"><span style="width:${percent}%"></span></div><strong>${percent}%</strong></div><div class="task-stat-grid"><div><span>总页数</span><strong>${p.total_pages || 0}</strong></div><div><span>已完成</span><strong>${p.completed_pages || 0}</strong></div><div><span>处理中</span><strong>${p.processing_pages || 0}</strong></div><div><span>等待中</span><strong>${p.queued_pages || 0}</strong></div><div><span>已跳过</span><strong>${p.skipped_pages || 0}</strong></div><div><span>失败</span><strong>${p.failed_pages || 0}</strong></div></div><div class="task-meta-line"><span>阶段：<strong>${esc(phaseText[p.phase] || p.phase || "-")}</strong></span><span>后端：<strong>${esc(task.backend || "-")}</strong></span><span>耗时：<strong class="task-elapsed">${esc(elapsed)}</strong></span>${task.error ? `<span class="bad-text">任务错误：${esc(task.error)}</span>` : ""}</div><div class="task-pages-heading"><h3>页面状态</h3><span>${pages.length} 个页面事件</span></div>${pageLegend()}<div id="task-page-grid" class="task-file-page-list">${fileSections || `<div class="empty-state">尚未收到页级进度，任务启动后会自动显示</div>`}</div>${renderPageTimingTable(timingPayload, taskId)}${problemPages.length ? `<div class="task-problem-list"><h3>跳过和失败页面</h3>${problemPages.map(page => `<div class="task-problem-row"><strong>${esc(page.file_name)} 第 ${page.page_number} 页</strong>${badge(page.status)}<span>${esc(page.error_type || "")}</span><p>${esc(page.error || "未返回错误详情")}</p></div>`).join("")}</div>` : ""}`;
+  document.getElementById("task-detail").innerHTML = `<div class="task-detail-header"><div><h2>${esc((task.file_names || []).join(", "))}</h2><div class="mono muted">${esc(task.task_id)}</div></div><div class="task-detail-actions">${badge(task.partial_success ? "partial_success" : task.status)}${previewAction}${reportActions}${cacheAction}</div></div><div class="task-live-position ${current.kind}"><span class="live-indicator"></span><div><small>当前处理位置</small><strong>${esc(current.title)}</strong><p>${esc(current.detail)}</p></div><time>${esc(formatDate(p.updated_at))}</time></div><div class="task-progress-row"><div class="progress"><span style="width:${percent}%"></span></div><strong>${percent}%</strong></div><div class="task-stat-grid"><div><span>总页数</span><strong>${p.total_pages || 0}</strong></div><div><span>已完成</span><strong>${p.completed_pages || 0}</strong></div><div><span>处理中</span><strong>${p.processing_pages || 0}</strong></div><div><span>等待中</span><strong>${p.queued_pages || 0}</strong></div><div><span>已跳过</span><strong>${p.skipped_pages || 0}</strong></div><div><span>失败</span><strong>${p.failed_pages || 0}</strong></div></div><div class="task-meta-line"><span>阶段：<strong>${esc(phaseText[p.phase] || p.phase || "-")}</strong></span><span>后端：<strong>${esc(task.backend || "-")}</strong></span><span>耗时：<strong class="task-elapsed">${esc(elapsed)}</strong></span>${task.error ? `<span class="bad-text">任务错误：${esc(task.error)}</span>` : ""}</div><div class="task-pages-heading"><h3>页面状态</h3><span>${pages.length} 个页面事件</span></div>${pageLegend()}<div id="task-page-grid" class="task-file-page-list">${fileSections || `<div class="empty-state">尚未收到页级进度，任务启动后会自动显示</div>`}</div>${renderPageTimingTable(timingPayload, taskId)}${problemPages.length ? `<div class="task-problem-list"><h3>跳过和失败页面</h3>${problemPages.map(page => `<div class="task-problem-row"><strong>${esc(page.file_name)} 第 ${page.page_number} 页</strong>${badge(page.status)}<span>${esc(page.error_type || "")}</span><p>${esc(page.error || "未返回错误详情")}</p></div>`).join("")}</div>` : ""}`;
 }
 
 /* ─────────────────────────── SSE 实时单任务更新 ─────────────────────────── */
@@ -930,6 +935,19 @@ document.getElementById("task-detail").addEventListener("click", event => {
 });
 
 document.getElementById("task-detail").addEventListener("click", async event => {
+  const button = event.target.closest("[data-task-delete]");
+  if (!button || !confirm("确认删除这个任务的控制台缓存？不会取消远程任务。")) return;
+  try {
+    await api(`/api/tasks/${encodeURIComponent(button.dataset.taskDelete)}`, {method: "DELETE"});
+    notice("任务缓存已删除", false);
+    state.activeTaskId = null;
+    closeTaskEventSource();
+    await loadTasks();
+    document.getElementById("task-detail").innerHTML = `<div class="empty-state">选择一个任务</div>`;
+  } catch (error) { notice(error.message); }
+});
+
+document.getElementById("task-detail").addEventListener("click", async event => {
   const button = event.target.closest("[data-task-report]");
   if (!button || !state.activeTaskId) return;
   const format = button.dataset.taskReport;
@@ -979,6 +997,15 @@ async function refreshTasksView() {
     state.taskRefreshLoading = false;
   }
 }
+
+document.getElementById("tasks-cleanup").addEventListener("click", async () => {
+  if (!confirm("确认清理超过保留期的任务缓存？不会影响仍保留的批次记录。")) return;
+  try {
+    const result = await api("/api/tasks/cleanup", {method: "POST"});
+    notice(`已清理 ${result.deleted || 0} 条任务缓存`, false);
+    await loadTasks();
+  } catch (error) { notice(error.message); }
+});
 
 function batchActions(run) {
   const runId = esc(run.run_id);

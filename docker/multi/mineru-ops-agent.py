@@ -55,6 +55,14 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
         "editable": True,
     },
     {
+        "key": "MINERU_ROUTER_UPSTREAM_URLS_JSON",
+        "category": "Router 节点",
+        "description": "Router 后端 API 节点列表（JSON 数组）。",
+        "help": "填写已部署且可从 Router 主机访问的 MinerU API 地址，例如 [\"http://32.15.75.232:6002\", \"http://32.15.84.31:8001\"]。保存后只重建 Router；远程主机上的 API 容器需要先单独启动。",
+        "type": "string",
+        "editable": True,
+    },
+    {
         "key": "MINERU_PROCESSING_WINDOW_SIZE",
         "category": "API 并发",
         "description": "API 处理窗口大小，影响同时保留的任务数。",
@@ -219,6 +227,10 @@ API_CONTAINER_ENV_KEYS = {
 ROUTER_CONTAINER_ENV_KEYS = {
     "MINERU_VLM_PAGE_TIMEOUT_SECONDS",
     "MINERU_VLM_CONNECT_MAX_RETRIES",
+    "MINERU_ROUTER_UPSTREAM_URLS_JSON",
+}
+ROUTER_ONLY_CONFIG_KEYS = {
+    "MINERU_ROUTER_UPSTREAM_URLS_JSON",
 }
 OPS_CONTAINER_ENV_KEYS = {
     "MINERU_OPS_AUTH_TOKEN",
@@ -560,11 +572,11 @@ class Agent:
 
     def configured_services(self) -> set[str]:
         result = run_command(
-            self.compose_command("config", "--services"),
+            self.compose_command("ps", "--services"),
             self.project_dir,
             timeout=30,
         )
-        if not result["ok"]:
+        if not result["ok"] or not result.get("output", "").strip():
             return set()
         return {line.strip() for line in result["output"].splitlines() if line.strip()}
 
@@ -674,6 +686,26 @@ class Agent:
                 errors[raw_key] = "该配置不在可编辑白名单中"
                 continue
             value = raw_value.strip()
+            if raw_key == "MINERU_ROUTER_UPSTREAM_URLS_JSON":
+                try:
+                    upstreams = json.loads(value)
+                except json.JSONDecodeError:
+                    errors[raw_key] = "必须是 JSON 字符串数组"
+                    continue
+                if (
+                    not isinstance(upstreams, list)
+                    or not upstreams
+                    or not all(
+                        isinstance(item, str)
+                        and item.startswith(("http://", "https://"))
+                        and "\n" not in item
+                        and "\r" not in item
+                        for item in upstreams
+                    )
+                ):
+                    errors[raw_key] = "必须是至少一个 http:// 或 https:// 地址组成的 JSON 数组"
+                    continue
+                value = json.dumps(list(dict.fromkeys(upstreams)), ensure_ascii=False, separators=(",", ":"))
             if schema["type"] == "integer":
                 try:
                     number = int(value)
@@ -722,15 +754,18 @@ class Agent:
 
     def _affected_services(self, keys: list[str]) -> tuple[list[str], bool]:
         requires_ops_restart = any(key.startswith("MINERU_OPS_") for key in keys)
-        api_keys_changed = any(not key.startswith("MINERU_OPS_") for key in keys)
-        if not api_keys_changed:
-            return [], requires_ops_restart
-        services = sorted(
-            service for service in self.configured_services()
-            if service == "mineru-api"
-            or service.startswith("mineru-api-")
-            or service == "mineru-router"
+        router_only_keys = ROUTER_ONLY_CONFIG_KEYS
+        api_keys_changed = any(
+            not key.startswith("MINERU_OPS_") and key not in router_only_keys
+            for key in keys
         )
+        router_keys_changed = any(key in router_only_keys for key in keys)
+        if not api_keys_changed and not router_keys_changed:
+            return [], requires_ops_restart
+        services = sorted(service for service in self.configured_services() if (
+            service == "mineru-router"
+            or (api_keys_changed and (service == "mineru-api" or service.startswith("mineru-api-")))
+        ))
         return services, requires_ops_restart
 
     @staticmethod

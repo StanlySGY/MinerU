@@ -93,6 +93,76 @@ def test_ops_store_persists_task_snapshots(tmp_path: Path):
     assert store.cached_tasks() == [payload]
 
 
+def test_ops_store_task_delete_cascades_page_details(tmp_path: Path):
+    store = OpsStore(tmp_path / "ops.db")
+    payload = {
+        "task_id": "stale-task",
+        "status": "failed",
+        "progress": {"files": [{"file_name": "a.pdf", "pages": [{"page_idx": 0, "page_number": 1, "status": "failed"}]}]},
+    }
+    store.upsert_tasks([payload])
+
+    assert store.delete_task_snapshots(["stale-task"]) == 1
+    assert store.cached_task("stale-task") is None
+    with store.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM task_page_timings WHERE task_id = ?", ("stale-task",)).fetchone()[0] == 0
+
+
+def test_ops_store_preserves_batch_source_when_live_snapshot_updates(tmp_path: Path):
+    store = OpsStore(tmp_path / "ops.db")
+    store.upsert_tasks([{"task_id": "batch-task", "status": "processing", "source_batch_run_id": "run-1"}])
+    store.upsert_tasks([{"task_id": "batch-task", "status": "completed"}])
+
+    assert store.cached_task("batch-task")["source_batch_run_id"] == "run-1"
+    assert store.cached_task("batch-task")["status"] == "completed"
+
+
+def test_ops_store_deletes_all_snapshots_for_batch(tmp_path: Path):
+    store = OpsStore(tmp_path / "ops.db")
+    store.upsert_tasks([
+        {"task_id": "batch-a", "status": "completed", "source_batch_run_id": "run-1"},
+        {"task_id": "batch-b", "status": "failed", "source_batch_run_id": "run-1"},
+        {"task_id": "other", "status": "completed", "source_batch_run_id": "run-2"},
+    ])
+
+    assert store.delete_task_snapshots_for_batch("run-1") == 2
+    assert store.cached_task("batch-a") is None
+    assert store.cached_task("batch-b") is None
+    assert store.cached_task("other") is not None
+
+
+def test_ops_store_cleanup_keeps_explicitly_retained_tasks(tmp_path: Path):
+    store = OpsStore(tmp_path / "ops.db")
+    store.upsert_tasks([
+        {"task_id": "old-task", "status": "failed"},
+        {"task_id": "kept-task", "status": "failed"},
+    ])
+    with store.connect() as connection:
+        connection.execute("UPDATE task_snapshots SET updated_at = ?", ("2020-01-01T00:00:00+00:00",))
+
+    assert store.cleanup_stale_task_snapshots(
+        keep_task_ids={"kept-task"},
+        updated_before="2021-01-01T00:00:00+00:00",
+    ) == 1
+    assert store.cached_task("old-task") is None
+    assert store.cached_task("kept-task") is not None
+
+
+def test_batch_reaper_marks_orphaned_active_record_interrupted(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path / "data"))
+    runtime = OpsRuntime()
+    runtime.batch_orphan_grace_seconds = 0
+    _create_batch_record(runtime, tmp_path, "orphan-run", "running")
+
+    repaired = asyncio.run(runtime.reap_batch_runs())
+
+    assert repaired == ["orphan-run"]
+    record = runtime.store.get_batch_run("orphan-run")
+    assert record["status"] == "interrupted"
+    assert "没有对应的运行进程" in record["error"]
+    asyncio.run(runtime.close())
+
+
 def test_ops_store_lists_audit_logs(tmp_path: Path):
     store = OpsStore(tmp_path / "ops.db")
     store.audit("first", "target-a", True, "{}")
@@ -1415,6 +1485,8 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "/api/tasks/{task_id}/preview/pages/{page_number}" in paths
     assert "/api/batch-runs" in paths
     assert "/api/batch-runs/bulk-delete" in paths
+    assert "/api/tasks/cleanup" in paths
+    assert "/api/tasks/{task_id}" in paths
     assert "/api/batch-runs/upload" in paths
     assert "/api/batch-runs/{run_id}/retry-problem-pages" in paths
     assert "/api/config" in paths

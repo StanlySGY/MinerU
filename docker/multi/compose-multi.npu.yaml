@@ -20,15 +20,38 @@ services:
       - /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro
       - /usr/local/Ascend/add-ons:/usr/local/Ascend/add-ons:ro
 
-  # 启用 API-2/API-3 时，在这里同样补上设备映射和驱动挂载。
-  # mineru-api-2:
-  #   devices:
-  #     - "/dev/davinci${PIPELINE_2_NPU_ID:-7}:/dev/davinci${PIPELINE_2_NPU_ID:-7}"
-  #     - /dev/davinci_manager:/dev/davinci_manager
-  #     - /dev/devmm_svm:/dev/devmm_svm
-  #     - /dev/hisi_hdc:/dev/hisi_hdc
-  #   environment:
-  #     ASCEND_RT_VISIBLE_DEVICES: "${PIPELINE_2_NPU_ID:-7}"
-  #   volumes:
-  #     - /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro
-  #     - /usr/local/Ascend/add-ons:/usr/local/Ascend/add-ons:ro
+  mineru-api-2:
+    devices:
+      - "/dev/davinci${PIPELINE_2_NPU_ID:-7}:/dev/davinci${PIPELINE_2_NPU_ID:-7}"
+      - /dev/davinci_manager:/dev/davinci_manager
+      - /dev/devmm_svm:/dev/devmm_svm
+      - /dev/hisi_hdc:/dev/hisi_hdc
+    environment:
+      ASCEND_RT_VISIBLE_DEVICES: "${PIPELINE_2_NPU_ID:-7}"
+    volumes:
+      - /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro
+      - /usr/local/Ascend/add-ons:/usr/local/Ascend/add-ons:ro
+
+  mineru-api-3:
+    devices:
+      - "/dev/davinci${PIPELINE_3_NPU_ID:-6}:/dev/davinci${PIPELINE_3_NPU_ID:-6}"
+      - /dev/davinci_manager:/dev/davinci_manager
+      - /dev/devmm_svm:/dev/devmm_svm
+      - /dev/hisi_hdc:/dev/hisi_hdc
+    environment:
+      ASCEND_RT_VISIBLE_DEVICES: "${PIPELINE_3_NPU_ID:-6}"
+    volumes:
+      - /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro
+      - /usr/local/Ascend/add-ons:/usr/local/Ascend/add-ons:ro
+
+  mineru-api-4:
+    devices:
+      - "/dev/davinci${PIPELINE_4_NPU_ID:-7}:/dev/davinci${PIPELINE_4_NPU_ID:-7}"
+      - /dev/davinci_manager:/dev/davinci_manager
+      - /dev/devmm_svm:/dev/devmm_svm
+      - /dev/hisi_hdc:/dev/hisi_hdc
+    environment:
+      ASCEND_RT_VISIBLE_DEVICES: "${PIPELINE_4_NPU_ID:-7}"
+    volumes:
+      - /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro
+      - /usr/local/Ascend/add-ons:/usr/local/Ascend/add-ons:ro
