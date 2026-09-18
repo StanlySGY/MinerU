@@ -357,6 +357,37 @@ check_npu_host_paths() {
             exit 1
         fi
     done
+
+    # 同一主机上两个容器共用一张卡会互相争抢，这里在启动前直接拦下。
+    # 232 单机跑 4 个节点时，四张卡必须是 6/7/4/5 这类互不相同的取值。
+    duplicate_ids=$(printf '%s\n' "${npu_ids[@]}" | sort | uniq -d | paste -sd, -)
+    if [ -n "$duplicate_ids" ]; then
+        echo "错误：本机多个 API 节点映射到同一张 NPU 卡:$duplicate_ids" >&2
+        echo "请为 PIPELINE_NPU_ID、PIPELINE_2_NPU_ID、PIPELINE_3_NPU_ID、PIPELINE_4_NPU_ID 填不同的卡号。" >&2
+        echo "这些卡号还需要避开本机 VLM 占用的卡，可用 npu-smi info 查看。" >&2
+        exit 1
+    fi
+}
+
+# Compose 自己会在端口重复时报错，但那条信息只提端口不提是哪个服务在本机冲突。
+# 这里提前渲染一次配置，直接指出是本机哪两个服务抢同一个宿主端口。
+check_published_port_conflicts() {
+    conflicts=$(compose config 2>/dev/null | awk '
+        /^  [a-zA-Z0-9_.-]+:$/ { svc = $1; sub(/:$/, "", svc); next }
+        /^[[:space:]]+published: "?[0-9]+"?[[:space:]]*$/ {
+            port = $2; gsub(/"/, "", port)
+            if (port == "") next
+            if (seen[port] == "") { seen[port] = svc; next }
+            if (index(seen[port], svc) == 0) { seen[port] = seen[port] "," svc }
+        }
+        END { for (p in seen) if (index(seen[p], ",") > 0) printf "%s -> %s\n", p, seen[p] }
+    ')
+    if [ -n "$conflicts" ]; then
+        echo "错误：本机有服务共用同一个宿主机端口，容器会启动失败:" >&2
+        printf '%s\n' "$conflicts" >&2
+        echo "请调整 API_<N>_PORT 或 ROUTER_PORT，并同步更新 MINERU_ROUTER_UPSTREAM_URLS_JSON。" >&2
+        exit 1
+    fi
 }
 
 check_npu_image() {
@@ -420,6 +451,7 @@ check() {
     done < <(enumerate_vlms)
     echo "检查 Compose 配置..."
     compose config >/dev/null
+    check_published_port_conflicts
     if [ ! -f ./mineru-ops-agent.py ] || [ ! -f ./batch-router-diagnose.py ]; then
         echo "错误：缺少 mineru-ops-agent.py 或 batch-router-diagnose.py。" >&2
         exit 1
@@ -459,6 +491,13 @@ check() {
         if [ "$vlm_count" -eq 0 ]; then
             echo "提示：env.multi 中没有填写任何 VLM_<N>_IP，跳过外部 VLM 检查。"
             echo "      此时只能使用 backend=pipeline；hybrid/vlm 系列后端不可用。"
+        fi
+        # 未填 IP 的节点会在容器内回落到 127.0.0.1:30000，上面检查不到它，
+        # 所以这里按节点数量补一条提示，避免"检查通过"被误读为 VLM 已配好。
+        selected_api_count=$(selected_api_services | wc -l)
+        if [ "$vlm_count" -gt 0 ] && [ "$vlm_count" -lt "$selected_api_count" ]; then
+            echo "提示：本机启动 $selected_api_count 个 API 节点，但只填了 $vlm_count 个 VLM_<N>_IP。"
+            echo "      未配置的节点会回落到 127.0.0.1:30000，其 hybrid 后端不可用。"
         fi
     else
         echo "Router 角色：跳过本地 Pipeline/NPU/VLM 检查。"

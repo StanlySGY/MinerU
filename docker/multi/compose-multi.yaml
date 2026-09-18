@@ -6,6 +6,7 @@
 # start-multi.sh 按 MINERU_DEPLOY_ROLE 和 MINERU_API_NODE_IDS 选择启动节点，并按 env.multi 检查 VLM。
 #
 # 本文件只包含与硬件无关的定义，可直接在 x86 / ARM 的纯 CPU 主机上启动。
+# API 端口默认值已避开现场 VLM 的 6002/6003 和 Router 的 8002,便于单机四节点共存。
 # 需要加速卡时，由 start-multi.sh 按 env.multi 的 MINERU_DEVICE_MODE 追加叠加文件：
 #   MINERU_DEVICE_MODE=npu  -> compose-multi.npu.yaml
 #   MINERU_DEVICE_MODE=cuda -> compose-multi.nvidia.yaml
@@ -32,10 +33,12 @@ services:
       mineru-code-sync:
         condition: service_completed_successfully
     ports:
-      - "${API_1_PORT:-6002}:8000"
+      - "${API_1_PORT:-16002}:8000"
     environment: &api-environment
       PYTHONPATH: /app
       # 这里填写 API 容器能访问的外部 VLM，不要填写 API 容器自己的 127.0.0.1。
+      # VLM_<N>_IP 留空时会回落到下面的 127.0.0.1,容器内的该地址指向容器自身,
+      # 结果是 hybrid 系列后端连不上 VLM,而 check 不会报错。
       MINERU_VL_SERVER: "http://${VLM_1_IP:-127.0.0.1}:${VLM_1_PORT:-30000}/v1"
       MINERU_VLM_SERVER_URL: "http://${VLM_1_IP:-127.0.0.1}:${VLM_1_PORT:-30000}/v1"
       MINERU_VLM_MODEL: ${MINERU_VLM_MODEL:-OpenDataLab/MinerU2.5-Pro-2604-1.2B}
@@ -96,7 +99,7 @@ services:
       mineru-code-sync:
         condition: service_completed_successfully
     ports:
-      - "${API_2_PORT:-6003}:8000"
+      - "${API_2_PORT:-16003}:8000"
     environment:
       <<: *api-environment
       MINERU_VL_SERVER: "http://${VLM_2_IP:-127.0.0.1}:${VLM_2_PORT:-30000}/v1"
@@ -117,7 +120,7 @@ services:
       mineru-code-sync:
         condition: service_completed_successfully
     ports:
-      - "${API_3_PORT:-8001}:8000"
+      - "${API_3_PORT:-18001}:8000"
     environment:
       <<: *api-environment
       MINERU_VL_SERVER: "http://${VLM_3_IP:-127.0.0.1}:${VLM_3_PORT:-30000}/v1"
@@ -138,7 +141,7 @@ services:
       mineru-code-sync:
         condition: service_completed_successfully
     ports:
-      - "${API_4_PORT:-8002}:8000"
+      - "${API_4_PORT:-18002}:8000"
     environment:
       <<: *api-environment
       MINERU_VL_SERVER: "http://${VLM_4_IP:-127.0.0.1}:${VLM_4_PORT:-30000}/v1"
