@@ -1745,6 +1745,11 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "clearTaskSelection" in dashboard_js
     assert "data-task-cancel" in dashboard_js
     assert "/cancel`" in dashboard_js
+    # 取消按钮只对未结束的任务出现;终态判据必须和 SSE 收尾共用一套,
+    # 否则失败任务也会显示「终止任务」,点下去 Router 报 404 并顺手清掉本地记录。
+    assert "const cancelAction = isTaskTerminal(task.status)" in dashboard_js
+    assert "isTaskTerminal(payload.status) || payload.status === \"unavailable\"" in dashboard_js
+    assert "const finished = task.partial_success || isTaskTerminal(task.status)" in dashboard_js
 
     index_route = next(route for route in app.routes if route.path == "/")
     response = asyncio.run(index_route.endpoint())

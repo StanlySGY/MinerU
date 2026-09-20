@@ -1,12 +1,12 @@
 {
   "id": "router-task-performance-and-node-config",
   "title": "修复控制台卡顿、任务终止能力与列表布局",
-  "status": "in_progress",
+  "status": "completed",
   "complexity": "L+",
   "risk": "medium",
   "domain": "backend",
-  "currentPhase": "review",
-  "nextAction": "审查 diff 后提交并推送 dev,再构建 ops-ui22",
+  "currentPhase": "completed",
+  "nextAction": "在 26 构建机构建并导出 mineru-code:v3.4.2-ops-ui22,验证后替换 env.multi 中的 MINERU_CODE_IMAGE",
   "createdAt": "2026-09-18T00:00:00Z",
   "branch": "dev"
 }

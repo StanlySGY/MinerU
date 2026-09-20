@@ -113,6 +113,14 @@ function statusTier(value) {
   return "warn"; // pending_restart, partially_applied, not_created, skipped, inconsistent, unknown, 其它均归入待操作层
 }
 
+/* 任务的终态集合。判定「还能不能取消」用它,和 SSE 收尾用的是同一套状态 ——
+   「已结束」和「有没有产物」是两件事,失败任务没有产物但同样已经结束。 */
+const TASK_TERMINAL_STATES = new Set(["completed", "completed_with_failures", "partial_success", "failed", "cancelled", "interrupted"]);
+
+function isTaskTerminal(status) {
+  return TASK_TERMINAL_STATES.has(status);
+}
+
 let skeletonCount = 0; // reserved for per-table unique skeleton ids (unused; kept minimal)
 
 /* ── 骨架屏 / 空状态 / 错误状态 规范片段 ── */
@@ -867,7 +875,7 @@ async function loadTaskDetail(taskId, {silent = false} = {}) {
     state.taskDetailLoaded = true;
     state.taskDetailLoading = false;
     renderTaskDetailBody(task, timingPayload, taskId);
-    const finished = task.partial_success || ["completed", "completed_with_failures", "partial_success", "failed", "cancelled", "interrupted"].includes(task.status);
+    const finished = task.partial_success || isTaskTerminal(task.status);
     if (!finished) openTaskEventSource(taskId);
     return {task, finished};
   } catch (error) {
@@ -920,13 +928,16 @@ function renderTaskDetailBody(task, timingPayload, taskId) {
   const pages = (p.files || []).flatMap(file => (file.pages || []).map(page => ({...page, file_name: file.file_name})));
   const current = currentTaskPosition(task, p, pages);
   const previewReady = taskPreviewReady(task);
+  // 只有真正产出了结果的任务才有预览产物可言,失败任务不算。
   const taskFinished = task.partial_success || ["completed", "completed_with_failures", "partial_success"].includes(task.status);
   const previewAction = previewReady
     ? `<button type="button" class="primary-button" data-task-preview="${esc(task.task_id)}">预览结果</button>`
     : (taskFinished ? `<span class="task-preview-unavailable" title="该任务没有保留原始 PDF 或提取产物">未保留预览产物</span>` : "");
   const reportActions = `<button type="button" class="secondary-button" data-task-report="markdown">导出 Markdown 报告</button><button type="button" class="secondary-button" data-task-report="csv">导出 CSV</button>`;
-  // 「终止任务」会真正中断解析,所以只对未结束的任务显示;已结束的任务没有可终止的工作。
-  const cancelAction = taskFinished
+  // 「终止任务」会真正中断解析,所以只对未结束的任务显示 —— 判据是终态,不是
+  // "有没有产物"。失败/已取消/被中断的任务再点它,Router 只会返回 404,然后连带
+  // 清掉本地记录,等于把「删除缓存」伪装成「取消」。
+  const cancelAction = isTaskTerminal(task.status) || task.partial_success
     ? ""
     : `<button type="button" class="danger-button" data-task-cancel="${esc(task.task_id)}" title="中断正在进行的解析,并把任务从列表移除">终止任务</button>`;
   // Router 已经不认识这个任务、控制台只剩缓存时必须说出来:否则页面上是一个
@@ -975,7 +986,7 @@ function openTaskEventSource(taskId) {
     }
     // unavailable 说明服务端已经结束这一路流(任务不存在或 Router 报错),
     // 客户端必须自己收尾,否则 EventSource 会自动重连。
-    const finished = payload.partial_success || ["completed", "completed_with_failures", "partial_success", "failed", "cancelled", "interrupted", "unavailable"].includes(payload.status);
+    const finished = payload.partial_success || isTaskTerminal(payload.status) || payload.status === "unavailable";
     if (finished) closeTaskEventSource();
   };
   state.taskEventSource.onerror = () => {
