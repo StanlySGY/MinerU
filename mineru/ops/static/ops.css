@@ -333,6 +333,14 @@ input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 2px r
 .panel { background: var(--bg-surface); border: 1px solid var(--border-default); border-radius: var(--radius-md); }
 .panel .section-heading { padding: 0 14px; }
 .table-wrap { overflow-x: auto; }
+/* 列表页的表格自己滚动,而不是把整页撑高:横向滚动条要留在可见范围内,
+   否则 100 行的表格会把滚动条推到屏幕外,末尾几列永远滚不到。 */
+.table-scroll { max-height: calc(100vh - 260px); min-height: 240px; overflow: auto; overscroll-behavior: contain; }
+.table-scroll thead th { position: sticky; top: 0; z-index: 1; }
+/* 时间/耗时这类列不许被压扁到读不出来。 */
+.table-scroll th.col-time, .table-scroll td.col-time { min-width: 128px; white-space: nowrap; }
+.table-scroll th.col-num, .table-scroll td.col-num { min-width: 72px; white-space: nowrap; }
+.table-scroll th.col-backend, .table-scroll td.col-backend { min-width: 116px; }
 table { width: 100%; border-collapse: collapse; }
 th, td { border-bottom: 1px solid var(--border-subtle); text-align: left; padding: 10px 12px; vertical-align: middle; }
 th { color: var(--text-muted); font-size: 12px; font-weight: 650; background: var(--bg-surface-raised); }
@@ -357,7 +365,15 @@ tbody tr[data-task].selected { background: var(--accent-soft); box-shadow: inset
 .segmented button { border: 0; border-right: 1px solid var(--border-default); background: var(--bg-surface); padding: 8px 12px; }
 .segmented button:last-child { border-right: 0; }
 .segmented button.active { background: var(--text-primary); color: white; }
-.split-view { display: grid; grid-template-columns: minmax(0, 1fr) minmax(500px, 42vw); gap: 14px; align-items: start; }
+/* 右侧详情原先写死 minmax(500px, 42vw):1366 宽屏上它要 574px,把左侧表格压到
+   比固有最小宽还窄,末尾列被截断且横向滚动条在屏幕外。七列任务表自身最少要
+   735px,两侧并排时只有左侧拿到这个宽度才不会截列——实测 1500px 是那条线,
+   所以之下改为上下堆叠:表格拿满宽度,所有列一次看全,详情挪到下方。 */
+.split-view { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 38%); gap: 14px; align-items: start; }
+@media (max-width: 1500px) {
+  .split-view { grid-template-columns: minmax(0, 1fr); }
+  .detail-panel { max-height: none; }
+}
 .detail-panel {
   background: var(--bg-surface);
   border: 1px solid var(--border-default);
@@ -407,6 +423,10 @@ tbody tr[data-task].selected { background: var(--accent-soft); box-shadow: inset
 }
 .task-detail-header h2 { line-height: 1.35; overflow-wrap: anywhere; }
 .task-detail-header .mono { margin-top: 6px; }
+.task-cache-warning {
+  margin-top: 10px; padding: 8px 10px; border-radius: var(--radius-sm);
+  background: var(--warn-soft); color: var(--warn); font-size: 12px; overflow-wrap: anywhere;
+}
 .task-detail-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
 .task-detail-actions .primary-button { white-space: nowrap; }
 .task-preview-unavailable { max-width: 150px; color: var(--text-muted); font-size: 12px; line-height: 1.35; text-align: right; }

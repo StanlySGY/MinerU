@@ -360,10 +360,10 @@ function taskPreviewReady(task) {
 
 function compactTaskRows(tasks, limit = 6, emptyText = "暂无任务") {
   if (!tasks.length) return `<div class="empty-state compact-empty-state">${esc(emptyText)}</div>`;
-  return `<table><thead><tr><th>文件</th><th>状态</th><th>页进度</th><th>更新时间</th></tr></thead><tbody>${tasks.slice(0, limit).map(task => {
+  return `<table><thead><tr><th>文件</th><th>状态</th><th class="col-num">页进度</th><th class="col-time">更新时间</th></tr></thead><tbody>${tasks.slice(0, limit).map(task => {
     const progress = task.progress || {};
     const finished = (progress.completed_pages || 0) + (progress.skipped_pages || 0) + (progress.failed_pages || 0);
-    return `<tr data-task="${esc(task.task_id)}"><td>${esc(task.display_name || (task.file_names || []).join(", "))}</td><td>${badge(task.partial_success ? "partial_success" : task.status)}</td><td>${finished}/${progress.total_pages || "-"}</td><td>${esc(formatDate(progress.updated_at || task.completed_at || task.created_at))}</td></tr>`;
+    return `<tr data-task="${esc(task.task_id)}"><td>${esc(task.display_name || (task.file_names || []).join(", "))}</td><td>${badge(task.partial_success ? "partial_success" : task.status)}</td><td class="col-num">${finished}/${progress.total_pages || "-"}</td><td class="col-time">${esc(formatDate(progress.updated_at || task.completed_at || task.created_at))}</td></tr>`;
   }).join("")}</tbody></table>`;
 }
 
@@ -371,11 +371,13 @@ async function loadOverview() {
   const data = await api("/api/overview");
   state.services = data.services || [];
   state.batches = data.batch_runs || [];
+  // 列表只用来渲染下面那几行任务;计数走服务端聚合,才能覆盖全部任务而不是这 20 条。
   const taskData = await api("/api/tasks?limit=20");
   state.tasks = taskData.items || [];
+  const counts = data.task_counts || {};
   const healthy = state.services.filter(item => item.health === "healthy").length;
-  const active = state.tasks.filter(item => ["pending", "processing"].includes(item.status)).length;
-  const failed = state.tasks.filter(item => item.status === "failed").length;
+  const active = (counts.pending || 0) + (counts.processing || 0);
+  const failed = counts.failed || 0;
   const gpu = deriveGpuSummary(state.services);
   document.getElementById("summary-strip").innerHTML = [
     ["服务总数", state.services.length, `${healthy} 健康`],
@@ -717,9 +719,9 @@ function renderTasks() {
     container.innerHTML = `<div class="empty-state">没有匹配「${esc(query)}」的任务</div>`;
     return;
   }
-  container.innerHTML = `<table><thead><tr><th>文件</th><th>状态</th><th>后端</th><th>成功/总页数</th><th>跳过</th><th>耗时</th><th>开始时间</th></tr></thead><tbody>${tasks.map(task => {
+  container.innerHTML = `<table><thead><tr><th>文件</th><th>状态</th><th class="col-backend">后端</th><th class="col-num">成功/总页数</th><th class="col-num">跳过</th><th class="col-time">耗时</th><th class="col-time">开始时间</th></tr></thead><tbody>${tasks.map(task => {
     const p = task.progress || {};
-    return `<tr data-task="${esc(task.task_id)}" class="${task.task_id === state.activeTaskId ? "selected" : ""}"><td><strong>${esc(task.display_name || (task.file_names || []).join(", "))}</strong><div class="muted">${esc((task.file_names || []).join(", "))}</div><div class="mono muted">${esc(task.task_id)}</div></td><td>${badge(task.partial_success ? "partial_success" : task.status)}</td><td>${esc(task.backend)}</td><td>${p.completed_pages || 0}/${p.total_pages || "-"}</td><td>${p.skipped_pages || 0}</td><td class="task-elapsed">${esc(formatElapsed(task.started_at || task.created_at, task.completed_at))}</td><td>${esc(formatDate(task.started_at || task.created_at))}</td></tr>`;
+    return `<tr data-task="${esc(task.task_id)}" class="${task.task_id === state.activeTaskId ? "selected" : ""}"><td><strong>${esc(task.display_name || (task.file_names || []).join(", "))}</strong><div class="muted">${esc((task.file_names || []).join(", "))}</div><div class="mono muted">${esc(task.task_id)}</div></td><td>${badge(task.partial_success ? "partial_success" : task.status)}</td><td class="col-backend">${esc(task.backend)}</td><td class="col-num">${p.completed_pages || 0}/${p.total_pages || "-"}</td><td class="col-num">${p.skipped_pages || 0}</td><td class="task-elapsed col-time">${esc(formatElapsed(task.started_at || task.created_at, task.completed_at))}</td><td class="col-time">${esc(formatDate(task.started_at || task.created_at))}</td></tr>`;
   }).join("")}</tbody></table>`;
 }
 
@@ -872,10 +874,42 @@ async function loadTaskDetail(taskId, {silent = false} = {}) {
     if (requestId !== state.taskDetailRequestId || state.activeTaskId !== taskId) return;
     state.taskDetailLoading = false;
     state.taskDetailError = error.message;
-    document.getElementById("task-detail").innerHTML = errorState(`任务详情加载失败：${error.message}`);
+    // Mark the detail as settled. Without this the 10s poll keeps seeing
+    // `!taskDetailLoaded` and retries a task the server has already dropped,
+    // repeating the same error banner on every round.
+    state.taskDetailLoaded = true;
+    if (isMissingTaskError(error)) {
+        // 任务已不存在:清掉选中态和 URL 里的 taskId,否则刷新或切视图回来会按
+        // hash 再拉一次,把这个不存在的任务重新变成常驻错误。
+        clearTaskSelection();
+        document.getElementById("task-detail").innerHTML = errorState("任务已不存在,可能已被终止或超出保留期");
+        if (!silent) notice("任务已不存在,可能已被终止或超出保留期");
+        return {task: null, finished: true};
+    }
+    document.getElementById("task-detail").innerHTML = errorState(`任务详情加载失败:${error.message}`);
     if (!silent) notice(error.message);
     return {task: null, finished: true};
   }
+}
+
+/* 服务端返回"任务不存在"时,详情页不该继续保留这个选中项。 */
+function isMissingTaskError(error) {
+  const message = String(error && error.message || "").toLowerCase();
+  return message.includes("404") || message.includes("task unavailable") || message.includes("not found");
+}
+
+/* 清掉详情选中态和 URL 里的 taskId,避免刷新后重复请求一个已经没有的任务。 */
+function clearTaskSelection() {
+  state.activeTaskId = null;
+  state.taskDetailLoaded = false;
+  state.taskDetailError = null;
+  closeTaskEventSource();
+  if (location.hash.includes("taskId=")) {
+    const routed = parseRoute();
+    history.replaceState(null, "", currentHash(routed.view, null));
+  }
+  const detail = document.getElementById("task-detail");
+  if (detail) detail.innerHTML = `<div class="empty-state">选择一个任务</div>`;
 }
 
 /* 把已取到的任务数据渲染进右侧详情面板（单一渲染源，SSE 与 REST 共用）。 */
@@ -891,13 +925,22 @@ function renderTaskDetailBody(task, timingPayload, taskId) {
     ? `<button type="button" class="primary-button" data-task-preview="${esc(task.task_id)}">预览结果</button>`
     : (taskFinished ? `<span class="task-preview-unavailable" title="该任务没有保留原始 PDF 或提取产物">未保留预览产物</span>` : "");
   const reportActions = `<button type="button" class="secondary-button" data-task-report="markdown">导出 Markdown 报告</button><button type="button" class="secondary-button" data-task-report="csv">导出 CSV</button>`;
+  // 「终止任务」会真正中断解析,所以只对未结束的任务显示;已结束的任务没有可终止的工作。
+  const cancelAction = taskFinished
+    ? ""
+    : `<button type="button" class="danger-button" data-task-cancel="${esc(task.task_id)}" title="中断正在进行的解析,并把任务从列表移除">终止任务</button>`;
+  // Router 已经不认识这个任务、控制台只剩缓存时必须说出来:否则页面上是一个
+  // 看起来还在跑的任务,实际早就查不到了。
+  const cacheWarning = task.source === "cache"
+    ? `<div class="task-cache-warning" role="status">Router 已无此任务记录,当前显示的是控制台缓存${task.cache_error ? `(${esc(String(task.cache_error).split("\n")[0])})` : ""}</div>`
+    : "";
   const cacheAction = task.source_batch_run_id
     ? ""
     : `<button type="button" class="danger-button" data-task-delete="${esc(task.task_id)}" title="只删除控制台缓存，不影响远程任务">删除缓存</button>`;
   const elapsed = formatElapsed(task.started_at || task.created_at, task.completed_at);
   const fileSections = (p.files || []).map(file => `<section class="task-file-pages"><div class="task-file-heading"><strong>${esc(file.file_name)}</strong><span>${(file.pages || []).length} 页</span></div><div class="page-list">${(file.pages || []).map(page => `<span class="page-chip ${esc(page.status || "queued")}" title="${esc(pageTitle(page, file.file_name))}">${page.page_number}</span>`).join("")}</div></section>`).join("");
   const problemPages = pages.filter(page => page.status === "skipped" || page.status === "failed");
-  document.getElementById("task-detail").innerHTML = `<div class="task-detail-header"><div><h2>${esc((task.file_names || []).join(", "))}</h2><div class="mono muted">${esc(task.task_id)}</div></div><div class="task-detail-actions">${badge(task.partial_success ? "partial_success" : task.status)}${previewAction}${reportActions}${cacheAction}</div></div><div class="task-live-position ${current.kind}"><span class="live-indicator"></span><div><small>当前处理位置</small><strong>${esc(current.title)}</strong><p>${esc(current.detail)}</p></div><time>${esc(formatDate(p.updated_at))}</time></div><div class="task-progress-row"><div class="progress"><span style="width:${percent}%"></span></div><strong>${percent}%</strong></div><div class="task-stat-grid"><div><span>总页数</span><strong>${p.total_pages || 0}</strong></div><div><span>已完成</span><strong>${p.completed_pages || 0}</strong></div><div><span>处理中</span><strong>${p.processing_pages || 0}</strong></div><div><span>等待中</span><strong>${p.queued_pages || 0}</strong></div><div><span>已跳过</span><strong>${p.skipped_pages || 0}</strong></div><div><span>失败</span><strong>${p.failed_pages || 0}</strong></div></div><div class="task-meta-line"><span>阶段：<strong>${esc(phaseText[p.phase] || p.phase || "-")}</strong></span><span>后端：<strong>${esc(task.backend || "-")}</strong></span><span>耗时：<strong class="task-elapsed">${esc(elapsed)}</strong></span>${task.error ? `<span class="bad-text">任务错误：${esc(task.error)}</span>` : ""}</div><div class="task-pages-heading"><h3>页面状态</h3><span>${pages.length} 个页面事件</span></div>${pageLegend()}<div id="task-page-grid" class="task-file-page-list">${fileSections || `<div class="empty-state">尚未收到页级进度，任务启动后会自动显示</div>`}</div>${renderPageTimingTable(timingPayload, taskId)}${problemPages.length ? `<div class="task-problem-list"><h3>跳过和失败页面</h3>${problemPages.map(page => `<div class="task-problem-row"><strong>${esc(page.file_name)} 第 ${page.page_number} 页</strong>${badge(page.status)}<span>${esc(page.error_type || "")}</span><p>${esc(page.error || "未返回错误详情")}</p></div>`).join("")}</div>` : ""}`;
+  document.getElementById("task-detail").innerHTML = `<div class="task-detail-header"><div><h2>${esc((task.file_names || []).join(", "))}</h2><div class="mono muted">${esc(task.task_id)}</div></div><div class="task-detail-actions">${badge(task.partial_success ? "partial_success" : task.status)}${previewAction}${reportActions}${cancelAction}${cacheAction}</div></div>${cacheWarning}<div class="task-live-position ${current.kind}"><span class="live-indicator"></span><div><small>当前处理位置</small><strong>${esc(current.title)}</strong><p>${esc(current.detail)}</p></div><time>${esc(formatDate(p.updated_at))}</time></div><div class="task-progress-row"><div class="progress"><span style="width:${percent}%"></span></div><strong>${percent}%</strong></div><div class="task-stat-grid"><div><span>总页数</span><strong>${p.total_pages || 0}</strong></div><div><span>已完成</span><strong>${p.completed_pages || 0}</strong></div><div><span>处理中</span><strong>${p.processing_pages || 0}</strong></div><div><span>等待中</span><strong>${p.queued_pages || 0}</strong></div><div><span>已跳过</span><strong>${p.skipped_pages || 0}</strong></div><div><span>失败</span><strong>${p.failed_pages || 0}</strong></div></div><div class="task-meta-line"><span>阶段：<strong>${esc(phaseText[p.phase] || p.phase || "-")}</strong></span><span>后端：<strong>${esc(task.backend || "-")}</strong></span><span>耗时：<strong class="task-elapsed">${esc(elapsed)}</strong></span>${task.error ? `<span class="bad-text">任务错误：${esc(task.error)}</span>` : ""}</div><div class="task-pages-heading"><h3>页面状态</h3><span>${pages.length} 个页面事件</span></div>${pageLegend()}<div id="task-page-grid" class="task-file-page-list">${fileSections || `<div class="empty-state">尚未收到页级进度，任务启动后会自动显示</div>`}</div>${renderPageTimingTable(timingPayload, taskId)}${problemPages.length ? `<div class="task-problem-list"><h3>跳过和失败页面</h3>${problemPages.map(page => `<div class="task-problem-row"><strong>${esc(page.file_name)} 第 ${page.page_number} 页</strong>${badge(page.status)}<span>${esc(page.error_type || "")}</span><p>${esc(page.error || "未返回错误详情")}</p></div>`).join("")}</div>` : ""}`;
 }
 
 /* ─────────────────────────── SSE 实时单任务更新 ─────────────────────────── */
@@ -919,11 +962,20 @@ function openTaskEventSource(taskId) {
     const signature = `${payload.status}@${progress.version || 0}`;
     if (signature === state.taskEventLastSignature) return;
     state.taskEventLastSignature = signature;
+    // 服务端明确说任务已不存在:此时选中项指向的东西已经没了,清掉选中态,
+    // 而不是把一个空壳任务写回列表。Router 抖动的 unavailable 不走这条路。
+    if (payload.gone) {
+      clearTaskSelection();
+      document.getElementById("task-detail").innerHTML = errorState("任务已不存在,可能已被终止或超出保留期");
+      return;
+    }
     upsertTaskInList(payload);
     if (!state.taskDetailLoading) {
       renderTaskDetailBody(payload, {items: [], total: 0, offset: state.taskTimingOffset, summary: null}, taskId);
     }
-    const finished = payload.partial_success || ["completed", "completed_with_failures", "partial_success", "failed", "cancelled", "interrupted"].includes(payload.status);
+    // unavailable 说明服务端已经结束这一路流(任务不存在或 Router 报错),
+    // 客户端必须自己收尾,否则 EventSource 会自动重连。
+    const finished = payload.partial_success || ["completed", "completed_with_failures", "partial_success", "failed", "cancelled", "interrupted", "unavailable"].includes(payload.status);
     if (finished) closeTaskEventSource();
   };
   state.taskEventSource.onerror = () => {
@@ -952,15 +1004,28 @@ document.getElementById("task-detail").addEventListener("click", event => {
 
 document.getElementById("task-detail").addEventListener("click", async event => {
   const button = event.target.closest("[data-task-delete]");
-  if (!button || !confirm("确认删除这个任务的控制台缓存？不会取消远程任务。")) return;
+  if (!button || !confirm("确认删除这个任务的控制台缓存?不会取消远程任务。")) return;
   try {
     await api(`/api/tasks/${encodeURIComponent(button.dataset.taskDelete)}`, {method: "DELETE"});
     notice("任务缓存已删除", false);
-    state.activeTaskId = null;
-    closeTaskEventSource();
+    clearTaskSelection();
     await loadTasks();
-    document.getElementById("task-detail").innerHTML = `<div class="empty-state">选择一个任务</div>`;
   } catch (error) { notice(error.message); }
+});
+
+document.getElementById("task-detail").addEventListener("click", async event => {
+  const button = event.target.closest("[data-task-cancel]");
+  if (!button) return;
+  const taskId = button.dataset.taskCancel;
+  if (!confirm("确认终止这个任务?\n\n正在进行的解析会被立即中断,任务会从列表中移除。此操作不可撤销。")) return;
+  button.disabled = true;
+  try {
+    await api(`/api/tasks/${encodeURIComponent(taskId)}/cancel`, {method: "POST"});
+    notice("任务已终止", false);
+    clearTaskSelection();
+    await loadTasks();
+  } catch (error) { notice(error.message); }
+  finally { button.disabled = false; }
 });
 
 document.getElementById("task-detail").addEventListener("click", async event => {
@@ -1002,8 +1067,9 @@ async function refreshTasksView() {
   try {
     await loadTasks();
     if (state.activeTaskId && !state.taskDetailLoaded && !state.taskDetailLoading) {
-      await loadTaskDetail(state.activeTaskId, {silent: true});
-      openTaskEventSource(state.activeTaskId);
+      const detail = await loadTaskDetail(state.activeTaskId, {silent: true});
+      // 只有真正拿到任务才订阅 SSE;详情失败说明任务已不在,订阅只会再报一次 404。
+      if (detail && detail.task) openTaskEventSource(state.activeTaskId);
     }
     setConnection(true, "控制台已连接");
   } catch (error) {
@@ -1042,7 +1108,7 @@ function batchActions(run) {
 
 function compactBatchRows(items, limit = 100) {
   if (!items.length) return `<div class="empty-state">暂无批量测试</div>`;
-  return `<table><thead><tr><th>选择</th><th>输入 / 任务</th><th>状态</th><th>PDF</th><th>开始时间</th><th>记录</th><th>操作</th></tr></thead><tbody>${items.slice(0, limit).map(run => {
+  return `<table><thead><tr><th>选择</th><th>输入 / 任务</th><th>状态</th><th class="col-num">PDF</th><th class="col-time">开始时间</th><th>记录</th><th>操作</th></tr></thead><tbody>${items.slice(0, limit).map(run => {
     const previewText = run.input_preview_ready || run.result_preview_ready ? "可预览" : "";
     const retrySource = run.settings?.source_type === "problem_page_retry" && run.settings?.retry_of_run_id
       ? `<div class="muted">异常页重试 · 来源 ${esc(run.settings.retry_of_run_id)}</div>`
@@ -1052,7 +1118,7 @@ function compactBatchRows(items, limit = 100) {
       ? links.map(task => `<button class="text-button" data-task-link="${esc(task.task_id)}" title="打开任务">${esc(task.display_name || task.file_name || task.task_id)}</button>`).join("")
       : `<span class="muted">任务尚未登记</span>`;
     const deletable = LAB_TERMINAL_STATES.has(run.status);
-    return `<tr><td>${deletable ? `<input type="checkbox" data-batch-select="${esc(run.run_id)}" ${state.selectedBatchRuns.has(run.run_id) ? "checked" : ""} aria-label="选择 ${esc(run.run_id)}">` : "-"}</td><td><strong>${esc(run.settings?.input_path || run.input_path)}</strong>${retrySource}<div class="mono muted">${esc(run.run_id)}</div><div class="batch-task-links">${taskLinks}</div></td><td>${badge(run.status)}${previewText ? `<div class="muted">${previewText}</div>` : ""}</td><td>${run.settings?.pdf_count || "-"}</td><td>${esc(formatDate(run.started_at || run.created_at))}</td><td><button class="text-button" data-batch-detail="${esc(run.run_id)}">查看记录</button></td><td><div class="actions">${batchActions(run)}</div></td></tr>`;
+    return `<tr><td>${deletable ? `<input type="checkbox" data-batch-select="${esc(run.run_id)}" ${state.selectedBatchRuns.has(run.run_id) ? "checked" : ""} aria-label="选择 ${esc(run.run_id)}">` : "-"}</td><td><strong>${esc(run.settings?.input_path || run.input_path)}</strong>${retrySource}<div class="mono muted">${esc(run.run_id)}</div><div class="batch-task-links">${taskLinks}</div></td><td>${badge(run.status)}${previewText ? `<div class="muted">${previewText}</div>` : ""}</td><td class="col-num">${run.settings?.pdf_count || "-"}</td><td class="col-time">${esc(formatDate(run.started_at || run.created_at))}</td><td><button class="text-button" data-batch-detail="${esc(run.run_id)}">查看记录</button></td><td><div class="actions">${batchActions(run)}</div></td></tr>`;
   }).join("")}</tbody></table>`;
 }
 

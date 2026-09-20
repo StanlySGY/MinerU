@@ -60,7 +60,10 @@ TASK_PENDING = "pending"
 TASK_PROCESSING = "processing"
 TASK_COMPLETED = "completed"
 TASK_FAILED = "failed"
-TASK_TERMINAL_STATES = {TASK_COMPLETED, TASK_FAILED}
+# A cancelled task is terminal too: the upstream API reports it once its
+# in-flight parse has been stopped, and the registry must stop refreshing it.
+TASK_CANCELLED = "cancelled"
+TASK_TERMINAL_STATES = {TASK_COMPLETED, TASK_FAILED, TASK_CANCELLED}
 DEFAULT_TASK_RETENTION_SECONDS = 24 * 60 * 60
 DEFAULT_TASK_CLEANUP_INTERVAL_SECONDS = 5 * 60
 FILE_PARSE_TASK_ID_HEADER = "X-MinerU-Task-Id"
@@ -973,6 +976,11 @@ class RouterTaskRegistry:
             task.completed_at = utc_now_iso()
             return task
 
+    async def remove(self, task_id: str) -> RouterTaskRecord | None:
+        """Forget a task and hand back the record that was dropped."""
+        async with self._lock:
+            return self._tasks.pop(task_id, None)
+
     async def cleanup_expired_tasks(self) -> int:
         if self.task_retention_seconds <= 0:
             return 0
@@ -1516,6 +1524,53 @@ def create_app(settings: RouterSettings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Task not found")
         task = await fetch_router_task_status(request, task)
         return task.to_status_payload(request)
+
+    @app.delete(path="/tasks/{task_id}", name="cancel_router_task")
+    async def cancel_router_task(task_id: str, request: Request):
+        """Stop an unfinished task on its upstream API and forget it here.
+
+        The Router runs no parsing itself, so cancelling means asking the upstream
+        API that accepted the task to stop, then dropping the local record. If the
+        upstream cannot be reached the task is kept, so a later attempt can still
+        reach it instead of leaving work running with no handle on it.
+        """
+        registry: RouterTaskRegistry = request.app.state.router_task_registry
+        client: httpx.AsyncClient = request.app.state.http_client
+        task = await registry.get(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        upstream_status: str | None = None
+        if not is_task_terminal(task.status):
+            task = await fetch_router_task_status(request, task)
+        if not is_task_terminal(task.status):
+            url = f"{task.upstream_base_url}{TASKS_ENDPOINT}/{task.upstream_task_id}"
+            try:
+                response = await client.delete(url)
+            except httpx.HTTPError as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"无法通知上游 API 停止任务: {exc}",
+                ) from exc
+            if response.status_code >= 400:
+                # The upstream may have finished or expired the task already. That is
+                # worth reporting, but it must not block dropping our own record.
+                upstream_status = f"{response.status_code} {response_detail(response)}"
+                logger.warning(
+                    "Upstream cancel returned {} for task {}: {}",
+                    response.status_code,
+                    task_id,
+                    upstream_status,
+                )
+
+        removed = await registry.remove(task_id)
+        if removed is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return {
+            "task_id": task_id,
+            "cancelled": True,
+            "upstream_status": upstream_status,
+        }
 
     @app.get(path="/tasks", name="list_router_tasks")
     async def list_router_tasks(

@@ -1,0 +1,12 @@
+{
+  "id": "router-task-performance-and-node-config",
+  "title": "修复控制台卡顿、任务终止能力与列表布局",
+  "status": "in_progress",
+  "complexity": "L+",
+  "risk": "medium",
+  "domain": "backend",
+  "currentPhase": "review",
+  "nextAction": "审查 diff 后提交并推送 dev,再构建 ops-ui22",
+  "createdAt": "2026-09-18T00:00:00Z",
+  "branch": "dev"
+}

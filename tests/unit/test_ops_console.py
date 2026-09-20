@@ -21,6 +21,8 @@ from mineru.cli.ops import (
     apply_service_runtime_health,
     build_smoke_test_pdf,
     create_app,
+    slim_task_for_list,
+    strip_pages_from_progress,
 )
 
 
@@ -1622,6 +1624,7 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "/api/batch-runs/bulk-delete" in paths
     assert "/api/tasks/cleanup" in paths
     assert "/api/tasks/{task_id}" in paths
+    assert "/api/tasks/{task_id}/cancel" in paths
     assert "/api/batch-runs/upload" in paths
     assert "/api/batch-runs/{run_id}/retry-problem-pages" in paths
     assert "/api/config" in paths
@@ -1735,6 +1738,13 @@ def test_ops_app_serves_dashboard_and_health(tmp_path: Path, monkeypatch) -> Non
     assert "max-width: 1400px" in dashboard_css
     assert "overflow-wrap: anywhere" in dashboard_css
     assert "width: 100vw" in dashboard_css
+    # 列表页的列宽保护和表头吸顶依赖这些约定,改名会让样式静默失效。
+    assert dashboard_html.count("table-wrap table-scroll") == 4
+    assert ".table-scroll thead th { position: sticky" in dashboard_css
+    assert "col-time" in dashboard_js
+    assert "clearTaskSelection" in dashboard_js
+    assert "data-task-cancel" in dashboard_js
+    assert "/cancel`" in dashboard_js
 
     index_route = next(route for route in app.routes if route.path == "/")
     response = asyncio.run(index_route.endpoint())
@@ -1955,4 +1965,286 @@ def test_start_batch_preserves_browser_upload_for_preview(tmp_path: Path, monkey
     assert not upload_dir.exists()
     assert (preserved_input / "a.pdf").is_file()
     assert record["settings"]["source_type"] == "browser_upload"
+    asyncio.run(runtime.close())
+
+
+def test_strip_pages_removes_per_page_arrays_only():
+    progress = {
+        "total_pages": 3,
+        "completed_pages": 2,
+        "files": [
+            {
+                "file_name": "a.pdf",
+                "total_pages": 3,
+                "pages": [{"page_idx": 0, "page_number": 1, "status": "completed"}],
+            }
+        ],
+    }
+
+    trimmed = strip_pages_from_progress(progress)
+
+    # 计数保留,逐页数组去掉,其余字段原样。
+    assert trimmed["total_pages"] == 3
+    assert trimmed["completed_pages"] == 2
+    assert trimmed["files"] == [{"file_name": "a.pdf", "total_pages": 3}]
+    assert "pages" in progress["files"][0], "原始数据不能被就地修改"
+
+
+def test_strip_pages_tolerates_missing_or_odd_progress():
+    assert strip_pages_from_progress(None) == {}
+    assert strip_pages_from_progress({"phase": "queued"}) == {"phase": "queued"}
+    assert strip_pages_from_progress({"files": "not-a-list"}) == {"files": "not-a-list"}
+
+
+def test_slim_task_for_list_drops_pages_and_keeps_row_fields():
+    task = {
+        "task_id": "task-1",
+        "status": "completed",
+        "backend": "vlm-http-client",
+        "file_names": ["a.pdf"],
+        "progress": {
+            "total_pages": 2,
+            "completed_pages": 2,
+            "files": [{"file_name": "a.pdf", "total_pages": 2, "pages": [{"page_idx": 0}]}],
+        },
+    }
+
+    slim = slim_task_for_list(task)
+
+    assert slim["task_id"] == "task-1"
+    assert slim["file_names"] == ["a.pdf"]
+    assert slim["progress"]["completed_pages"] == 2
+    assert "pages" not in slim["progress"]["files"][0]
+    assert "pages" in task["progress"]["files"][0]
+
+
+def test_count_tasks_by_status_and_failed_pages(tmp_path: Path):
+    store = OpsStore(tmp_path / "ops.db")
+    store.upsert_tasks([
+        {"task_id": "t1", "status": "completed", "progress": {"files": []}},
+        {"task_id": "t2", "status": "completed", "progress": {"files": []}},
+        {"task_id": "t3", "status": "processing", "progress": {"files": []}},
+    ])
+    store.upsert_tasks([
+        {
+            "task_id": "t4",
+            "status": "completed",
+            "progress": {
+                "files": [
+                    {
+                        "file_name": "a.pdf",
+                        "total_pages": 2,
+                        "pages": [
+                            {"page_idx": 0, "page_number": 1, "status": "skipped"},
+                            {"page_idx": 1, "page_number": 2, "status": "failed"},
+                        ],
+                    }
+                ]
+            },
+        },
+    ])
+
+    assert store.count_tasks_by_status() == {
+        "completed": 3,
+        "processing": 1,
+    }
+    assert store.count_failed_pages() == (1, 1)
+
+
+def test_batch_metrics_drops_page_samples_and_slims_slowest_pages(tmp_path: Path):
+    store = OpsStore(tmp_path / "ops.db")
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
+    try:
+        runtime = OpsRuntime()
+        run_id = "run-metrics"
+        run_dir = runtime.report_dir / run_id
+        results_dir = run_dir / "results" / "task-metrics"
+        results_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "input").mkdir(parents=True, exist_ok=True)
+        (results_dir / "preview.json").write_text(
+            json.dumps({
+                "task_id": "task-metrics",
+                "file_name": "a.pdf",
+                "relative_path": "a.pdf",
+                "task_status": "completed",
+                "progress": {
+                    "total_pages": 2,
+                    "files": [
+                        {
+                            "file_name": "a.pdf",
+                            "total_pages": 2,
+                            "pages": [
+                                {"page_idx": 0, "page_number": 1, "status": "completed",
+                                 "vlm_request_seconds": 9.0, "total_seconds": 10.0},
+                                {"page_idx": 1, "page_number": 2, "status": "completed",
+                                 "vlm_request_seconds": 1.0, "total_seconds": 2.0},
+                            ],
+                        }
+                    ],
+                },
+            }),
+            encoding="utf-8",
+        )
+        store.create_batch_run(
+            run_id,
+            tmp_path,
+            {"input_path": "."},
+            run_dir / "BATCH_DIAGNOSIS.md",
+            run_dir / "raw",
+            run_dir / "batch.log",
+        )
+        store.update_batch_run(run_id, status="completed")
+
+        metrics = runtime.batch_run_metrics(store.get_batch_run(run_id))
+
+        assert "page_samples" not in metrics
+        assert metrics["page_sample_count"] == 2
+        assert metrics["slowest_pages"][0]["page_number"] == 1
+        assert metrics["slowest_pages"][0]["seconds"] == 9.0
+        # 逐页大字段不再随 metrics 一起传输。
+        assert set(metrics["slowest_pages"][0]) == {"page_number", "file_name", "seconds", "timeout"}
+        asyncio.run(runtime.close())
+    finally:
+        monkeypatch.undo()
+
+
+def test_cancel_task_stops_pending_task_and_clears_cache(tmp_path: Path, monkeypatch) -> None:
+    """#4:取消必须真的让任务停下来,并把控制台那一行也清掉。"""
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
+    monkeypatch.setenv("MINERU_OPS_AUTH_TOKEN", "tok")
+    runtime = OpsRuntime()
+    runtime.store.upsert_tasks([
+        {
+            "task_id": "cancel-me",
+            "status": "processing",
+            "source_batch_run_id": "run-1",
+            "progress": {"total_pages": 1, "files": []},
+        }
+    ])
+
+    async def fake_delete(url, *args, **kwargs):
+        return httpx.Response(200, json={"task_id": "cancel-me", "cancelled": True})
+
+    monkeypatch.setattr(runtime.http_client, "delete", fake_delete)
+    runtime.router_url = "http://router:8002"
+    monkeypatch.setattr(ops_module, "OpsRuntime", lambda: runtime)
+    app = create_app()
+
+    from fastapi.testclient import TestClient
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/tasks/cancel-me/cancel",
+            headers={"X-MinerU-Ops-Token": "tok"},
+        )
+    assert response.status_code == 200, response.text
+    assert response.json()["cancelled"] is True
+    # 即使任务是批次产生的,取消也要把它从列表里移走。
+    assert runtime.store.cached_task("cancel-me") is None
+    asyncio.run(runtime.close())
+
+
+def test_cancel_task_reports_router_failure_without_clearing_cache(tmp_path: Path, monkeypatch) -> None:
+    """Router 没确认取消时,不能把缓存删掉:否则页面显示的"已取消"是假的。"""
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
+    monkeypatch.setenv("MINERU_OPS_AUTH_TOKEN", "tok")
+    runtime = OpsRuntime()
+    runtime.store.upsert_tasks([{"task_id": "still-there", "status": "processing", "progress": {"files": []}}])
+
+    async def fake_delete(url, *args, **kwargs):
+        raise httpx.ConnectError("router down")
+
+    monkeypatch.setattr(runtime.http_client, "delete", fake_delete)
+    monkeypatch.setattr(ops_module, "OpsRuntime", lambda: runtime)
+    app = create_app()
+
+    from fastapi.testclient import TestClient
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/tasks/still-there/cancel",
+            headers={"X-MinerU-Ops-Token": "tok"},
+        )
+    assert response.status_code == 502
+    assert runtime.store.cached_task("still-there") is not None
+    asyncio.run(runtime.close())
+
+
+def test_overview_tiles_count_every_task_not_just_the_first_page(tmp_path: Path, monkeypatch) -> None:
+    """#6:总览的计数曾经来自列表前 100 条,任务一多就会少算;现在走服务端聚合。"""
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
+    monkeypatch.setenv("MINERU_OPS_AUTH_TOKEN", "tok")
+    runtime = OpsRuntime()
+    runtime.store.upsert_tasks(
+        [
+            {"task_id": f"done-{index}", "status": "completed", "progress": {"files": []}}
+            for index in range(150)
+        ]
+    )
+    runtime.store.upsert_tasks(
+        [
+            {"task_id": "running-1", "status": "processing", "progress": {"files": []}},
+            {"task_id": "queued-1", "status": "pending", "progress": {"files": []}},
+            {"task_id": "broken-1", "status": "failed", "progress": {"files": []}},
+        ]
+    )
+
+    async def no_router(*args, **kwargs):
+        raise httpx.ConnectError("router down")
+
+    monkeypatch.setattr(runtime.http_client, "get", no_router)
+    monkeypatch.setattr(ops_module, "OpsRuntime", lambda: runtime)
+    app = create_app()
+
+    from fastapi.testclient import TestClient
+
+    with TestClient(app) as client:
+        response = client.get("/api/overview", headers={"X-MinerU-Ops-Token": "tok"})
+
+    assert response.status_code == 200, response.text
+    counts = response.json()["task_counts"]
+    # Router 不可达时仍要给出缓存里的真实计数,而不是退回第一页。
+    assert counts["completed"] == 150
+    assert counts["processing"] == 1
+    assert counts["pending"] == 1
+    assert counts["failed"] == 1
+    asyncio.run(runtime.close())
+
+
+def test_task_events_stops_immediately_when_task_is_gone(tmp_path: Path, monkeypatch) -> None:
+    """任务已被终止:SSE 要报一次就收尾,不能每秒重新问一个不存在的任务。"""
+    monkeypatch.setenv("MINERU_OPS_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MINERU_OPS_TEST_ROOT", str(tmp_path))
+    monkeypatch.setenv("MINERU_OPS_AUTH_TOKEN", "tok")
+    runtime = OpsRuntime()
+    router_calls: list[str] = []
+
+    async def gone(url, *args, **kwargs):
+        if "/tasks/gone" in str(url):
+            router_calls.append("call")
+        return httpx.Response(404, text="not found")
+
+    monkeypatch.setattr(runtime.http_client, "get", gone)
+    monkeypatch.setattr(ops_module, "OpsRuntime", lambda: runtime)
+    app = create_app()
+
+    from fastapi.testclient import TestClient
+
+    with TestClient(app) as client:
+        with client.stream(
+            "GET",
+            "/api/tasks/gone/events",
+            headers={"X-MinerU-Ops-Token": "tok"},
+        ) as response:
+            body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert "task not found" in body
+    assert body.count("data:") == 1, "只应推送一次"
+    assert len(router_calls) == 1, "404 之后不能再轮询 Router"
     asyncio.run(runtime.close())

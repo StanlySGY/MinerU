@@ -81,7 +81,8 @@ TASK_PENDING = "pending"
 TASK_PROCESSING = "processing"
 TASK_COMPLETED = "completed"
 TASK_FAILED = "failed"
-TASK_TERMINAL_STATES = {TASK_COMPLETED, TASK_FAILED}
+TASK_CANCELLED = "cancelled"
+TASK_TERMINAL_STATES = {TASK_COMPLETED, TASK_FAILED, TASK_CANCELLED}
 SUPPORTED_UPLOAD_SUFFIXES = pdf_suffixes + image_suffixes + office_suffixes
 RESULT_IMAGE_SUFFIXES = set(image_suffixes) | {"svg"}
 DEFAULT_TASK_RETENTION_SECONDS = 24 * 60 * 60
@@ -1090,6 +1091,9 @@ class AsyncTaskManager:
         self.dispatcher_task: Optional[asyncio.Task[Any]] = None
         self.cleanup_task: Optional[asyncio.Task[Any]] = None
         self.active_tasks: set[asyncio.Task[Any]] = set()
+        # task_id -> processor coroutine, so a cancel can stop the work in progress.
+        self.processors: dict[str, asyncio.Task[Any]] = {}
+        self.cancelled_task_ids: set[str] = set()
         self.last_worker_error: Optional[str] = None
         self.is_shutting_down = False
         self.task_retention_seconds = get_task_retention_seconds()
@@ -1150,6 +1154,40 @@ class AsyncTaskManager:
         if status:
             tasks = [task for task in tasks if task.status == status]
         return sorted(tasks, key=lambda task: task.created_at, reverse=True)
+
+    async def cancel(self, task_id: str) -> bool:
+        """Stop a task and drop it from the manager.
+
+        A pending task is simply not started. A running task has its processor
+        cancelled, which is what makes an in-flight parse stop consuming VLM time.
+        Returns False when the task is unknown.
+        """
+        task = self.tasks.get(task_id)
+        if task is None:
+            return False
+
+        processor = self.processors.get(task_id)
+        if task.status == TASK_PENDING or processor is None:
+            # Still queued: mark it so the dispatcher skips it when it dequeues.
+            self.cancelled_task_ids.add(task_id)
+        if processor is not None:
+            if not processor.done():
+                processor.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await processor
+            # Drop the mapping here rather than waiting for the done callback, so a
+            # cancelled task can never be looked up again.
+            self.processors.pop(task_id, None)
+            self.active_tasks.discard(processor)
+
+        self.tasks.pop(task_id, None)
+        task_event = self.task_events.pop(task_id, None)
+        if task_event is not None:
+            task_event.set()
+        cleanup_file(task.output_dir)
+        task_progress_registry.remove(task_id)
+        logger.info(f"Cancelled async task: {task_id}")
+        return True
 
     def get_queued_ahead(self, task_id: str) -> int | None:
         task = self.tasks.get(task_id)
@@ -1267,6 +1305,7 @@ class AsyncTaskManager:
                     name=f"mineru-fastapi-task-{task_id}",
                 )
                 self.active_tasks.add(processor)
+                self.processors[task_id] = processor
                 processor.add_done_callback(self._on_processor_done)
                 self.queue.task_done()
         except asyncio.CancelledError:
@@ -1291,6 +1330,9 @@ class AsyncTaskManager:
 
     def _on_processor_done(self, processor: asyncio.Task[Any]) -> None:
         self.active_tasks.discard(processor)
+        for task_id, registered in list(self.processors.items()):
+            if registered is processor:
+                self.processors.pop(task_id, None)
         if processor.cancelled():
             return
         exception = processor.exception()
@@ -1301,6 +1343,10 @@ class AsyncTaskManager:
     async def _process_task(self, task_id: str) -> None:
         task = self.tasks.get(task_id)
         if task is None:
+            return
+        if task_id in self.cancelled_task_ids:
+            # Cancelled while sitting in the queue: never start the work.
+            self.cancelled_task_ids.discard(task_id)
             return
 
         try:
@@ -1532,6 +1578,23 @@ async def stream_async_task_events(task_id: str, request: Request):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.delete(
+    path="/tasks/{task_id}",
+    name="cancel_async_task",
+    summary="Cancel an unfinished task and drop it",
+    description=(
+        "Stop a queued or running parse task. A queued task is never started; a "
+        "running one has its in-flight parse cancelled. The task then disappears "
+        "from the status and result endpoints."
+    ),
+)
+async def cancel_async_task(task_id: str, request: Request):
+    task_manager = get_task_manager()
+    if not await task_manager.cancel(task_id):
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {"task_id": task_id, "cancelled": True}
 
 
 @app.get(path="/tasks/{task_id}/result", name="get_async_task_result")

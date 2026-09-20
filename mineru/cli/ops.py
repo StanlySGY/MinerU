@@ -52,7 +52,16 @@ TERMINAL_BATCH_STATES = {
     "interrupted",
 }
 ACTIVE_BATCH_STATES = {"pending", "running", "paused", "cancelling"}
+# Router task states that mean the task will not change again, so the console
+# can treat it as finished without polling its detail endpoint.
+TERMINAL_TASK_STATES = {"completed", "failed", "cancelled", "interrupted"}
 BATCH_PROCESS_TERMINATE_TIMEOUT_SECONDS = 5.0
+# A reachable external VLM answers /models immediately; an unreachable one used to
+# hold the status response for the shared 15s client timeout once per configured
+# VLM. A short budget keeps the console responsive when a VLM host is down.
+SERVICE_PROBE_TIMEOUT_SECONDS = 5.0
+# Concurrent consoles all poll every 10s, so collapse their probes onto one round.
+SERVICE_PROBE_CACHE_SECONDS = 3.0
 DEFAULT_BATCH_REAPER_INTERVAL_SECONDS = 30.0
 DEFAULT_BATCH_ORPHAN_GRACE_SECONDS = 120.0
 DEFAULT_BATCH_MAX_RUNTIME_SECONDS = 86400.0
@@ -118,6 +127,39 @@ def json_loads_object(value: str | None) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def strip_pages_from_progress(progress: Any) -> dict[str, Any]:
+    """Drop the per-page arrays the list views never read.
+
+    ``progress.files[].pages`` is nearly the whole payload of a task snapshot
+    (about 98% of one entry) while the task list only renders the page counters.
+    The detail view fetches a single task, so it keeps the arrays.
+    """
+    if not isinstance(progress, dict):
+        return {}
+    files = progress.get("files")
+    if not isinstance(files, list):
+        return progress
+    trimmed = {key: value for key, value in progress.items() if key != "files"}
+    trimmed["files"] = [
+        {
+            key: value
+            for key, value in file_state.items()
+            if key != "pages"
+        }
+        if isinstance(file_state, dict)
+        else file_state
+        for file_state in files
+    ]
+    return trimmed
+
+
+def slim_task_for_list(task: dict[str, Any]) -> dict[str, Any]:
+    """Return a task snapshot without the per-page detail arrays."""
+    trimmed = {key: value for key, value in task.items() if key != "progress"}
+    trimmed["progress"] = strip_pages_from_progress(task.get("progress"))
+    return trimmed
 
 
 def markdown_table_cell(value: Any, limit: int = 500) -> str:
@@ -793,6 +835,33 @@ class OpsStore:
                 row = connection.execute("SELECT COUNT(*) FROM task_snapshots").fetchone()
         return int(row[0] if row else 0)
 
+    def count_tasks_by_status(self) -> dict[str, int]:
+        """Return per-status snapshot counts in one query.
+
+        The overview tiles only need these counters, so counting in SQLite keeps
+        it from loading every snapshot payload just to tally them in Python.
+        """
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT status, COUNT(*) FROM task_snapshots GROUP BY status"
+            ).fetchall()
+        return {str(row[0]): int(row[1]) for row in rows}
+
+    def count_failed_pages(self) -> tuple[int, int]:
+        """Return (skipped, failed) page totals from the page-timing table.
+
+        The overview tiles used to add these up in Python across 100 task
+        snapshots; the timing rows are already the authoritative per-page record,
+        so a single grouped query is both cheaper and more accurate.
+        """
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT status, COUNT(*) FROM task_page_timings "
+                "WHERE status IN ('skipped', 'failed') GROUP BY status"
+            ).fetchall()
+        counts = {str(row[0]): int(row[1]) for row in rows}
+        return counts.get("skipped", 0), counts.get("failed", 0)
+
     def cached_task(self, task_id: str) -> dict[str, Any] | None:
         with self.connect() as connection:
             row = connection.execute(
@@ -1106,6 +1175,9 @@ class OpsRuntime:
         )
         self.save_result_images = env_bool("MINERU_OPS_SAVE_RESULT_IMAGES", True)
         self.cleanup_expired_artifacts()
+        self._artifact_storage_cache: tuple[float, dict[str, Any]] | None = None
+        self._services_probe_cache: tuple[float, list[dict[str, Any]]] | None = None
+        self._services_probe_lock = asyncio.Lock()
         self.http_client = httpx.AsyncClient(timeout=15.0, follow_redirects=True)
 
     @staticmethod
@@ -1667,6 +1739,21 @@ class OpsRuntime:
             "retention_days": self.artifact_retention_days,
             "save_result_images": self.save_result_images,
         }
+
+    def cached_artifact_storage_status(self, ttl_seconds: float = 60.0) -> dict[str, Any]:
+        """Cache the artifact footprint.
+
+        Sizing the artifact tree walks every uploaded PDF and extracted image, so
+        recomputing it on each viewer's poll multiplies the cost by the number of
+        open consoles.
+        """
+        now = time.monotonic()
+        cached = self._artifact_storage_cache
+        if cached is not None and now - cached[0] < ttl_seconds:
+            return cached[1]
+        status = self.artifact_storage_status()
+        self._artifact_storage_cache = (now, status)
+        return status
 
     def cleanup_expired_artifacts(self) -> None:
         now = datetime.now(timezone.utc)
@@ -2738,12 +2825,28 @@ class OpsRuntime:
         average_page_seconds = elapsed_seconds / processed_for_rate if processed_for_rate else 0.0
         status = str(record.get("status") or "")
         complete = status in TERMINAL_BATCH_STATES and pending_pages == 0
+        # Keep only the fields the console renders: shipping whole page records here
+        # made the slowest-page list a large share of the batch response.
         slowest_pages = sorted(
-            [
-                {**page, "duration_seconds": round(number(self._first_not_none(page.get("vlm_request_seconds"), page.get("total_seconds"))) or 0.0, 3)}
+            (
+                {
+                    "page_number": page.get("page_number"),
+                    "file_name": page.get("file_name"),
+                    "seconds": round(
+                        number(
+                            self._first_not_none(
+                                page.get("vlm_request_seconds"),
+                                page.get("total_seconds"),
+                            )
+                        )
+                        or 0.0,
+                        3,
+                    ),
+                    "timeout": bool(page.get("timeout")),
+                }
                 for page in page_samples
-            ],
-            key=lambda item: item["duration_seconds"],
+            ),
+            key=lambda item: item["seconds"],
             reverse=True,
         )[:10]
         return {
@@ -2769,7 +2872,10 @@ class OpsRuntime:
             "with_retry_seconds": round(with_retry_seconds, 3),
             "timeout_pages": timeout_pages,
             "timeout_rate": round(timeout_pages / total_pages, 4) if total_pages else 0.0,
-            "page_samples": page_samples[:500],
+            # page_samples used to ship here: they were 96% of this response and the
+            # console never read them. Keep only the count the compare view needs;
+            # the detail view serves per-page data on demand.
+            "page_sample_count": len(page_samples),
             "complete": complete,
         }
 
@@ -2932,6 +3038,16 @@ class OpsRuntime:
             self.last_task_sync_monotonic = now
             return items
 
+    def invalidate_task_sync_cache(self) -> None:
+        """Drop the cached task-sync payload.
+
+        The list endpoint serves a snapshot refreshed every few seconds. After the
+        console deletes or cancels a task it must show that immediately, so the next
+        request has to re-query instead of replaying the stale list.
+        """
+        self.last_task_sync_monotonic = 0.0
+        self.last_task_sync_items = []
+
     def cleanup_task_snapshots(self) -> int:
         cutoff = datetime.now(timezone.utc) - timedelta(days=self.task_retention_days)
         batch_run_ids = {
@@ -3077,7 +3193,7 @@ class OpsRuntime:
                 item_warnings.append("实验尚未完成")
             if int(metrics.get("failed_pages") or 0) > 0:
                 item_warnings.append("存在失败或跳过页")
-            if int(metrics.get("total_pages") or 0) > len(metrics.get("page_samples") or []):
+            if int(metrics.get("total_pages") or 0) > int(metrics.get("page_sample_count") or 0):
                 item_warnings.append("页级样本不足")
             elapsed = float(metrics.get("elapsed_seconds") or 0)
             baseline_elapsed = float(baseline_metrics.get("elapsed_seconds") or 0)
@@ -3921,14 +4037,14 @@ def create_app() -> FastAPI:
                 detail=f"operations agent unavailable: {exc}",
             ) from exc
 
-    async def query_service(service: dict[str, Any]) -> dict[str, Any]:
+    async def query_service(service: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
         result = dict(service)
         endpoint = service.get("endpoint")
         if not endpoint:
             result.update({"health": "unknown", "health_error": "no health endpoint"})
             return result
         try:
-            response = await runtime.http_client.get(endpoint)
+            response = await runtime.http_client.get(endpoint, timeout=timeout)
             payload = response.json() if "json" in response.headers.get("content-type", "") else None
             result.update(
                 {
@@ -3949,18 +4065,20 @@ def create_app() -> FastAPI:
     @app.get("/api/overview")
     async def overview(request: Request):
         authorize(request)
+        # The tiles need service health and a few counters only. Pulling the full
+        # task payloads here was the expensive part: an unreachable external VLM
+        # probe burns its whole timeout, and counting statuses from 100 complete
+        # snapshots is pure overhead.
         services = await services_view(request)
-        tasks_payload = await tasks_view(request, limit=100, offset=0, status=None)
-        tasks = tasks_payload.get("items", [])
-        counts: dict[str, int] = {}
-        skipped_pages = 0
-        failed_pages = 0
-        for task in tasks:
-            status = str(task.get("status", "unknown"))
-            counts[status] = counts.get(status, 0) + 1
-            progress = task.get("progress") or {}
-            skipped_pages += int(progress.get("skipped_pages", 0) or 0)
-            failed_pages += int(progress.get("failed_pages", 0) or 0)
+        # Refresh the snapshot table before counting, so a task that finished or was
+        # cancelled is reflected in the tiles. The sync is interval-cached, so this
+        # normally costs nothing; if the Router is down the cached counts still stand.
+        try:
+            await runtime.sync_task_snapshots()
+        except Exception as exc:
+            logger.warning("Ops overview task sync failed: {}", exc)
+        counts = runtime.store.count_tasks_by_status()
+        skipped_pages, failed_pages = runtime.store.count_failed_pages()
         batch_runs = runtime.store.list_batch_runs(limit=10)
         for item in batch_runs:
             item["task_links"] = runtime.batch_task_links(item)
@@ -4082,22 +4200,41 @@ def create_app() -> FastAPI:
     @app.get("/api/services")
     async def services_view(request: Request):
         authorize(request)
-        definitions = runtime.discover_services()
-        health_results = await asyncio.gather(*(query_service(service) for service in definitions))
-        agent_result = await runtime.agent_call({"action": "services"}, timeout=15)
-        runtime_states = agent_result.get("services", {}) if agent_result.get("ok") else {}
-        for service in health_results:
-            state = runtime_states.get(service["name"], {}) if isinstance(runtime_states, dict) else {}
-            if service.get("remote") and not state:
-                state = {
-                    "state": "remote",
-                    "status": "远程 API，只提供健康检查",
-                    "health": "none",
-                }
-            apply_service_runtime_health(service, state)
-            if not agent_result.get("ok"):
-                service["agent_error"] = agent_result.get("error")
-        return health_results
+        return await probe_services()
+
+    async def probe_services() -> list[dict[str, Any]]:
+        """Probe every declared service, sharing one round across concurrent callers."""
+        cached = runtime._services_probe_cache
+        if cached is not None and time.monotonic() - cached[0] < SERVICE_PROBE_CACHE_SECONDS:
+            return cached[1]
+
+        async with runtime._services_probe_lock:
+            cached = runtime._services_probe_cache
+            if cached is not None and time.monotonic() - cached[0] < SERVICE_PROBE_CACHE_SECONDS:
+                return cached[1]
+
+            definitions = runtime.discover_services()
+            health_results = await asyncio.gather(
+                *(
+                    query_service(service, timeout=SERVICE_PROBE_TIMEOUT_SECONDS)
+                    for service in definitions
+                )
+            )
+            agent_result = await runtime.agent_call({"action": "services"}, timeout=15)
+            runtime_states = agent_result.get("services", {}) if agent_result.get("ok") else {}
+            for service in health_results:
+                state = runtime_states.get(service["name"], {}) if isinstance(runtime_states, dict) else {}
+                if service.get("remote") and not state:
+                    state = {
+                        "state": "remote",
+                        "status": "远程 API,只提供健康检查",
+                        "health": "none",
+                    }
+                apply_service_runtime_health(service, state)
+                if not agent_result.get("ok"):
+                    service["agent_error"] = agent_result.get("error")
+            runtime._services_probe_cache = (time.monotonic(), health_results)
+            return health_results
 
     @app.get("/api/diagnostics/runtime")
     async def runtime_diagnostics_view(request: Request):
@@ -4122,7 +4259,8 @@ def create_app() -> FastAPI:
         if definition is None:
             raise HTTPException(status_code=404, detail="service not found")
         if action in {"check", "test"}:
-            result = await query_service(definition)
+            # 单个服务的"检查"按钮和总览探测用同一个预算,否则点一下要等 15 秒。
+            result = await query_service(definition, timeout=SERVICE_PROBE_TIMEOUT_SECONDS)
             if definition.get("role") == "code-sync":
                 agent_result = await runtime.agent_call({"action": "services"}, timeout=15)
                 runtime_states = agent_result.get("services", {}) if agent_result.get("ok") else {}
@@ -4235,7 +4373,7 @@ def create_app() -> FastAPI:
         selected = items[:normalized_limit]
         total = runtime.store.count_tasks(status=status)
         result = {
-            "items": selected,
+            "items": [slim_task_for_list(item) for item in selected],
             "total": total,
             "limit": normalized_limit,
             "offset": normalized_offset,
@@ -4296,8 +4434,45 @@ def create_app() -> FastAPI:
     async def delete_task(task_id: str, request: Request):
         authorize(request, write=True)
         runtime.delete_task_snapshot(task_id)
+        runtime.invalidate_task_sync_cache()
         runtime.store.audit("task_delete", task_id, True)
         return {"ok": True, "task_id": task_id}
+
+    @app.post("/api/tasks/{task_id}/cancel")
+    async def cancel_task(task_id: str, request: Request):
+        """Stop the task on the Router and clear its console cache.
+
+        This is the destructive action: unlike deleting the cache, it interrupts
+        parsing that is still running. The cache entry is cleared only after the
+        Router confirmed, so a failed cancel leaves the console state truthful.
+        """
+        authorize(request, write=True)
+        try:
+            response = await runtime.http_client.delete(
+                f"{runtime.router_url}/tasks/{task_id}"
+            )
+        except Exception as exc:
+            runtime.store.audit("task_cancel", task_id, False, str(exc))
+            raise HTTPException(
+                status_code=502,
+                detail=f"无法连接 Router 取消任务: {exc}",
+            ) from exc
+        if response.status_code >= 400:
+            detail = response.text[:500]
+            runtime.store.audit("task_cancel", task_id, False, detail)
+            raise HTTPException(
+                status_code=502,
+                detail=f"取消任务失败: HTTP {response.status_code} {detail}",
+            )
+        try:
+            # Unlike "delete cache", cancelling must always clear the console row
+            # even when the task came from a batch run.
+            runtime.store.delete_task_snapshots([task_id])
+        except Exception as exc:
+            logger.warning("Clearing cancelled task cache failed for {}: {}", task_id, exc)
+        runtime.invalidate_task_sync_cache()
+        runtime.store.audit("task_cancel", task_id, True)
+        return {"ok": True, "task_id": task_id, "cancelled": True}
 
     @app.get("/api/tasks/{task_id}/page-timings")
     async def task_page_timings(
@@ -4425,10 +4600,25 @@ def create_app() -> FastAPI:
             while True:
                 if await request.is_disconnected():
                     break
+                gone = False
                 try:
                     response = await runtime.http_client.get(f"{runtime.router_url}/tasks/{task_id}")
-                    response.raise_for_status()
-                    payload = response.json()
+                    if response.status_code == 404:
+                        # The task is gone (cancelled or expired). Streaming "unavailable"
+                        # once and stopping is right; retrying would poll the Router every
+                        # second forever for a task that no longer exists. `gone` lets the
+                        # console tell this apart from a transient Router error, which
+                        # must not drop the selection.
+                        gone = True
+                        payload = {
+                            "task_id": task_id,
+                            "status": "unavailable",
+                            "gone": True,
+                            "error": "task not found",
+                        }
+                    else:
+                        response.raise_for_status()
+                        payload = response.json()
                 except Exception as exc:
                     payload = {"task_id": task_id, "status": "unavailable", "error": str(exc)}
                 progress = payload.get("progress") or {}
@@ -4436,7 +4626,7 @@ def create_app() -> FastAPI:
                 if signature != last_signature:
                     yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
                     last_signature = signature
-                if payload.get("status") in {"completed", "failed"}:
+                if gone or payload.get("status") in TERMINAL_TASK_STATES:
                     break
                 await asyncio.sleep(1.0)
 
@@ -4455,7 +4645,7 @@ def create_app() -> FastAPI:
             item["metrics"] = runtime.batch_run_metrics(item)
         return {
             "items": items,
-            "storage": runtime.artifact_storage_status(),
+            "storage": runtime.cached_artifact_storage_status(),
         }
 
     @app.post("/api/batch-runs/bulk-delete")
