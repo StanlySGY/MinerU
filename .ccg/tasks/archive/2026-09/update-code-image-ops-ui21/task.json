@@ -1,0 +1,12 @@
+{
+  "id": "update-code-image-ops-ui21",
+  "title": "发布并更新 ops-ui21 代码镜像",
+  "status": "completed",
+  "complexity": "S",
+  "risk": "medium",
+  "domain": "deployment",
+  "currentPhase": "completed",
+  "nextAction": "UI21 已跳过:本轮修复合并进 UI22,构建导出 mineru-code:v3.4.2-ops-ui22 后在现场替换 MINERU_CODE_IMAGE",
+  "createdAt": "2026-09-18T00:00:00Z",
+  "branch": "dev"
+}
