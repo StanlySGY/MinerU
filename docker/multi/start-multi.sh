@@ -205,6 +205,16 @@ business_services() {
     done
 }
 
+# stop/restart 用:和 deployment_services_into 一样把清单读进数组,但排除
+# mineru-ops —— 停业务服务时控制台要继续可用,否则现场就没法在网页上重新启动。
+business_services_into() {
+    array_name="$1"
+    if ! services="$(business_services)"; then
+        exit 1
+    fi
+    mapfile -t "$array_name" < <(printf '%s\n' "$services" | grep -v '^$')
+}
+
 # 返回 compose 中定义的 API 服务名（mineru-api、mineru-api-1 ... mineru-api-N）。
 # 用于 start/check 动态打印多节点地址，不再写死 API-1。
 api_services() {
@@ -213,6 +223,17 @@ api_services() {
             mineru-api|mineru-api-*) printf '%s\n' "$service" ;;
         esac
     done
+}
+
+# MINERU_API_NODE_IDS 里写节点编号(1,2,3,4),不是服务名 —— 服务名由脚本拼成
+# mineru-api-<编号>。写成 mineru-api-1 会被拼成 mineru-api-mineru-api-1,而报错
+# 文案里只出现拼好的名字,现场很难看出是自己多写了前缀,所以这里额外点破。
+node_id_format_hint() {
+    case ",$1," in
+        *,mineru-api-*)
+            echo "提示:MINERU_API_NODE_IDS 只写编号,例如 1,2,3,4;不要写服务名 mineru-api-1。" >&2
+            ;;
+    esac
 }
 
 selected_api_services() {
@@ -224,7 +245,9 @@ selected_api_services() {
         if api_services | grep -Fxq "$service"; then
             printf '%s\n' "$service"
         else
-            echo "错误：MINERU_API_NODE_IDS 包含未定义服务 $service。" >&2
+            echo "错误:MINERU_API_NODE_IDS 包含未定义服务 $service。" >&2
+            node_id_format_hint "$node_id"
+            echo "      Compose 中可用的 API 节点:$(api_services | tr '\n' ' ')" >&2
             return 1
         fi
     done
@@ -237,18 +260,38 @@ deployment_services() {
             ;;
         api)
             printf '%s\n' mineru-code-sync
-            selected_api_services
+            # 节点名带前缀写错时这里会失败;命令替换会吃掉 return 1,所以
+            # 调用方要用 deployment_services_into,由它负责报错并终止。
+            selected_api_services || return 1
             ;;
         all)
             printf '%s\n' mineru-code-sync
-            selected_api_services
+            selected_api_services || return 1
             printf '%s\n' mineru-router mineru-ops
             ;;
         *)
-            echo "错误：MINERU_DEPLOY_ROLE 只支持 router、api 或 all，当前为 $MINERU_DEPLOY_ROLE。" >&2
+            echo "错误:MINERU_DEPLOY_ROLE 只支持 router、api 或 all,当前为 $MINERU_DEPLOY_ROLE。" >&2
             return 1
             ;;
     esac
+}
+
+# 把 deployment_services 的输出读进调用方通过名字给到的数组。
+# 服务清单为空是危险状态:compose up -d 不带服务名会拉起全部服务,
+# compose stop/restart 不带服务名会被拒绝,两者都和 env.multi 的意图不符,
+# 所以这里既检查部署角色是否合法,也检查清单是否为空。
+deployment_services_into() {
+    array_name="$1"
+    if ! services="$(deployment_services)"; then
+        exit 1
+    fi
+    # herestring 会给空输出留下一个空元素,所以先去掉空行再判断清单是否为空。
+    mapfile -t "$array_name" < <(printf '%s\n' "$services" | grep -v '^$')
+    eval "count=\${#${array_name}[@]}"
+    if [ "$count" -eq 0 ]; then
+        echo "错误:按 MINERU_DEPLOY_ROLE=$MINERU_DEPLOY_ROLE 和 MINERU_API_NODE_IDS=$MINERU_API_NODE_IDS 得到空的服务清单,已中止。" >&2
+        exit 1
+    fi
 }
 
 # 解析 env.multi 中所有 VLM_<N>_IP 配置，输出 "N IP PORT" 列表。
@@ -494,7 +537,12 @@ check() {
         fi
         # 未填 IP 的节点会在容器内回落到 127.0.0.1:30000，上面检查不到它，
         # 所以这里按节点数量补一条提示，避免"检查通过"被误读为 VLM 已配好。
-        selected_api_count=$(selected_api_services | wc -l)
+        # selected_api_services 会校验节点名,失败时这里必须显式退出:
+        # 命令替换会吃掉 return 1,否则脚本会带着空清单继续"检查通过"。
+        if ! selected_services="$(selected_api_services)"; then
+            exit 1
+        fi
+        selected_api_count=$(printf '%s\n' "$selected_services" | grep -c .)
         if [ "$vlm_count" -gt 0 ] && [ "$vlm_count" -lt "$selected_api_count" ]; then
             echo "提示：本机启动 $selected_api_count 个 API 节点，但只填了 $vlm_count 个 VLM_<N>_IP。"
             echo "      未配置的节点会回落到 127.0.0.1:30000，其 hybrid 后端不可用。"
@@ -553,7 +601,7 @@ case "${1:-help}" in
         echo "启动服务（角色：$MINERU_DEPLOY_ROLE；API 节点：$MINERU_API_NODE_IDS）..."
         check
         prepare_ops
-        mapfile -t services_to_start < <(deployment_services)
+        deployment_services_into services_to_start
         compose up -d "${services_to_start[@]}"
         echo ""
         echo "等待服务就绪..."
@@ -600,7 +648,7 @@ case "${1:-help}" in
     stop)
         echo "停止 MinerU 业务服务，保留运维控制台..."
         load_env
-        mapfile -t services_to_stop < <(business_services)
+        business_services_into services_to_stop
         if [ "${#services_to_stop[@]}" -gt 0 ]; then
             compose stop "${services_to_stop[@]}"
         fi
@@ -619,7 +667,7 @@ case "${1:-help}" in
         echo "重启 MinerU 业务服务，保留运维控制台..."
         load_env
         prepare_ops
-        mapfile -t services_to_restart < <(business_services)
+        business_services_into services_to_restart
         if [ "${#services_to_restart[@]}" -gt 0 ]; then
             compose restart "${services_to_restart[@]}"
         fi
