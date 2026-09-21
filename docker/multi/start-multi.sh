@@ -215,14 +215,42 @@ business_services_into() {
     mapfile -t "$array_name" < <(printf '%s\n' "$services" | grep -v '^$')
 }
 
-# 返回 compose 中定义的 API 服务名（mineru-api、mineru-api-1 ... mineru-api-N）。
-# 用于 start/check 动态打印多节点地址，不再写死 API-1。
+# 返回 compose 中定义的 API 服务名(mineru-api、mineru-api-1 ... mineru-api-N)。
+# 用于 start/check 动态打印多节点地址,不再写死 API-1。
 api_services() {
-    compose config --services | while IFS= read -r service; do
+    local names
+    if ! names="$(compose_service_names)"; then
+        return 1
+    fi
+    [ -n "$names" ] || return 0
+    while IFS= read -r service; do
         case "$service" in
             mineru-api|mineru-api-*) printf '%s\n' "$service" ;;
         esac
-    done
+    done <<< "$names"
+}
+
+# compose config --services 的原始输出,一次性读进变量。
+#
+# 不要在调用点直接把它的输出接进 grep -q / head:这类命令命中就退出,上游的
+# docker compose 还在写就会被 SIGPIPE 杀掉,而 set -o pipefail 会把「匹配成功,
+# 但上游被 SIGPIPE」当成整条管道失败,检查逻辑就会凭空报"未定义服务"。这里先
+# 把输出读完,后续比较都在纯 bash 里做,没有提前退出。
+compose_service_names() {
+    local output
+    if ! output="$(compose config --services 2>/dev/null)"; then
+        return 1
+    fi
+    printf '%s\n' "$output"
+}
+
+# 判断服务名是否在 compose 里定义。纯 bash 比较,不经过管道。
+compose_has_service() {
+    local names="$1" wanted="$2" name
+    while IFS= read -r name; do
+        [ "$name" = "$wanted" ] && return 0
+    done <<< "$names"
+    return 1
 }
 
 # MINERU_API_NODE_IDS 里写节点编号(1,2,3,4),不是服务名 —— 服务名由脚本拼成
@@ -237,12 +265,17 @@ node_id_format_hint() {
 }
 
 selected_api_services() {
+    local available node_ids node_id service
+    if ! available="$(compose_service_names)"; then
+        echo "错误:读不到 compose 服务清单,请先确认 docker compose config 能正常执行。" >&2
+        return 1
+    fi
     IFS=',' read -r -a node_ids <<< "$MINERU_API_NODE_IDS"
     for node_id in "${node_ids[@]}"; do
         node_id="${node_id//[[:space:]]/}"
         [ -n "$node_id" ] || continue
         service="mineru-api-${node_id}"
-        if api_services | grep -Fxq "$service"; then
+        if compose_has_service "$available" "$service"; then
             printf '%s\n' "$service"
         else
             echo "错误:MINERU_API_NODE_IDS 包含未定义服务 $service。" >&2
