@@ -819,6 +819,10 @@ dialog { max-width: 1200px; max-height: 90vh; }
 .config-group-summary::-webkit-details-marker { display: none; }
 .config-group-summary::before { content: ""; width: 7px; height: 7px; border-right: 1.5px solid var(--text-muted); border-bottom: 1.5px solid var(--text-muted); transform: rotate(-45deg); transition: transform .12s ease; }
 .config-group[open] > .config-group-summary::before { transform: rotate(45deg); }
+.audit-panel > summary { list-style: none; cursor: pointer; }
+.audit-panel > summary::-webkit-details-marker { display: none; }
+.audit-panel > summary h2::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 8px; border-right: 1.5px solid var(--text-muted); border-bottom: 1.5px solid var(--text-muted); transform: rotate(-45deg); transition: transform .12s ease; }
+.audit-panel[open] > summary h2::before { transform: rotate(45deg); }
 .config-group-title { font-weight: 650; }
 .config-group-count { color: var(--text-muted); font-size: 12px; }
 .config-group-apply { margin-left: auto; }

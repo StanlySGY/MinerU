@@ -49,16 +49,10 @@
         <div id="summary-strip" class="summary-strip"></div>
         <div class="section-heading"><h2>服务状态</h2><span id="overview-health-count"></span></div>
         <div id="overview-services" class="service-grid"></div>
-        <div class="two-column">
-          <section class="panel">
-            <div class="section-heading"><h2>进行中的任务</h2><button data-go="tasks" class="text-button">查看全部</button></div>
-            <div id="overview-tasks" class="table-wrap"></div>
-          </section>
-          <section class="panel">
-            <div class="section-heading"><h2>最近批量测试</h2><button data-go="batch" class="text-button">查看全部</button></div>
-            <div id="overview-batches" class="table-wrap"></div>
-          </section>
-        </div>
+        <section class="panel">
+          <div class="section-heading"><h2>进行中的任务</h2><button data-go="tasks" class="text-button">查看全部</button></div>
+          <div id="overview-tasks" class="table-wrap"></div>
+        </section>
       </section>
 
       <section id="view-services" class="view">
@@ -111,6 +105,8 @@
           </select>
           <input id="task-search" type="search" placeholder="任务 ID 或文件名">
           <button id="tasks-cleanup" type="button" class="secondary-button" title="删除超过保留期的任务记录，不影响仍在运行的解析">清理过期记录</button>
+          <span id="task-selection-count" class="muted">已选择 0 条</span>
+          <button id="tasks-delete-selected" type="button" class="danger-button" disabled>批量删除</button>
           <span id="tasks-retention" class="muted"></span>
         </div>
         <div class="split-view">
@@ -293,16 +289,16 @@
             <div id="config-history" class="config-history"><div class="empty-state">正在读取...</div></div>
           </aside>
         </div>
-        <section class="panel audit-panel">
-          <div class="section-heading">
+        <details id="audit-panel" class="panel audit-panel">
+          <summary class="section-heading">
             <div>
               <h2>操作审计</h2>
-              <p class="muted">记录配置、服务和批量任务操作，不展示敏感原值。</p>
+              <p class="muted">记录配置、服务和批量任务操作，不展示敏感原值。展开后才读取。</p>
             </div>
             <button id="audit-refresh" type="button" class="secondary-button">刷新</button>
-          </div>
-          <div id="audit-log"><div class="empty-state">进入配置页后读取审计记录</div></div>
-        </section>
+          </summary>
+          <div id="audit-log"><div class="empty-state">展开后读取审计记录</div></div>
+        </details>
       </section>
 
       <section id="view-logs" class="view">

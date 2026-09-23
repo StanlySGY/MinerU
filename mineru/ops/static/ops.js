@@ -21,6 +21,7 @@ const state = {
   batches: [],
   batchesError: null,
   selectedBatchRuns: new Set(),
+  selectedTasks: new Set(),
   uploadItems: [],
   activeBatchId: null,
   activeBatchDetail: null,
@@ -389,22 +390,15 @@ async function loadOverview() {
   const gpu = deriveGpuSummary(state.services);
   document.getElementById("summary-strip").innerHTML = [
     ["服务总数", state.services.length, `${healthy} 健康`],
-    ["任务队列", Math.max(0, active), `${failed} 失败`],
-    ["GPU 显存负载", gpu.ratioText, gpu.totalText],
+    ["任务队列", Math.max(0, active), failed ? `<span class="bad-text">${failed} 失败</span>` : "无失败"],
     ["今日解析页数", gpu.pagesToday, gpu.avgPageText],
-  ].map(([label, value, sub]) => renderMetricTile(label, value, sub)).join("");
+  ].map(([label, value, sub]) => renderMetricTile(label, value, sub, true)).join("");
   document.getElementById("overview-health-count").textContent = `${healthy}/${state.services.length} 健康`;
   document.getElementById("overview-services").innerHTML = state.services.map(serviceCard).join("") || `<div class="empty-state">没有发现服务</div>`;
   const activeTasks = state.tasks.filter(item => ["pending", "processing"].includes(item.status));
-  if (activeTasks.length) {
-    document.getElementById("overview-tasks").innerHTML = compactTaskRows(activeTasks);
-  } else {
-    const recentDone = state.tasks
-      .filter(item => ["completed", "completed_with_failures", "partial_success", "failed"].includes(item.status))
-      .sort((a, b) => new Date(b.completed_at || b.created_at || 0) - new Date(a.completed_at || a.created_at || 0));
-    document.getElementById("overview-tasks").innerHTML = `<div class="empty-state compact-empty-state">当前没有进行中的任务</div>${recentDone.length ? `<div class="overview-recent-heading muted">最近完成</div>${compactTaskRows(recentDone, 4)}` : ""}`;
-  }
-  document.getElementById("overview-batches").innerHTML = compactBatchRows(state.batches, 6);
+  document.getElementById("overview-tasks").innerHTML = activeTasks.length
+    ? compactTaskRows(activeTasks)
+    : `<div class="empty-state compact-empty-state">当前没有进行中的任务</div>`;
   updateLogServices();
   document.getElementById("page-meta").textContent = `最后更新：${formatDate(data.updated_at)}`;
 }
@@ -445,8 +439,9 @@ function percentile(sortedValues, q) {
   return sortedValues[Math.max(0, index)];
 }
 
-function renderMetricTile(label, value, sub = "") {
-  return `<div class="summary-item"><span>${esc(label)}</span><strong>${esc(value)}</strong>${sub ? `<div class="muted">${esc(sub)}</div>` : ""}</div>`;
+function renderMetricTile(label, value, sub = "", rawSub = false) {
+  const subHtml = sub ? `<div class="muted">${rawSub ? sub : esc(sub)}</div>` : "";
+  return `<div class="summary-item"><span>${esc(label)}</span><strong>${esc(value)}</strong>${subHtml}</div>`;
 }
 
 function vramMeter(usedBytes, totalBytes) {
@@ -456,7 +451,7 @@ function vramMeter(usedBytes, totalBytes) {
   const cls = ratio >= 0.9 ? "bad" : ratio >= 0.7 ? "warn" : "good";
   return total > 0
     ? `<div class="vram-meter ${cls}"><span style="width:${Math.round(ratio * 100)}%"></span></div><div class="vram-label"><span>显存</span><strong>${formatBytes(used)} / ${formatBytes(total)} (${Math.round(ratio * 100)}%)</strong></div>`
-    : `<div class="vram-label"><span>显存</span><strong class="muted">${used > 0 ? formatBytes(used) : "无数据"}</strong></div>`;
+    : "";
 }
 
 function gpuTempTag(temperature) {
@@ -696,12 +691,14 @@ async function loadTasks() {
     state.tasksError = null;
     const data = await api(`/api/tasks?limit=100${status ? `&status=${encodeURIComponent(status)}` : ""}`);
     state.tasks = data.items || [];
+    state.selectedTasks = new Set([...state.selectedTasks].filter(id => state.tasks.some(task => task.task_id === id)));
     const retention = document.getElementById("tasks-retention");
     if (retention) {
       const total = Number(data.total) || state.tasks.length;
       retention.textContent = `显示最近 ${state.tasks.length} 条，共 ${total} 条 · 缓存保留 ${data.retention_days || 7} 天`;
     }
     renderTasks();
+    updateTaskSelectionUi();
     if (data.source === "cache") notice(`Router 暂不可用，当前显示缓存：${data.error}`);
   } catch (error) {
     state.tasksError = error.message;
@@ -727,9 +724,10 @@ function renderTasks() {
     container.innerHTML = `<div class="empty-state">没有匹配「${esc(query)}」的任务</div>`;
     return;
   }
-  container.innerHTML = `<table><thead><tr><th>文件</th><th>状态</th><th class="col-backend">后端</th><th class="col-num">成功/总页数</th><th class="col-num">跳过</th><th class="col-time">耗时</th><th class="col-time">开始时间</th><th>操作</th></tr></thead><tbody>${tasks.map(task => {
+  const allSelected = tasks.every(task => state.selectedTasks.has(task.task_id));
+  container.innerHTML = `<table><thead><tr><th><input type="checkbox" data-task-select-all ${allSelected ? "checked" : ""} aria-label="全选当前任务"></th><th>文件</th><th>状态</th><th class="col-backend">后端</th><th class="col-num">成功/总页数</th><th class="col-num">跳过</th><th class="col-time">耗时</th><th class="col-time">开始时间</th><th>操作</th></tr></thead><tbody>${tasks.map(task => {
     const p = task.progress || {};
-    return `<tr data-task="${esc(task.task_id)}" class="${task.task_id === state.activeTaskId ? "selected" : ""}"><td><strong>${esc(task.display_name || (task.file_names || []).join(", "))}</strong><div class="muted">${esc((task.file_names || []).join(", "))}</div><div class="mono muted">${esc(task.task_id)}</div></td><td>${badge(task.partial_success ? "partial_success" : task.status)}</td><td class="col-backend">${esc(task.backend)}</td><td class="col-num">${p.completed_pages || 0}/${p.total_pages || "-"}</td><td class="col-num">${p.skipped_pages || 0}</td><td class="task-elapsed col-time">${esc(formatElapsed(task.started_at || task.created_at, task.completed_at))}</td><td class="col-time">${esc(formatDate(task.started_at || task.created_at))}</td><td class="task-row-actions">${taskRowActions(task)}</td></tr>`;
+    return `<tr data-task="${esc(task.task_id)}" class="${task.task_id === state.activeTaskId ? "selected" : ""}"><td><input type="checkbox" data-task-select="${esc(task.task_id)}" ${state.selectedTasks.has(task.task_id) ? "checked" : ""} aria-label="选择 ${esc(task.task_id)}"></td><td><strong>${esc(task.display_name || (task.file_names || []).join(", "))}</strong><div class="muted">${esc((task.file_names || []).join(", "))}</div><div class="mono muted">${esc(task.task_id)}</div></td><td>${badge(task.partial_success ? "partial_success" : task.status)}</td><td class="col-backend">${esc(task.backend)}</td><td class="col-num">${p.completed_pages || 0}/${p.total_pages || "-"}</td><td class="col-num">${p.skipped_pages || 0}</td><td class="task-elapsed col-time">${esc(formatElapsed(task.started_at || task.created_at, task.completed_at))}</td><td class="col-time">${esc(formatDate(task.started_at || task.created_at))}</td><td class="task-row-actions">${taskRowActions(task)}</td></tr>`;
   }).join("")}</tbody></table>`;
 }
 
@@ -743,9 +741,63 @@ function taskRowActions(task) {
   return stop + remove;
 }
 
+function updateTaskSelectionUi() {
+  const count = document.getElementById("task-selection-count");
+  const button = document.getElementById("tasks-delete-selected");
+  if (count) count.textContent = `已选择 ${state.selectedTasks.size} 条`;
+  if (button) button.disabled = !state.selectedTasks.size;
+}
+
+/* 批量删除只清控制台自己的记录。来自批量测试的任务后端会拒绝（409），
+   单独列出来，避免用户以为删了其实还在。 */
+async function deleteTaskRecords(taskIds) {
+  const ids = [...new Set(taskIds)].filter(Boolean);
+  if (!ids.length) return;
+  if (!confirm(`确认删除 ${ids.length} 条任务记录？\n\n只删除控制台里保存的记录和缓存，不会停止仍在运行的解析。来自批量测试的任务需要到「批量测试」里删除对应批次。`)) return;
+  const failed = [];
+  let deleted = 0;
+  for (const taskId of ids) {
+    try {
+      await api(`/api/tasks/${encodeURIComponent(taskId)}`, {method: "DELETE"});
+      deleted += 1;
+      state.selectedTasks.delete(taskId);
+    } catch (error) {
+      failed.push(`${taskId.slice(0, 8)}：${error.message}`);
+    }
+  }
+  if (state.activeTaskId && !state.tasks.some(task => task.task_id === state.activeTaskId && !state.selectedTasks.has(task.task_id))) {
+    if (ids.includes(state.activeTaskId) && !failed.some(item => item.startsWith(state.activeTaskId.slice(0, 8)))) clearTaskSelection();
+  }
+  notice(failed.length ? `已删除 ${deleted} 条，${failed.length} 条未删除：${failed.join("；")}` : `已删除 ${deleted} 条任务记录`, failed.length > 0);
+  await loadTasks();
+}
+
+document.getElementById("tasks-table").addEventListener("change", event => {
+  const all = event.target.closest("[data-task-select-all]");
+  if (all) {
+    document.querySelectorAll("#tasks-table [data-task-select]").forEach(box => {
+      if (all.checked) state.selectedTasks.add(box.dataset.taskSelect);
+      else state.selectedTasks.delete(box.dataset.taskSelect);
+      box.checked = all.checked;
+    });
+    updateTaskSelectionUi();
+    return;
+  }
+  const box = event.target.closest("[data-task-select]");
+  if (!box) return;
+  if (box.checked) state.selectedTasks.add(box.dataset.taskSelect);
+  else state.selectedTasks.delete(box.dataset.taskSelect);
+  updateTaskSelectionUi();
+});
+
+document.getElementById("tasks-delete-selected").addEventListener("click", () => {
+  void deleteTaskRecords([...state.selectedTasks]);
+});
+
 document.getElementById("task-status").addEventListener("change", loadTasks);
 document.getElementById("task-search").addEventListener("input", renderTasks);
 document.getElementById("tasks-table").addEventListener("click", async event => {
+  if (event.target.closest("[data-task-select], [data-task-select-all]")) return;
   const stop = event.target.closest("[data-task-row-cancel]");
   if (stop) {
     event.stopPropagation();
@@ -1472,7 +1524,6 @@ async function handleBatchTableClick(event) {
 }
 
 document.getElementById("batch-table").addEventListener("click", handleBatchTableClick);
-document.getElementById("overview-batches").addEventListener("click", handleBatchTableClick);
 document.getElementById("batch-table").addEventListener("change", event => {
   const checkbox = event.target.closest("[data-batch-select]");
   if (!checkbox) return;
@@ -2563,7 +2614,7 @@ function renderConfig() {
   for (const item of items) groups.set(item.category || "其他配置", [...(groups.get(item.category || "其他配置") || []), item]);
   document.getElementById("config-groups").innerHTML = [...groups.entries()].map(([category, group]) => {
     const editable = group.some(item => item.editable !== false);
-    return `<details class="panel config-group" data-config-category="${esc(category)}" open><summary class="config-group-summary"><span class="config-group-title">${esc(category)}</span><span class="config-group-count">${group.length} 项</span>${editable ? `<button type="button" class="secondary-button config-group-apply" data-config-group-apply="${esc(category)}">保存并应用</button>` : ""}</summary><div class="config-group-body">${group.map(item => configControl(item)).join("")}</div></details>`;
+    return `<details class="panel config-group" data-config-category="${esc(category)}"><summary class="config-group-summary"><span class="config-group-title">${esc(category)}</span><span class="config-group-count">${group.length} 项</span>${editable ? `<button type="button" class="secondary-button config-group-apply" data-config-group-apply="${esc(category)}">保存并应用</button>` : ""}</summary><div class="config-group-body">${group.map(item => configControl(item)).join("")}</div></details>`;
   }).join("") || `<div class="empty-state">没有可显示的配置。</div>`;
   applyConfigGroupsFilter();
 }
@@ -2971,8 +3022,11 @@ async function loadConfig() {
   const status = document.getElementById("config-validation-status");
   status.textContent = "修改输入框后先预览变更；确认后才会写入并重建受影响服务。";
   status.classList.remove("bad-text");
-  void loadAuditLogs();
 }
+
+document.getElementById("audit-panel").addEventListener("toggle", event => {
+  if (event.target.open && state.auditLogs === null) void loadAuditLogs();
+});
 
 function auditDetailText(detail) {
   if (detail == null || detail === "") return "-";
