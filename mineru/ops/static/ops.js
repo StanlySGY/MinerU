@@ -2761,13 +2761,19 @@ async function loadConfigStatus({force = false} = {}) {
   const button = document.getElementById("config-status-refresh");
   state.configStatusLoading = true;
   if (button) button.disabled = true;
-  if (target) target.innerHTML = skeletonState();
+  // 只有第一次（还没有任何结果）才显示骨架屏。轮询和手动刷新时保留上一次的内容，
+  // 否则每次刷新都会把整块清空、高度骤降，看起来像一直在重新加载。
+  if (target && state.configStatus === null) target.innerHTML = skeletonState();
   try {
+    // 不用视图级的 AbortSignal。切走页面时由 configStatusLoading 锁挡住并发，
+    // 请求照常返回并写进 state；用视图 signal 的话，任何一次视图重入都会把这次
+    // 读取掐掉，留下 load_error，下个轮询再清空重来，这块就永远停在加载中。
+    const fetchStatus = path => api(path, {signal: new AbortController().signal});
     try {
-      state.configStatus = await api("/api/config/effective");
+      state.configStatus = await fetchStatus("/api/config/effective");
     } catch (effectiveError) {
       try {
-        state.configStatus = await api("/api/config/status");
+        state.configStatus = await fetchStatus("/api/config/status");
       } catch (legacyError) {
         throw new Error(`${effectiveError.message}；兼容接口同样失败：${legacyError.message}`);
       }
