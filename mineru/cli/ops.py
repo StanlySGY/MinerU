@@ -4966,7 +4966,7 @@ def create_app() -> FastAPI:
 
         # 控制台前端版本号：单一来源。index.html 中的 {{OPS_VERSION}} 占位符
         # （缓存号 ?v=… 与 .version-badge 文案）统一由这里注入。
-        OPS_VERSION = "2.0.0"
+        OPS_VERSION = "2.0.1"
 
         @app.get("/")
         async def index():

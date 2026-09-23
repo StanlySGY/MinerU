@@ -727,15 +727,53 @@ function renderTasks() {
     container.innerHTML = `<div class="empty-state">没有匹配「${esc(query)}」的任务</div>`;
     return;
   }
-  container.innerHTML = `<table><thead><tr><th>文件</th><th>状态</th><th class="col-backend">后端</th><th class="col-num">成功/总页数</th><th class="col-num">跳过</th><th class="col-time">耗时</th><th class="col-time">开始时间</th></tr></thead><tbody>${tasks.map(task => {
+  container.innerHTML = `<table><thead><tr><th>文件</th><th>状态</th><th class="col-backend">后端</th><th class="col-num">成功/总页数</th><th class="col-num">跳过</th><th class="col-time">耗时</th><th class="col-time">开始时间</th><th>操作</th></tr></thead><tbody>${tasks.map(task => {
     const p = task.progress || {};
-    return `<tr data-task="${esc(task.task_id)}" class="${task.task_id === state.activeTaskId ? "selected" : ""}"><td><strong>${esc(task.display_name || (task.file_names || []).join(", "))}</strong><div class="muted">${esc((task.file_names || []).join(", "))}</div><div class="mono muted">${esc(task.task_id)}</div></td><td>${badge(task.partial_success ? "partial_success" : task.status)}</td><td class="col-backend">${esc(task.backend)}</td><td class="col-num">${p.completed_pages || 0}/${p.total_pages || "-"}</td><td class="col-num">${p.skipped_pages || 0}</td><td class="task-elapsed col-time">${esc(formatElapsed(task.started_at || task.created_at, task.completed_at))}</td><td class="col-time">${esc(formatDate(task.started_at || task.created_at))}</td></tr>`;
+    return `<tr data-task="${esc(task.task_id)}" class="${task.task_id === state.activeTaskId ? "selected" : ""}"><td><strong>${esc(task.display_name || (task.file_names || []).join(", "))}</strong><div class="muted">${esc((task.file_names || []).join(", "))}</div><div class="mono muted">${esc(task.task_id)}</div></td><td>${badge(task.partial_success ? "partial_success" : task.status)}</td><td class="col-backend">${esc(task.backend)}</td><td class="col-num">${p.completed_pages || 0}/${p.total_pages || "-"}</td><td class="col-num">${p.skipped_pages || 0}</td><td class="task-elapsed col-time">${esc(formatElapsed(task.started_at || task.created_at, task.completed_at))}</td><td class="col-time">${esc(formatDate(task.started_at || task.created_at))}</td><td class="task-row-actions">${taskRowActions(task)}</td></tr>`;
   }).join("")}</tbody></table>`;
+}
+
+/* 列表行上的操作。终止只对未结束的任务有意义；删除缓存对所有任务都有意义，
+   但它只清控制台自己的记录，所以文案必须把这一点说清楚。 */
+function taskRowActions(task) {
+  const stop = isTaskTerminal(task.status) || task.partial_success
+    ? ""
+    : `<button type="button" class="action-button danger" data-task-row-cancel="${esc(task.task_id)}">停止</button>`;
+  const remove = `<button type="button" class="action-button" data-task-row-delete="${esc(task.task_id)}" title="只删除控制台里的这条记录，不停止正在运行的解析">删除记录</button>`;
+  return stop + remove;
 }
 
 document.getElementById("task-status").addEventListener("change", loadTasks);
 document.getElementById("task-search").addEventListener("input", renderTasks);
-document.getElementById("tasks-table").addEventListener("click", event => {
+document.getElementById("tasks-table").addEventListener("click", async event => {
+  const stop = event.target.closest("[data-task-row-cancel]");
+  if (stop) {
+    event.stopPropagation();
+    const taskId = stop.dataset.taskRowCancel;
+    if (!confirm("确认停止这个任务？\n\n正在进行的解析会被中断，任务从列表中移除。此操作不可撤销。")) return;
+    stop.disabled = true;
+    try {
+      await api(`/api/tasks/${encodeURIComponent(taskId)}/cancel`, {method: "POST"});
+      notice("任务已停止", false);
+      if (state.activeTaskId === taskId) clearTaskSelection();
+      await loadTasks();
+    } catch (error) { notice(error.message); stop.disabled = false; }
+    return;
+  }
+  const remove = event.target.closest("[data-task-row-delete]");
+  if (remove) {
+    event.stopPropagation();
+    const taskId = remove.dataset.taskRowDelete;
+    if (!confirm("确认删除这条任务记录？\n\n只删除控制台里保存的记录和缓存，不会停止仍在运行的解析。")) return;
+    remove.disabled = true;
+    try {
+      await api(`/api/tasks/${encodeURIComponent(taskId)}`, {method: "DELETE"});
+      notice("任务记录已删除", false);
+      if (state.activeTaskId === taskId) clearTaskSelection();
+      await loadTasks();
+    } catch (error) { notice(error.message); remove.disabled = false; }
+    return;
+  }
   const row = event.target.closest("[data-task]");
   if (row) loadTaskDetail(row.dataset.task);
 });
@@ -947,7 +985,7 @@ function renderTaskDetailBody(task, timingPayload, taskId) {
     : "";
   const cacheAction = task.source_batch_run_id
     ? ""
-    : `<button type="button" class="danger-button" data-task-delete="${esc(task.task_id)}" title="只删除控制台缓存，不影响远程任务">删除缓存</button>`;
+    : `<button type="button" class="danger-button" data-task-delete="${esc(task.task_id)}" title="只删除控制台里保存的记录和缓存，不停止仍在运行的解析">删除记录</button>`;
   const elapsed = formatElapsed(task.started_at || task.created_at, task.completed_at);
   const fileSections = (p.files || []).map(file => `<section class="task-file-pages"><div class="task-file-heading"><strong>${esc(file.file_name)}</strong><span>${(file.pages || []).length} 页</span></div><div class="page-list">${(file.pages || []).map(page => `<span class="page-chip ${esc(page.status || "queued")}" title="${esc(pageTitle(page, file.file_name))}">${page.page_number}</span>`).join("")}</div></section>`).join("");
   const problemPages = pages.filter(page => page.status === "skipped" || page.status === "failed");
@@ -1015,7 +1053,7 @@ document.getElementById("task-detail").addEventListener("click", event => {
 
 document.getElementById("task-detail").addEventListener("click", async event => {
   const button = event.target.closest("[data-task-delete]");
-  if (!button || !confirm("确认删除这个任务的控制台缓存?不会取消远程任务。")) return;
+  if (!button || !confirm("确认删除这条任务记录？\n\n只删除控制台里保存的记录和缓存，不会停止仍在运行的解析。")) return;
   try {
     await api(`/api/tasks/${encodeURIComponent(button.dataset.taskDelete)}`, {method: "DELETE"});
     notice("任务缓存已删除", false);
@@ -1092,7 +1130,7 @@ async function refreshTasksView() {
 }
 
 document.getElementById("tasks-cleanup").addEventListener("click", async () => {
-  if (!confirm("确认清理超过保留期的任务缓存？不会影响仍保留的批次记录。")) return;
+  if (!confirm("确认清理超过保留期的任务记录？\n\n只删除控制台里的旧记录，不会停止仍在运行的解析，也不影响批次记录。")) return;
   try {
     const result = await api("/api/tasks/cleanup", {method: "POST"});
     notice(`已清理 ${result.deleted || 0} 条任务缓存`, false);
@@ -2524,9 +2562,8 @@ function renderConfig() {
   const groups = new Map();
   for (const item of items) groups.set(item.category || "其他配置", [...(groups.get(item.category || "其他配置") || []), item]);
   document.getElementById("config-groups").innerHTML = [...groups.entries()].map(([category, group]) => {
-    const compact = category === "其他配置";
     const editable = group.some(item => item.editable !== false);
-    return `<section class="panel config-group${compact ? " config-group-compact" : ""}" data-config-category="${esc(category)}"><div class="section-heading"><div><h2>${esc(category)}</h2><span>${group.length} 项</span></div>${editable ? `<button type="button" class="secondary-button config-group-apply" data-config-group-apply="${esc(category)}">保存并应用</button>` : ""}</div><div class="config-group-body${compact ? " config-group-grid" : ""}">${group.map(item => configControl(item)).join("")}</div></section>`;
+    return `<details class="panel config-group" data-config-category="${esc(category)}" open><summary class="config-group-summary"><span class="config-group-title">${esc(category)}</span><span class="config-group-count">${group.length} 项</span>${editable ? `<button type="button" class="secondary-button config-group-apply" data-config-group-apply="${esc(category)}">保存并应用</button>` : ""}</summary><div class="config-group-body">${group.map(item => configControl(item)).join("")}</div></details>`;
   }).join("") || `<div class="empty-state">没有可显示的配置。</div>`;
   applyConfigGroupsFilter();
 }
@@ -2650,7 +2687,8 @@ function renderConfigStatus(payload = state.configStatus) {
         noteHtml: warnings.length ? noteHtml : null,
       });
     }).join("");
-    return `<article class="config-effective-item"><div class="section-heading"><div><h3 class="mono">${esc(item.key)}</h3><p class="muted">${esc(item.description || item.label || "")}</p></div></div><div class="config-effective-configured"><span>env.multi 配置值</span><code>${esc(configStatusValue(item.configured_value))}</code></div><div class="config-effective-services">${serviceHtml || `<div class="empty-state">没有适用的运行服务。</div>`}</div></article>`;
+    const problem = services.some(([, detail]) => detail.status && detail.status !== "applied");
+    return `<details class="config-effective-item"${problem ? " open" : ""}><summary class="config-effective-summary"><span class="mono">${esc(item.key)}</span><code>${esc(configStatusValue(item.configured_value))}</code><span class="muted">${services.length} 个服务</span></summary><p class="muted config-effective-desc">${esc(item.description || item.label || "")}</p><div class="config-effective-services">${serviceHtml || `<div class="empty-state">没有适用的运行服务。</div>`}</div></details>`;
   }).join("");
   target.innerHTML = `<div class="config-status-meta"><span>检查时间：${esc(formatDate(payload.generated_at))}</span><span>总体状态：${badge(payload.overall || "unknown")}</span><span>Env 版本：${esc(env.version || "-")}</span><span title="${esc(env.sha256 || "")}">SHA256：${esc(env.sha256 ? env.sha256.slice(0, 12) : "-")}</span><span>说明：最终值为 Docker inspect、容器环境变量和已知默认值的推断结果</span></div><div class="config-status-counts">${countHtml}</div><div class="config-effective-list">${itemHtml || `<div class="empty-state">没有可展示的最终配置。</div>`}</div>${Array.isArray(payload.warnings) && payload.warnings.length ? `<div class="config-diagnostic-warning"><strong>整体提示</strong><ul>${payload.warnings.map(item => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}`;
 }

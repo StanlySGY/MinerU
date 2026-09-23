@@ -656,7 +656,7 @@ dialog { max-width: 1200px; max-height: 90vh; }
 .log-toolbar input[type=search] { min-width: 220px; }
 .batch-bulk-toolbar { display: flex; align-items: center; gap: 10px; margin: 12px 0 8px; }
 .batch-bulk-toolbar .muted { margin-right: auto; }
-.danger-button { min-height: 34px; padding: 6px 12px; border: 1px solid #d9827d; border-radius: var(--radius-sm); background: var(--bad-soft); color: var(--bad); }
+.task-row-actions { display: flex; gap: 6px; white-space: nowrap; }
 .danger-button:disabled { opacity: .45; cursor: not-allowed; }
 .log-toolbar { position: sticky; top: 82px; z-index: 2; padding: 8px 0; background: var(--bg-base); }
 .inline-check {
@@ -813,21 +813,20 @@ dialog { max-width: 1200px; max-height: 90vh; }
 .config-toolbar { margin-bottom: 14px; padding: 10px 12px; border: 1px solid var(--border-default); border-radius: var(--radius-md); background: var(--bg-surface); }
 .config-toolbar #config-validation-status { margin-left: auto; font-size: 13px; }
 .config-layout { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 16px; align-items: start; }
-.config-groups { display: grid; gap: 14px; }
-.config-group { padding: 0 16px 10px; overflow: hidden; }
-.config-group .section-heading > div { min-width: 0; }
-.config-group-apply { flex: none; }
+.config-groups { display: grid; gap: 10px; }
+.config-group { padding: 0; overflow: hidden; }
+.config-group-summary { display: flex; align-items: center; gap: 12px; padding: 12px 16px; cursor: pointer; list-style: none; }
+.config-group-summary::-webkit-details-marker { display: none; }
+.config-group-summary::before { content: ""; width: 7px; height: 7px; border-right: 1.5px solid var(--text-muted); border-bottom: 1.5px solid var(--text-muted); transform: rotate(-45deg); transition: transform .12s ease; }
+.config-group[open] > .config-group-summary::before { transform: rotate(45deg); }
+.config-group-title { font-weight: 650; }
+.config-group-count { color: var(--text-muted); font-size: 12px; }
+.config-group-apply { margin-left: auto; }
+.config-group-body { padding: 0 16px 8px; }
 .config-group.hidden { display: none; }
 .config-item { display: grid; grid-template-columns: minmax(230px, .8fr) minmax(260px, 1fr); gap: 7px 16px; padding: 13px 0; border-top: 1px solid var(--border-default); }
 .config-item.hidden { display: none; }
 
-/* 「其他配置」紧凑双列网格：23 项只读配置改为响应式双列，配合搜索过滤 */
-.config-group-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0 20px;
-}
-.config-group-grid .config-item { grid-template-columns: minmax(150px, .8fr) minmax(150px, 1fr); }
 .config-groups-toolbar { margin: 12px 0; }
 .config-groups-toolbar input[type=search] { width: min(360px, 100%); }
 .config-item.has-error { padding: 10px; border: 1px solid var(--bad); border-radius: var(--radius-sm); background: var(--bad-soft); }
@@ -1054,30 +1053,18 @@ button:disabled { cursor: not-allowed; opacity: .58; }
 .audit-detail { max-width: 480px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .audit-load-more { margin-top: 12px; }
 
-.config-effective-list { display: grid; gap: 12px; }
+.config-effective-list { display: grid; gap: 8px; }
+.config-effective-item { border: 1px solid var(--border-default); border-radius: var(--radius-md); background: var(--bg-surface); }
+.config-effective-summary { display: flex; align-items: center; gap: 14px; padding: 10px 14px; cursor: pointer; list-style: none; }
+.config-effective-summary::-webkit-details-marker { display: none; }
+.config-effective-summary .mono { flex: none; min-width: 280px; font-weight: 600; }
+.config-effective-summary code { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-secondary); }
+.config-effective-desc { margin: 0; padding: 0 14px 8px; }
 
-/* Config effective item: flat, restrained — no marketing gradient/shadow */
-.config-effective-item {
-  min-width: 0;
-  padding: 18px;
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-lg);
-  background: var(--bg-surface-raised);
-}
+/* 最终有效配置：每项默认折叠成一行，只有存在未生效/冲突的项才展开 */
+.config-effective-item { min-width: 0; padding: 0 0 4px; }
 .config-effective-item h3 { overflow-wrap: anywhere; }
-.config-effective-configured {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 12px;
-  margin: 14px 0;
-  padding: 11px 13px;
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
-  background: var(--bg-surface);
-}
-.config-effective-configured code { overflow-wrap: anywhere; }
-.config-effective-services { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; }
+.config-effective-services { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; padding: 0 14px 12px; }
 .config-effective-service {
   min-width: 0;
   padding: 14px;
@@ -1178,7 +1165,6 @@ button:disabled { cursor: not-allowed; opacity: .58; }
   .lab-filter-grid { grid-template-columns: 1fr; }
   .lab-selection-actions { align-items: stretch; }
   .lab-selection-actions button { flex: 1; }
-  .config-group-grid { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 720px) {
