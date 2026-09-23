@@ -2695,17 +2695,23 @@ function renderLegacyConfigStatus(payload) {
 function renderConfigStatus(payload = state.configStatus) {
   const target = document.getElementById("config-application-status");
   if (!target) return;
+  const html = configStatusHtml(payload);
+  // 配置页每 10 秒重拉一次。整段 innerHTML 替换会让页面高度骤变、滚动位置被夹紧，
+  // 表现为页面自己往上跳。内容没变就不要动 DOM。
+  if (target.dataset.rendered === html) return;
+  target.dataset.rendered = html;
+  target.innerHTML = html;
+}
+
+function configStatusHtml(payload) {
   if (!payload) {
-    target.innerHTML = `<div class="empty-state">暂无最终有效配置</div>`;
-    return;
+    return `<div class="empty-state">暂无最终有效配置</div>`;
   }
   if (payload.load_error || payload.ok === false) {
-    target.innerHTML = errorState(`最终有效配置读取失败：${payload.load_error || payload.error || "未知错误"}`);
-    return;
+    return errorState(`最终有效配置读取失败：${payload.load_error || payload.error || "未知错误"}`);
   }
   if (!Array.isArray(payload.items) && payload.services) {
-    target.innerHTML = renderLegacyConfigStatus(payload);
-    return;
+    return renderLegacyConfigStatus(payload);
   }
   const env = payload.env_file || {};
   const summary = payload.summary || {};
@@ -2741,7 +2747,7 @@ function renderConfigStatus(payload = state.configStatus) {
     const problem = services.some(([, detail]) => detail.status && detail.status !== "applied");
     return `<details class="config-effective-item"${problem ? " open" : ""}><summary class="config-effective-summary"><span class="mono">${esc(item.key)}</span><code>${esc(configStatusValue(item.configured_value))}</code><span class="muted">${services.length} 个服务</span></summary><p class="muted config-effective-desc">${esc(item.description || item.label || "")}</p><div class="config-effective-services">${serviceHtml || `<div class="empty-state">没有适用的运行服务。</div>`}</div></details>`;
   }).join("");
-  target.innerHTML = `<div class="config-status-meta"><span>检查时间：${esc(formatDate(payload.generated_at))}</span><span>总体状态：${badge(payload.overall || "unknown")}</span><span>Env 版本：${esc(env.version || "-")}</span><span title="${esc(env.sha256 || "")}">SHA256：${esc(env.sha256 ? env.sha256.slice(0, 12) : "-")}</span><span>说明：最终值为 Docker inspect、容器环境变量和已知默认值的推断结果</span></div><div class="config-status-counts">${countHtml}</div><div class="config-effective-list">${itemHtml || `<div class="empty-state">没有可展示的最终配置。</div>`}</div>${Array.isArray(payload.warnings) && payload.warnings.length ? `<div class="config-diagnostic-warning"><strong>整体提示</strong><ul>${payload.warnings.map(item => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}`;
+  return `<div class="config-status-meta"><span>总体状态：${badge(payload.overall || "unknown")}</span><span>Env 版本：${esc(env.version || "-")}</span><span title="${esc(env.sha256 || "")}">SHA256：${esc(env.sha256 ? env.sha256.slice(0, 12) : "-")}</span><span>说明：最终值为 Docker inspect、容器环境变量和已知默认值的推断结果</span></div><div class="config-status-counts">${countHtml}</div><div class="config-effective-list">${itemHtml || `<div class="empty-state">没有可展示的最终配置。</div>`}</div>${Array.isArray(payload.warnings) && payload.warnings.length ? `<div class="config-diagnostic-warning"><strong>整体提示</strong><ul>${payload.warnings.map(item => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}`;
 }
 
 async function loadConfigStatus({force = false} = {}) {
